@@ -98,33 +98,52 @@ sc.push_step_wrapper(w);
 ### tower `Service`
 
 ```rust
-pub struct StepRequest { pub step_id: String, pub run_meta: Option<Value>, /* 执行体 */ }
+pub struct StepRequest { pub step_id: String, pub run_meta: Option<Value> }
 pub struct StepResponse(pub serde_json::Value);
 
+// step 闭包就是叶子 service 的 call 体 —— 这正是 tower 的形状
 impl Service<StepRequest> for StepLeaf { /* 跑闭包、落 STEP_FINISHED */ }
 
 // 中间件里
 sc.wrap_step(ReseedLayer::new(plan, load_results));
-sc.wrap_step(InterimGoalLayer::new(goals));
+sc.wrap_step(TimeoutLayer::new(Duration::from_secs(30)));
 ```
 
-好处：**不用在 core 里手写执行器**。版本绑定算不算坏处，取决于
-`Service` / `Layer` 出不出现在公开签名里：
+## tower 值不值得上：先纠正一个错误论断
 
-| | `Service`/`Layer` 在公开签名？ | 版本绑定 | 生态复用 |
-| --- | --- | --- | --- |
-| 只活在实现内部（对外仍是 `wrap_step(StepWrapper)`） | 否 | 不成立 | 无 |
-| 对外接受 `tower::Layer` | 是 | **成立**：我们的 `tower` 版本升级等于用户的跟着动，用户写的 layer 必须实现同一版 `Service` | 有 |
+起草时写过「现成的 layer 都面向 `http::Request`，对 `StepRequest` 帮不上忙，
+所以生态复用接近零」。**这是错的。**
 
-第二行的收益是真实的——用户能复用 tower 生态的现成 layer、按生态习惯写层——
-但**在本场景接近零**：那些 layer（`TimeoutLayer`、限流、`tower-http` 那一批）
-都面向 `http::Request`，对我们自定义的 `StepRequest` 帮不上忙。本仓的 step 包装层
-是**业务策略**（泊车、复用、DAG 调度），不是泛用横切。
+只有 `tower-http` 那一批才绑定 HTTP。`tower` **本体**的层是请求类型无关的
+——它对任意 `S: Service<Req>` 生效，不关心 `Req` 里装什么：
 
-所以这里不是「tower 一定是坏处」，而是：**要生态复用就得付版本绑定，
-而这一步的生态复用没有实际收益**。若将来出现可复用的通用 step layer
-（例如统一的超时 / 重试层），这个权衡要重新算。
+| layer | 对 `ctx.step` 是否有用 |
+| --- | --- |
+| `tower::timeout::TimeoutLayer` | 有用：统一的 step 超时（现在是每步 `StepOptions.timeout`） |
+| `tower::retry::RetryLayer` | 有用：与现有 step 重试策略对位 |
+| `tower::limit::ConcurrencyLimitLayer` | 有用：与现有 `gate` 对位 |
+| `tower::limit::RateLimitLayer` | 有用 |
+| `tower::tracing` / 自定义 metrics | 有用 |
 
+而且 `Service::call` 里跑的就是 step 闭包本身——
+
+```rust
+fn call(&mut self, req: StepRequest) -> Self::Future {
+    // 这里 await 用户闭包，落 STEP_FINISHED
+}
+```
+
+——所以「闭包属于 service、请求只是数据」这个 tower 惯例，我们天然满足。
+
+## 于是权衡变成
+
+| | 收益 | 代价 |
+| --- | --- | --- |
+| 自写 `StepWrapper` | 无额外依赖；已跑通 | core 里多一套手写执行器；`timeout` / `retry` / `limit` 各写一份私有版本，互不兼容 |
+| tower | 上表那批层直接可用；执行器是验证过的 | 版本绑定（若 `Layer` 进公开签名）；学习面稍大 |
+
+**倾向 tower**，但有一个前置问题必须先回答（见下一节第 1 条）：策略状态放哪。
+`
 ### 两种承载都要面对的
 
 1. **并发与策略状态**：step 会被并行分支并发调用。tower 习惯 `Service: Clone`、
@@ -144,12 +163,20 @@ sc.wrap_step(InterimGoalLayer::new(goals));
 
 ## 待定
 
-- 承载方式：自写还是 tower（上节）。
+- **承载方式：倾向 tower**，前置条件是先回答上一节第 1 条（策略状态放层里还是
+  层外）。若答案是「必须放层外」，tower 仍然可用（层只做判断、状态由 drive 持有），
+  只是层本身会变薄；若连这点都做不到，再回到自写。
 - `set_step_interceptor` 怎么下线：直接删，不留适配层——它本身就是洋葱的
   退化形式，留着等于永久维护两条语义不同的短路路径。
 
 ## 证据
 
-- 方案 B 的分支：`experiment/step-onion` @ `bc609fd`
+- 自写版实现（已合入 main，`040293f`）：`StepWrapper` + `push_step_wrapper`
 - 叠加测试：`packages/workflow_middlewares/tests/step_onion.rs`（3 条）
-- 方案 B 期间的三个坑：见上文「实验中还踩到三个真实坑」
+- 三个坑的实测记录：见「两种承载都要面对的」第 3 条
+
+## 修订
+
+- 2026-11-03 起草时断言「现成的 layer 都面向 `http::Request`，生态复用接近零」
+  ——**错**。tower 本体的层是请求类型无关的，见「先纠正一个错误论断」。
+  更正后倾向从「自写」改为「tower」。
