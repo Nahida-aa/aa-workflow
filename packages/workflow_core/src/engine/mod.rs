@@ -437,6 +437,23 @@ impl EngineRuntime {
         self.lives.lock().ok()?.get(step_id).cloned()
     }
 
+    /// 本 drive 内**已成功**的 step 快照（按 `live` 表，即日志的内存投影）。
+    ///
+    /// 给包装层判断「哪些目标已达成」用：策略因此不必自带可变状态，
+    /// 并发分支看到的也是同一份事实。
+    fn completed_steps(&self) -> std::collections::HashSet<String> {
+        self.lives
+            .lock()
+            .map(|lives| {
+                lives
+                    .iter()
+                    .filter(|(_, st)| matches!(st.status, StepStatus::Success))
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
 
     /// F2-lite interim goal：goal 步骤 checkpoint 时记入 done 集合；全齐且
     /// 本 drive 启动时尚未全齐 → 返回 true（调用者经保留信号 `__interim-goal`
@@ -462,6 +479,9 @@ impl EngineRuntime {
             self.step_wrappers.lock().expect("step wrappers lock").clone();
         let step_id = Arc::new(step_id.to_string());
         let run_meta = Arc::new(self.meta.clone());
+        // 已完成的 step：**进入链时取一次快照**。上一个 step 的 STEP_FINISHED
+        // 在它自己的链返回前已落盘，所以这里读到的是准确的「此前完成集」。
+        let completed = Arc::new(self.completed_steps());
         let engine = self.clone();
         // 反向折叠：[A, B] → A(B(terminal))，A 在外层先执行。
         let entry = wrappers
@@ -471,6 +491,7 @@ impl EngineRuntime {
                 let inner = Arc::new(Mutex::new(Some(inner)));
                 let step_id = step_id.clone();
                 let run_meta = run_meta.clone();
+                let completed = completed.clone();
                 let engine = engine.clone();
                 crate::middleware::NextStep::new(move || {
                     let next = inner
@@ -482,6 +503,7 @@ impl EngineRuntime {
                         step_id: (*step_id).clone(),
                         run_id: engine.run_id.clone(),
                         run_meta: (*run_meta).clone(),
+                        completed: completed.clone(),
                         next,
                         engine: engine.clone(),
                     })

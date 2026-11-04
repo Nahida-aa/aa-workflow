@@ -163,16 +163,66 @@ fn call(&mut self, req: StepRequest) -> Self::Future {
 
 ## 待定
 
-- **承载方式：倾向 tower**，前置条件是先回答上一节第 1 条（策略状态放层里还是
-  层外）。若答案是「必须放层外」，tower 仍然可用（层只做判断、状态由 drive 持有），
-  只是层本身会变薄；若连这点都做不到，再回到自写。
+- **承载方式：已选定 tower 路线的前置条件已满足，待迁移。**
+  关键前提是「策略状态不放在层里」——已落地（见下节「第一步已完成」）。
+  tower 化的具体做法与验收标准见下节。
 - `set_step_interceptor` 怎么下线：直接删，不留适配层——它本身就是洋葱的
   退化形式，留着等于永久维护两条语义不同的短路路径。
+
+## 第一步已完成：策略无状态（2026-11-03）
+
+把「策略自己累积 `done`」换成「读引擎给的快照」，这一步与用不用 tower 无关，
+本身就该做：
+
+```rust
+pub struct StepCall {
+    // 本 drive 内已成功的 step（含此前全部，不含本次）
+    pub completed: Arc<HashSet<String>>,
+}
+```
+
+三个策略的改造：
+
+| 策略 | 原来 | 现在 |
+| --- | --- | --- |
+| `interim_goals` | `done: Mutex<HashSet>` + `parked: Mutex<bool>` | 只读 `call.completed` |
+| `dag_policies` | `PlanState.done` + `parked: Mutex<HashSet<run_id>>` | 只读 `call.completed`；计划本身不可变 |
+| `reseed` | `cache: Mutex<Option<HashMap>>` 懒加载 | drive 开始同步加载一次，不可变 |
+
+**为什么可行**（两条事实，已核实）：
+
+1. `STEP_FINISHED` 在**包装链返回之前**落盘，所以下一个 step 入口读到的快照
+   必然包含此前全部完成的 step。
+2. 泊车会让整条 drive 以 `WorkflowParked` 结束，**不可能在同一 drive 内
+   触发第二次**，所以 `parked` 标记是多余的。
+
+**为什么这是 tower 化的前提**：`Service: Clone` 会让层在并行分支间各持一份；
+策略状态若在层里就会分裂。状态移到「请求携带的只读快照」之后，层变成纯函数，
+`Clone` 不再有害。
+
+测试：`packages/workflow_middlewares/tests/completed_snapshot.rs`（3 条）——
+串行顺序、并行不含自身、跨 drive 累积。
+
+## 下一步：tower 化
+
+前置条件已满足，剩下的是一次机械替换：
+
+```rust
+// 叶子
+impl Service<StepRequest> for StepLeaf { /* 跑闭包、落 STEP_FINISHED */ }
+// 中间件
+sc.wrap_step(TimeoutLayer::new(d));     // 现成的
+sc.wrap_step(ReseedLayer::new(plan));   // 无状态，只读 request
+```
+
+验收标准：**现有测试原样通过**（`step_onion` 3 + `completed_snapshot` 3 +
+策略 7 + 全 workspace）。删掉 `StepWrapper` / `StepCall` / `NextStep`。
 
 ## 证据
 
 - 自写版实现（已合入 main，`040293f`）：`StepWrapper` + `push_step_wrapper`
 - 叠加测试：`packages/workflow_middlewares/tests/step_onion.rs`（3 条）
+- 快照测试：`packages/workflow_middlewares/tests/completed_snapshot.rs`（3 条）
 - 三个坑的实测记录：见「两种承载都要面对的」第 3 条
 
 ## 修订

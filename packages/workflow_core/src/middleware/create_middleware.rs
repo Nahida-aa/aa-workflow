@@ -136,6 +136,14 @@ pub struct StepCall {
     pub run_id: String,
     /// Run 级参数（`RunWorkflowOptions.meta`，策略输入）。
     pub run_meta: Option<Value>,
+    /// **本 drive 内已成功的 step 快照**（含本次之前的全部，不含本次）。
+    ///
+    /// 这是策略判断「哪些目标已达成」的唯一真值源——包装层因此**不需要**
+    /// 自带可变状态（`Arc<Mutex<HashSet>>`），并发分支之间也就不会出现
+    /// 「各记各的、互相看不见」。
+    ///
+    /// 数据来自引擎的 `live` 表（日志的内存投影），在本次调用构造时取快照。
+    pub completed: std::sync::Arc<std::collections::HashSet<String>>,
     /// 进入下一层（含真实执行）。**不调即短路**。
     pub(crate) next: NextStep,
     /// 落 checkpoint / 泊车用。

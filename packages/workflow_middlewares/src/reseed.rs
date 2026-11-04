@@ -21,7 +21,7 @@
 //! [`MiddlewareServerFnArgs::push_step_wrapper`]——不调 `next()` 即短路，
 //! 用 [`StepCall::skip`] 把源结果作为本 step 的 checkpoint 落盘。
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use aa_workflow_core::middleware::{Middleware, MiddlewareServerFnArgs, StepCall, StepWrapper};
 
@@ -71,35 +71,23 @@ where
         Box::pin(async move {
             // 本 run 就是源 run？不做任何事（禁止自我播种）。
             if plan.source_run_id != sc.ctx.run_id {
-                // 每个 run 只载入一次源结果（拦截器每个 step 都会被问一次）。
-                let cache: Arc<Mutex<Option<HashMap<String, serde_json::Value>>>> =
-                    Arc::new(Mutex::new(None));
+                // **drive 开始时加载一次**，而不是在包装层里懒加载 + 缓存：
+                // `load_results` 是同步函数，放在这里不会阻塞；省掉
+                // `Arc<Mutex<Option<...>>>` 之后包装层就是纯的（只读 plan）。
+                //
+                // 源读不到 → 空表，「没有可复用结果」→ 全部真跑
+                // （与引擎版「导入 0 条」同义）。
+                let lookup = Arc::new(load_results(&plan.source_run_id).unwrap_or_default());
 
                 let wrapper: StepWrapper = Arc::new(move |call: StepCall| {
-                    let cache = cache.clone();
+                    let lookup = lookup.clone();
                     let redo = redo.clone();
-                    let plan = plan.clone();
-                    let load_results = load_results.clone();
                     Box::pin(async move {
-                        // 判定在同步块里完成，**先释放锁再 await**。
-                        // 锁中毒按「没有可复用结果」处理 → 真跑。
-                        let reused = (|| {
-                            // redoSet 里的 step 要真跑。
-                            if redo.contains(&call.step_id) {
-                                return None;
-                            }
-                            let mut guard = cache.lock().ok()?;
-                            if guard.is_none() {
-                                *guard = match load_results(&plan.source_run_id) {
-                                    Ok(m) => Some(m),
-                                    // 源读不到 → 「没有可复用结果」，真跑（与引擎版
-                                    // 「导入 0 条」同义）。
-                                    Err(_) => Some(HashMap::new()),
-                                };
-                            }
-                            guard.as_ref().and_then(|m| m.get(&call.step_id)).cloned()
-                        })();
-                        match reused {
+                        // redoSet 里的 step 要真跑。
+                        if redo.contains(&call.step_id) {
+                            return call.next().await;
+                        }
+                        match lookup.get(&call.step_id).cloned() {
                             // 短路：源结果作为本 step 的 checkpoint 落盘。
                             Some(result) => call.skip(result).await,
                             // 源里没有这个 step（新加的 / 上次失败的）→ 真跑。

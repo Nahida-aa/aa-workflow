@@ -21,20 +21,12 @@
 //!
 //! 判断「开局目标是否已达成」要读日志，构造时注入 `get_events`。
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use aa_workflow_core::middleware::{Middleware, MiddlewareServerFnArgs, StepCall, StepWrapper};
 
 /// 保留信号名（与 `__timer` 同族）。
 pub const INTERIM_GOAL_SIGNAL: &str = "__interim-goal";
-
-/// 包装层的决定（锁内算出，锁外执行）。
-enum Decision {
-    /// 继续执行本 step。
-    Pass,
-    /// 在本次 drive 的边界泊车。
-    Park,
-}
 
 /// `RunWorkflowOptions.meta` 里的目标字段。
 pub const INTERIM_GOALS_FIELD: &str = "__interimGoals";
@@ -89,53 +81,32 @@ where
                     .collect();
                 let goals_done_at_start = goals.iter().all(|g| finished_at_start.contains(g));
 
-                // 本 drive 已完成的 step（真跑完成；被 reseed 复用的由
-                // Skip 分支通过 meta 传不进来，所以这里只看真跑）。
-                let done: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-                let parked = Arc::new(Mutex::new(false));
-
+                // **无状态包装层**：判定全部读 `call.completed`（引擎给的
+                // 「本 drive 已成功 step」快照），不再自带 `done` 累积集合。
+                //
+                // 为什么可以不累积：进入某个 step 时，此前所有 step 的
+                // `STEP_FINISHED` 都已落盘（在它们自己的链返回前），引擎在
+                // 构造 `StepCall` 时取的快照就是准确的。
+                //
+                // 为什么不用 `parked` 标记：泊车会整条 drive 结束
+                // （`WorkflowParked`），不可能在同一 drive 内触发第二次。
                 let wrapper: StepWrapper = Arc::new(move |call: StepCall| {
-                    let done = done.clone();
-                    let parked = parked.clone();
                     let goals = goals.clone();
                     Box::pin(async move {
                         if goals_done_at_start {
                             return call.next().await;
                         }
-                        // 判定全程在同步块里完成，**先释放所有锁再 await**
-                        // （guard 非 Send，跨 await 会被拒 —— 也会真的卡住并发）。
-                        // 锁中毒时一律 Pass（旁路失败不该拦住 step）。
-                        let decision = (|| {
-                            let mut d = done.lock().ok()?;
-                            // 入口判定：上一个 step 完成后，goals 是否已全齐。
-                            // 当前 step 尚未执行，所以先判定再记录它「即将执行」。
-                            let reached =
-                                !d.is_empty() && goals.iter().all(|g| d.contains(g));
-                            if reached {
-                                let mut p = parked.lock().ok()?;
-                                if *p {
-                                    return Some(Decision::Pass);
-                                }
-                                *p = true;
-                                d.clear();
-                                return Some(Decision::Park);
-                            }
-                            if goals.contains(&call.step_id) {
-                                d.insert(call.step_id.clone());
-                            }
-                            Some(Decision::Pass)
-                        })()
-                        .unwrap_or(Decision::Pass);
-                        match decision {
-                            Decision::Pass => call.next().await,
-                            Decision::Park => {
-                                call.park(
+                        // 入口判定：goals 是否已全齐（不含本 step——它还没跑）。
+                        let reached = goals.iter().all(|g| call.completed.contains(g));
+                        if reached {
+                            return call
+                                .park(
                                     INTERIM_GOAL_SIGNAL,
                                     Some(serde_json::json!({ INTERIM_GOALS_FIELD: goals })),
                                 )
-                                .await
-                            }
+                                .await;
                         }
+                        call.next().await
                     })
                 });
                 sc.push_step_wrapper(wrapper);
