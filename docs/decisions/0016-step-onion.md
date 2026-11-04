@@ -1,12 +1,13 @@
-# 0016 — step 拦截怎么叠加：候选 tower `Service` vs 自制 wrapper
+# 0016 — step 拦截改成包装层叠加：自制 wrapper 还是 tower `Service`
 
 **状态**：**待定**（2026-11-03 起）。结论未定，本文只记录问题与候选方案。
 **关联**：[0002](0002-rust-step-hooks.md)（现行 `set_step_interceptor`）、
 [0007](0007-middleware-compose-order.md)（组合顺序）、
 [0015](0015-ext-namespaces.md)（命名空间扩展，同一批改造）
 
-> 本文按阅读到的顺序写了三个候选与各自的论证。**（C）尚未评估完，
-> 是作者倾向的方案**；选定前不要把任何一条当结论引用。
+> **要定的是两件事**：① 要不要叠加（已定：要）；② 用什么承载包装层
+> （自制 wrapper vs tower `Service`）。两者语义一致，见「方案 C」开头。
+> 选定前不要把任何一条当结论引用。
 
 ## 问题
 
@@ -78,7 +79,16 @@ call.next().await          // 正常推进
 
 ## 方案 C（待评估，作者倾向）：`ctx.step` 是 tower 的 `Service`
 
-核心想法：**不要另造洋葱，把 step 表达成 `tower::Service`**。
+**先说清楚 C 不是「另一种架构」，而是 B 的实现选型。** TS 的 `ctx.step = wrapped`
+本身就是包装层，B 与它同构——差别只在包装层用什么承载：
+
+| | 承载 | 叠加执行器 |
+| --- | --- | --- |
+| B | 自制 `StepWrapper` 闭包 | core 里手写 `fold` + `NextStep` |
+| C | `tower::Service` | tower 的 `ServiceBuilder::layer` |
+
+所以 C 与 B **语义完全一致**（不调下一层 = 短路），要决定的只是
+「自己维护一个洋葱执行器，还是复用 tower 的」。
 
 ```rust
 // step 的请求/响应
@@ -96,13 +106,12 @@ sc.wrap_step(ReseedLayer::new(plan, load_results));   // 复用
 sc.wrap_step(InterimGoalLayer::new(goals));           // 泊车
 ```
 
-### 为什么这比（B）好
+### 为什么可能优于 B 的实现
 
 - **叠加、顺序、短路都是 tower 现成的**：`ServiceBuilder::layer` 的洋葱语义、
   `Service::call` 返回 future 的形状，都是生态共识，不需要在 core 里手写 `fold`。
-- **短路 = 不调 `inner.call()`**，和（B）语义一致，但类型是 `Service` 而不是自制别名。
-- **中间件与 step 的分层变清楚**：中间件是 drive 级洋葱，它的职责之一是
-  **决定给 step 装哪些层**；step 的 stack 是 step 级洋葱。现在（B）里
+- **中间件与 step 的分层更清楚**：中间件是 drive 级洋葱，它的职责之一是
+  **决定给 step 装哪些层**；step 的 stack 是 step 级洋葱。B 里
   `push_step_wrapper` 两头都能改，职责是糊的。
 - 与 [0007](0007-middleware-compose-order.md) 的约束天然吻合：策略层必须先包进
   调度之前，tower 的 `layer` 调用点就是「包进去」这个动作。
@@ -122,10 +131,18 @@ sc.wrap_step(InterimGoalLayer::new(goals));           // 泊车
 
 ## 待定
 
-- 采纳哪一条？倾向 C，但要先回答上面四个问题。
-- 若采纳 C，`set_step_interceptor` 如何下线（直接删，不留适配层——它本身就是
-  洋葱的退化形式）。
-- 若 C 走不通（例如问题 1 无解），回到 B 并在本文补齐「为什么 C 不可行」。
+要定的是**两件独立的事**：
+
+1. **要不要叠加**（架构）——A 已否决，B/C 都同意「叠加」。这一条实际上已经定了：
+   单值槽位在 `interim_goals + reseed` 同时使用时必然丢一个，必须改。
+2. **用什么承载包装层**（实现选型）——自制 `StepWrapper`（B）还是 tower
+   `Service`（C）。语义一致，差别在「自己维护执行器」vs「复用 tower」。
+
+其他未定：
+
+- `set_step_interceptor` 如何下线（直接删，不留适配层——它本身就是洋葱的退化形式）。
+- 若选 C，先回答上文四个问题；问题 1（策略状态放层里还是外面）是唯一的硬约束，
+  回答不了就用 B。
 
 ## 证据
 
