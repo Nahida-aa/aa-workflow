@@ -108,8 +108,22 @@ sc.wrap_step(ReseedLayer::new(plan, load_results));
 sc.wrap_step(InterimGoalLayer::new(goals));
 ```
 
-好处只有一个但实在：**不用在 core 里手写执行器**。坏处是把
-`Service` / `Layer` 的版本绑定变成对外的隐式契约。
+好处：**不用在 core 里手写执行器**。版本绑定算不算坏处，取决于
+`Service` / `Layer` 出不出现在公开签名里：
+
+| | `Service`/`Layer` 在公开签名？ | 版本绑定 | 生态复用 |
+| --- | --- | --- | --- |
+| 只活在实现内部（对外仍是 `wrap_step(StepWrapper)`） | 否 | 不成立 | 无 |
+| 对外接受 `tower::Layer` | 是 | **成立**：我们的 `tower` 版本升级等于用户的跟着动，用户写的 layer 必须实现同一版 `Service` | 有 |
+
+第二行的收益是真实的——用户能复用 tower 生态的现成 layer、按生态习惯写层——
+但**在本场景接近零**：那些 layer（`TimeoutLayer`、限流、`tower-http` 那一批）
+都面向 `http::Request`，对我们自定义的 `StepRequest` 帮不上忙。本仓的 step 包装层
+是**业务策略**（泊车、复用、DAG 调度），不是泛用横切。
+
+所以这里不是「tower 一定是坏处」，而是：**要生态复用就得付版本绑定，
+而这一步的生态复用没有实际收益**。若将来出现可复用的通用 step layer
+（例如统一的超时 / 重试层），这个权衡要重新算。
 
 ### 两种承载都要面对的
 
