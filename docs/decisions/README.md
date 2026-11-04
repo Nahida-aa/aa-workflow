@@ -27,7 +27,7 @@ Y 时，这条记录在未来就是不可复核的。别的文件（`feature/`�
 | [0013](0013-middleware-generics.md) | `Middleware<TCtxIn, TExtension>`：只有 `TCtxIn` 是实参数 | 已被 0015 取代 |
 | [0014](0014-middleware-takes-array.md) | `.middleware()` 收数组（对齐上游），三处差异 | 已被 0015 取代 |
 | [0015](0015-ext-namespaces.md) | `ctx.ext` 按命名空间存取：使用者不需要定义合并类型 | 已接受 |
-| [0016](0016-step-onion.md) | step 拦截改成包装层叠加；承载选自制 wrapper 还是 tower `Service` | **待定** |
+| [0016](0016-step-onion.md) | step 拦截改成包装层叠加（取代单值 `set_step_interceptor`） | 已接受 |
 
 ## 什么时候写新 ADR
 
