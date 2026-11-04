@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::define::{RetryPolicy, StepCtx, StepOptions};
+use crate::define::{BoxFuture, RetryPolicy, StepCtx, StepOptions};
 #[cfg(test)]
 use crate::define::AnyWorkflowDefinition;
 use crate::error::{RunError, StoreError, WorkflowError};
@@ -267,14 +267,13 @@ pub struct EngineRuntime {
     /// wrap 前置与 step 钩子经此读取策略参数；不参与 handler、不落 \`RunState\`。
     pub meta: Option<serde_json::Value>,
     pub pending_retries: Mutex<std::collections::HashMap<String, PendingRetry>>,
-    /// **Step 拦截器**（本仓有意扩展：TS 靠覆盖 `ctx.step` 达到同样能力，
-    /// Rust 的 `ctx.step` 是方法、不可替换——由 [`Middleware::server`] 经
-    /// `MiddlewareServerFnArgs::set_step_interceptor` 设置）。
+    /// **Step 包装链**（本仓有意扩展：TS 靠覆盖 `ctx.step` 达到同样能力）。
     ///
-    /// `exec_step` 入口调用；返回 `Skip`（不执行闭包、直接提交结果）、
-    /// `Park`（边界泊车）或透传。策略（临时目标、redo 复用等）放在
-    /// middlewares 包里，引擎只提供这一层机制。
-    pub step_interceptor: Mutex<Option<crate::middleware::StepInterceptor>>,
+    /// 由 [`Middleware::server`] 经
+    /// `MiddlewareServerFnArgs::push_step_wrapper` 追加；**可叠加**，
+    /// 先注册的在最外层（见 `docs/decisions/0016`）。
+    /// `exec_step` 入口把真实执行当作最内层 `next` 交给这条链。
+    pub step_wrappers: Mutex<Vec<crate::middleware::StepWrapper>>,
     /// 中间件在 server 里经 `MiddlewareServerFnArgs::next(ext)` 合并进来的 ctx 扩展
     /// （擦除层 Value；驱动收尾反序列化进 handler 的 `TCtxExt`）。
     pub ext_extra: Mutex<serde_json::Value>,
@@ -442,14 +441,96 @@ impl EngineRuntime {
     /// F2-lite interim goal：goal 步骤 checkpoint 时记入 done 集合；全齐且
     /// 本 drive 启动时尚未全齐 → 返回 true（调用者经保留信号 `__interim-goal`
     /// 泊车）。转移检查防重挂；未到达的 goal 永不触发。
-    /// 设置 step 拦截器（中间件经 `MiddlewareServerFnArgs::set_step_interceptor` 调用）。
-    pub fn set_step_interceptor(&self, f: crate::middleware::StepInterceptor) {
-        *self
-            .step_interceptor
+    /// 追加 step 包装层（中间件经 `MiddlewareServerFnArgs::push_step_wrapper` 调用）。
+    pub fn push_step_wrapper(&self, w: crate::middleware::StepWrapper) {
+        self.step_wrappers
             .lock()
-            .expect("step interceptor lock") = Some(f);
+            .expect("step wrappers lock")
+            .push(w);
     }
 
+    /// 把真实执行包进已注册的链（先注册的在外层），返回整条链的入口。
+    ///
+    /// `next` 是洋葱最内层——真正跑闭包、落 `STEP_FINISHED` 的那段。
+    fn compose_step_wrappers(
+        self: &Arc<Self>,
+        step_id: &str,
+        next: crate::middleware::NextStep,
+    ) -> BoxFuture<'static, anyhow::Result<serde_json::Value>> {
+        // 取快照后立刻释放锁：包装层内会 await，不能持锁跨越。
+        let wrappers: Vec<crate::middleware::StepWrapper> =
+            self.step_wrappers.lock().expect("step wrappers lock").clone();
+        let step_id = Arc::new(step_id.to_string());
+        let run_meta = Arc::new(self.meta.clone());
+        let engine = self.clone();
+        // 反向折叠：[A, B] → A(B(terminal))，A 在外层先执行。
+        let entry = wrappers
+            .into_iter()
+            .rev()
+            .fold(next, move |inner, w| {
+                let inner = Arc::new(Mutex::new(Some(inner)));
+                let step_id = step_id.clone();
+                let run_meta = run_meta.clone();
+                let engine = engine.clone();
+                crate::middleware::NextStep::new(move || {
+                    let next = inner
+                        .lock()
+                        .expect("step next lock")
+                        .take()
+                        .expect("step wrapper may call next() at most once");
+                    w(crate::middleware::StepCall {
+                        step_id: (*step_id).clone(),
+                        run_id: engine.run_id.clone(),
+                        run_meta: (*run_meta).clone(),
+                        next,
+                        engine: engine.clone(),
+                    })
+                })
+            });
+        entry.take_and_call()
+    }
+}
+
+/// 短路时落一条 `STEP_FINISHED`（对齐原来的 `StepAction::Skip`）：
+/// 与正常完成同样记账（事件 + live 状态 + publish），只是没有真实执行。
+///
+/// 由 [`StepCall::skip`](crate::middleware::StepCall::skip) 调用。
+pub(crate) async fn record_skipped_step(
+engine: &Arc<EngineRuntime>,
+step_id: &str,
+result: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+let ts = now_ms();
+let ev = WorkflowEvent::StepFinished {
+    ts,
+    run_id: engine.run_id.clone(),
+    step_id: step_id.to_string(),
+    result: Some(result.clone()),
+    attempts: vec![StepAttempt {
+        attempt: 1,
+        started_at: ts,
+        finished_at: ts,
+        result: Some(result.clone()),
+        error: None,
+    }],
+    meta: None,
+};
+engine.append(&ev)?;
+engine.set_live(
+    step_id,
+    StepState {
+        status: StepStatus::Success,
+        result: Some(result.clone()),
+        error: None,
+        started_at: Some(ts),
+        finished_at: Some(ts),
+    },
+);
+engine.publish(&ev);
+Ok(result)
+}
+
+impl EngineRuntime {
     /// 合并中间件 `next(ext)` 传入的 ctx 扩展（Object.assign 同义）。
     pub fn merge_ext(&self, value: serde_json::Value) {
         let mut slot = self.ext_extra.lock().expect("ext extra lock");
@@ -508,80 +589,74 @@ where
     if is_cancelled(&inner.store, &inner.run_id) {
         return Err(WorkflowCancelled.into());
     }
-    // **Step 拦截器**（本仓有意扩展：TS 靠覆盖 ctx.step 达到同样能力）。
-    // 时机在重放短路之后——已 checkpoint 的 step 不会到达拦截器。
-    // 先取决定并释放锁（Park 路径含 await，不能持锁跨 await），再执行决定：
-    // Skip → 不执行闭包、直接提交结果；Park → 在本 step 边界停下；None → 正常。
-    let action = inner
-        .step_interceptor
+    // **Step 包装链**（本仓有意扩展：TS 靠覆盖 ctx.step 达到同样能力）。
+    // 时机在重放短路之后——已 checkpoint 的 step 不会到达包装层。
+    // 快照在调用时取，所以包装层内不能再追加（只能在装配期 push）。
+    // 注意：锁 guard 必须先释放（下面 `compose_step_wrappers` 会再取一次，
+    // 若把 `.lock()` 写在 `if` 条件里，guard 的生命周期会延续到整个 if 块）。
+    let has_wrappers = !inner
+        .step_wrappers
         .lock()
-        .expect("step interceptor lock")
-        .as_ref()
-        .and_then(|f| {
-            f(&crate::middleware::StepEvent {
-                run_id: &inner.run_id,
-                step_id,
-                run_meta: inner.meta.as_ref(),
-            })
+        .expect("step wrappers lock")
+        .is_empty();
+    if has_wrappers {
+        // `run` 只要求 `Send`（闭包本身可能不 `Sync`），而 `NextStep` 要求 `Sync`；
+        // 放进 `Mutex` 既满足 `Sync`，也天然保证「只被执行一次」。
+        let run_slot = Arc::new(Mutex::new(Some(run)));
+        let raw = inner
+            .compose_step_wrappers(step_id, crate::middleware::NextStep::new({
+                let inner = inner.clone();
+                let step_id = step_id.to_string();
+                let opts = opts.clone();
+                let run_slot = run_slot.clone();
+                move || {
+                    let inner = inner.clone();
+                    let step_id = step_id.clone();
+                    let opts = opts.clone();
+                    let run_slot = run_slot.clone();
+                    Box::pin(async move {
+                        let run = run_slot
+                            .lock()
+                            .expect("step run slot")
+                            .take()
+                            .expect("step run may execute at most once");
+                        exec_step_unwrapped(&inner, &step_id, &opts, run)
+                            .await
+                            .and_then(|v| serde_json::to_value(v).map_err(anyhow::Error::from))
+                    })
+                }
+            }))
+            .await?;
+        return serde_json::from_value(raw).map_err(|e| {
+            anyhow::anyhow!(
+                "step `{step_id}`: a step wrapper result does not deserialize into \
+                 `{}`: {e}",
+                std::any::type_name::<T>()
+            )
         });
-    if let Some(action) = action {
-        match action {
-            crate::middleware::StepAction::Skip { result } => {
-                // 与正常完成同样落账：STEP_FINISHED + live 状态 + publish。
-                let ts = now_ms();
-                let ev = WorkflowEvent::StepFinished {
-                    ts,
-                    run_id: inner.run_id.clone(),
-                    step_id: step_id.to_string(),
-                    result: Some(result.clone()),
-                    attempts: vec![StepAttempt {
-                        attempt: 1,
-                        started_at: ts,
-                        finished_at: ts,
-                        result: Some(result.clone()),
-                        error: None,
-                    }],
-                    meta: None,
-                };
-                inner.append(&ev)?;
-                inner.set_live(
-                    step_id,
-                    StepState {
-                        status: StepStatus::Success,
-                        result: Some(result.clone()),
-                        error: None,
-                        started_at: Some(ts),
-                        finished_at: Some(ts),
-                    },
-                );
-                inner.publish(&ev);
-                return serde_json::from_value(result).map_err(|e| {
-                    anyhow::anyhow!(
-                        "step `{step_id}`: a middleware Skip result does not deserialize into \
-                         `{}`: {e}",
-                        std::any::type_name::<T>()
-                    )
-                });
-            }
-            crate::middleware::StepAction::Park { signal_name, meta } => {
-                let _ = crate::engine::exec_pause_with(
-                    inner,
-                    step_id,
-                    &signal_name,
-                    "parked at a middleware step boundary",
-                    None,
-                    meta,
-                    None,
-                )
-                .await;
-                return Err(WorkflowParked.into());
-            }
-        }
     }
 
-    // deadline，自轮询驱动循环到期后重驱），到期则以携带的 attempts 续跑。
-    // 跨重启等价：pending 状态从日志折叠（StepRetryScheduled），驱动启动时
-    // 重建（见 run_workflow 的 pending_retries 折叠）。
+    exec_step_unwrapped(inner, step_id, opts, run).await
+}
+
+/// 真正跑闭包、落 `STEP_FINISHED` 的那段（洋葱最内层）。
+///
+/// 包装链见 [`EngineRuntime::compose_step_wrappers`]；无包装层时 `exec_step`
+/// 直接走这里。
+async fn exec_step_unwrapped<T, F, Fut>(
+    inner: &Arc<EngineRuntime>,
+    step_id: &str,
+    opts: &StepOptions,
+    run: F,
+) -> anyhow::Result<T>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
+    F: FnOnce(StepCtx) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = anyhow::Result<T>> + Send + 'static,
+{
+    // 重试续跑（F2-lite：deadline 到期后由自轮询驱动循环重驱），到期则以
+    // 携带的 attempts 续跑。跨重启等价：pending 状态从日志折叠（StepRetryScheduled），
+    // 驱动启动时重建（见 run_workflow 的 pending_retries 折叠）。
     let pending_retry = inner
         .pending_retries
         .lock()
@@ -772,6 +847,13 @@ where
                 return Ok(result);
             }
             Err(err) => {
+                // 泊车 / 取消是**控制流**，不是 step 失败：它们在闭包外产生
+                // （暂停原语、取消检查），不能落 STEP_FAILED、更不能进重试。
+                if err.downcast_ref::<WorkflowParked>().is_some()
+                    || err.downcast_ref::<WorkflowCancelled>().is_some()
+                {
+                    return Err(err);
+                }
                 let run_err = RunError::from_anyhow(&err);
                 attempts.push(StepAttempt {
                     attempt,

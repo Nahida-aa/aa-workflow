@@ -68,15 +68,24 @@ pub struct MiddlewareServerFnArgs {
 }
 
 impl MiddlewareServerFnArgs {
-    /// 受控覆盖 `ctx.step`：拦截器对**本次 drive 内每个真实执行的 step** 作出决定。
+    /// 包裹 `ctx.step`：对**本次 drive 内每个真实执行的 step**包一层。
     ///
-    /// 对齐 TS 的 `ctx.step = wrapped`——那边是未承诺的实现细节，这边是受控 API。
+    /// 对齐 TS 的 `ctx.step = A(ctx.step)`——可多次注册，**先注册的在最外层**，
+    /// 与中间件本身的洋葱顺序一致（见 `docs/decisions/0016`）。
     ///
-    /// - [`StepAction::Skip`]：不执行闭包，把给定结果作为 `STEP_FINISHED` 落盘；
-    /// - [`StepAction::Park`]：在本 step 边界泊车（后续 step 不执行）；
-    /// - `None`：正常执行。
-    pub fn set_step_interceptor(&self, f: StepInterceptor) {
-        self.erased.engine.set_step_interceptor(f);
+    /// ```ignore
+    /// let w: StepWrapper = Arc::new(|call: StepCall| {
+    ///     Box::pin(async move {
+    ///         if should_reuse(&call.step_id) {
+    ///             return Ok(cached);       // 不调 next = 短路
+    ///         }
+    ///         call.next().await            // 正常推进
+    ///     })
+    /// });
+    /// sc.push_step_wrapper(w);
+    /// ```
+    pub fn push_step_wrapper(&self, w: StepWrapper) {
+        self.erased.engine.push_step_wrapper(w);
     }
 
     /// 推进到内层中间件与 handler —— 对齐上游 `next(opts)`（`run-workflow.ts:1502`）。
@@ -119,32 +128,104 @@ impl MiddlewareServerFnArgs {
     }
 }
 
-/// step 拦截器：对每个将要真实执行的 step 作出决定。
-///
-/// 时机：`exec_step` 入口、重放短路**之后**。槽位是**单值**：多个中间件都装时
-/// 后者覆盖前者。
-pub type StepInterceptor = Arc<dyn Fn(&StepEvent<'_>) -> Option<StepAction> + Send + Sync>;
-
-/// 拦截器看到的数据。
-#[derive(Debug)]
-pub struct StepEvent<'a> {
-    pub run_id: &'a str,
-    pub step_id: &'a str,
+/// 一次 step 调用的上下文（wrapper 看到的）。
+pub struct StepCall {
+    /// 本次 step 的 id。
+    pub step_id: String,
+    /// 所属 run 的 id（策略按 run 去重时用）。
+    pub run_id: String,
     /// Run 级参数（`RunWorkflowOptions.meta`，策略输入）。
-    pub run_meta: Option<&'a Value>,
+    pub run_meta: Option<Value>,
+    /// 进入下一层（含真实执行）。**不调即短路**。
+    pub(crate) next: NextStep,
+    /// 落 checkpoint / 泊车用。
+    pub(crate) engine: std::sync::Arc<crate::engine::EngineRuntime>,
 }
 
-/// 拦截器的决定。
-#[derive(Debug, Clone)]
-pub enum StepAction {
-    /// 不执行 step 闭包，把给定结果作为本 step 的 `STEP_FINISHED` 落盘（redo 复用）。
-    Skip { result: Value },
-    /// 在本 step 边界泊车：`SIGNAL_AWAITED { name, meta }` 落盘，后续 step 不执行。
-    Park {
-        signal_name: String,
-        meta: Option<Value>,
-    },
+impl StepCall {
+    /// 推进到下一层。**至多一次**——第二次调用报错。
+    ///
+    /// 不调 `next` 即为短路：后面的包装层与真实执行都不跑。
+    pub fn next(self) -> BoxFuture<'static, Result<Value>> {
+        self.next.take_and_call()
+    }
+
+    /// 短路并**落 checkpoint**：不执行闭包，把 `result` 作为本 step 的
+    /// `STEP_FINISHED` 写入日志，随后原样返回。
+    ///
+    /// 这是「复用已有结果」（reseed / redo 之外的重放）的正确写法——
+    /// 直接 `Ok(cached)` 只是让本次 drive 看到值，日志里没有记录，
+    /// 续驱 / 并行分支会重新计算，产生不一致。
+    pub fn skip(self, result: Value) -> BoxFuture<'static, Result<Value>> {
+        let engine = self.engine;
+        let step_id = self.step_id;
+        Box::pin(async move {
+            crate::engine::record_skipped_step(&engine, &step_id, result).await
+        })
+    }
+
+    /// **在本 step 边界泊车**：落 `SIGNAL_AWAITED` + 投影 RunState，随后整条
+    /// drive 以「已挂起」结束（调用方看到的是 `Err(WorkflowParked)`）。
+    ///
+    /// 不调 `next`——泊车意味着后续 step 与闭包都不执行。
+    /// `signal_name` 用保留名（`__interim-goal` / `__timer` / `__approval`）时
+    /// 由宿主侧续驱；自定义名字则等外部 `signal_run` 投递。
+    pub fn park(self, signal_name: impl Into<String>, meta: Option<Value>) -> BoxFuture<'static, Result<Value>> {
+        let engine = self.engine;
+        let step_id = self.step_id;
+        let signal_name = signal_name.into();
+        Box::pin(async move {
+            let _ = crate::engine::exec_pause_with(
+                &engine,
+                &step_id,
+                &signal_name,
+                "parked at a middleware step boundary",
+                None,
+                meta,
+                None,
+            )
+            .await;
+            Err(crate::engine::WorkflowParked.into())
+        })
+    }
 }
+
+/// `StepCall::next` 的实现（**至多一次**：用 `take()` 保证只推进一次）。
+#[derive(Clone)]
+pub(crate) struct NextStep(
+    pub(crate) Arc<
+        std::sync::Mutex<
+            Option<Box<dyn FnOnce() -> BoxFuture<'static, Result<Value>> + Send + Sync>>,
+        >,
+    >,
+);
+
+impl NextStep {
+    pub(crate) fn new(
+        f: impl FnOnce() -> BoxFuture<'static, Result<Value>> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(std::sync::Mutex::new(Some(Box::new(f)))))
+    }
+
+    /// 取走并执行。第二次调用返回错误（对齐 `next()` 的至多一次语义）。
+    pub(crate) fn take_and_call(&self) -> BoxFuture<'static, Result<Value>> {
+        let taken = self.0.lock().ok().and_then(|mut g| g.take());
+        match taken {
+            Some(f) => f(),
+            None => Box::pin(async {
+                anyhow::bail!("step wrapper called next() more than once for the same step")
+            }),
+        }
+    }
+}
+
+/// step 包装层：返回本次 step 的结果。**可叠加**，先注册的在最外层。
+///
+/// 替代旧的单值 `StepInterceptor`（见 `docs/decisions/0016`）：
+/// - 短路（原 `Skip`）= 不调 `next`，直接返回缓存值；
+/// - 泊车（原 `Park`）= 不调 `next`，改调引擎的 pause 原语后返回 `WorkflowParked`。
+pub type StepWrapper =
+    Arc<dyn Fn(StepCall) -> BoxFuture<'static, Result<Value>> + Send + Sync>;
 
 /// 中间件（对齐 TS `Middleware`：一个 server 函数）。
 ///

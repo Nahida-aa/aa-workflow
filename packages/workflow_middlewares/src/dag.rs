@@ -39,7 +39,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use aa_workflow_core::middleware::{
-    Middleware, MiddlewareServerFnArgs, StepAction, StepEvent, StepInterceptor,
+    Middleware, MiddlewareServerFnArgs, StepCall, StepWrapper,
 };
 use aa_workflow_dag::DagShape;
 
@@ -48,6 +48,16 @@ pub const INTERIM_GOAL_SIGNAL: &str = "__interim-goal";
 
 /// `RunWorkflowOptions.meta` 里的计划信封字段。
 pub const DAG_PLAN_FIELD: &str = "__dagPlan";
+
+/// 包装层的决定（锁内算出，锁外执行）。
+enum Decision {
+    /// 继续执行本 step。
+    Pass,
+    /// 复用已有结果（不执行闭包，落 checkpoint）。
+    Skip(serde_json::Value),
+    /// 在本次 drive 的边界泊车。
+    Park { meta: Option<serde_json::Value> },
+}
 
 /// 读某个 run 的日志（引擎事件数组）。
 pub type GetEvents =
@@ -138,45 +148,59 @@ pub fn dag_policies(shape: Arc<DagShape>, get_events: Arc<GetEvents>) -> Middlew
 
             let state: Arc<Mutex<PlanState>> = Arc::new(Mutex::new(st));
 
-            let intercept: StepInterceptor = Arc::new(move |ev: &StepEvent<'_>| {
-                let mut st = state.lock().expect("dag policies state lock");
+            let wrapper: StepWrapper = Arc::new(move |call: StepCall| {
+                let state = state.clone();
+                let parked = parked.clone();
+                Box::pin(async move {
+                    // 判定全程在同步块里完成，**先释放所有锁再 await**
+                    // （guard 非 Send，跨 await 会被拒 —— 也会真的卡住并发）。
+                    // 锁中毒时一律 Pass（旁路失败不该拦住 step）。
+                    let decision = (|| {
+                        let mut st = state.lock().ok()?;
 
-                // ① 临时目标：入口判定——上一个 step 完成后 goals 已全齐则泊车。
-                //    当前 step 尚未执行，所以先判定，再决定是否记入它。
-                if !st.goals.is_empty()
-                    && !st.done.is_empty()
-                    && st.goals.iter().all(|g| st.done.contains(g))
-                {
-                    // 防御：同一 run 只泊一次。
-                    let mut p = parked.lock().expect("park lock");
-                    if !p.insert(ev.run_id.to_string()) {
-                        return None;
+                        // ① 临时目标：入口判定——上一个 step 完成后 goals 已全齐
+                        //    则泊车。当前 step 尚未执行，所以先判定，再决定是否记入它。
+                        if !st.goals.is_empty()
+                            && !st.done.is_empty()
+                            && st.goals.iter().all(|g| st.done.contains(g))
+                        {
+                            // 防御：同一 run 只泊一次。
+                            let mut p = parked.lock().ok()?;
+                            if !p.insert(call.run_id.clone()) {
+                                return Some(Decision::Pass);
+                            }
+                            // 本段已全部达成 → 清累积（泊车后续驱的新段重新累积）。
+                            let goals = std::mem::take(&mut st.goals);
+                            st.done.clear();
+                            return Some(Decision::Park {
+                                meta: Some(serde_json::json!({ "goals": goals })),
+                            });
+                        }
+
+                        // ② redo：有源结果 → 复用（同时算「达成」）。
+                        if let Some(result) = st.lookup.get(&call.step_id).cloned() {
+                            st.done.insert(call.step_id.clone());
+                            return Some(Decision::Skip(result));
+                        }
+
+                        // ③ redoSet 里的 step（或源里没有的）真跑：若它本身是
+                        //    目标，入口即记达成——本次真执行会落 STEP_FINISHED。
+                        if st.goals.iter().any(|g| g == &call.step_id) {
+                            st.done.insert(call.step_id.clone());
+                        }
+                        Some(Decision::Pass)
+                    })()
+                    .unwrap_or(Decision::Pass);
+                    match decision {
+                        Decision::Pass => call.next().await,
+                        Decision::Skip(result) => call.skip(result).await,
+                        Decision::Park { meta } => {
+                            call.park(INTERIM_GOAL_SIGNAL, meta).await
+                        }
                     }
-                    // 本段已全部达成 → 清累积（泊车后续驱的新段重新累积）。
-                    let goals = std::mem::take(&mut st.goals);
-                    st.done.clear();
-                    drop(st);
-                    drop(p);
-                    return Some(StepAction::Park {
-                        signal_name: INTERIM_GOAL_SIGNAL.to_string(),
-                        meta: Some(serde_json::json!({ "goals": goals })),
-                    });
-                }
-
-                // ② redo：有源结果 → Skip 复用（同时算「达成」）。
-                if let Some(result) = st.lookup.get(ev.step_id).cloned() {
-                    st.done.insert(ev.step_id.to_string());
-                    return Some(StepAction::Skip { result });
-                }
-
-                // ③ redoSet 里的 step（或源里没有的）真跑：若它本身是目标，
-                //    入口即记达成——本次真执行会落 STEP_FINISHED。
-                if st.goals.iter().any(|g| g == ev.step_id) {
-                    st.done.insert(ev.step_id.to_string());
-                }
-                None
+                })
             });
-            sc.set_step_interceptor(intercept);
+            sc.push_step_wrapper(wrapper);
 
             sc.next(None).await
         })

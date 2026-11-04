@@ -13,18 +13,19 @@
 //! | --- | --- |
 //! | `next({ context: {...} })` 扩展 ctx | [`MiddlewareServerFnArgs::next`]`(ext)`（一次调用，同构） |
 //! | 在 `next` 前后加行为（计时 / 日志） | `server` 闭包里 `sc.next(..).await` 前后 |
-//! | `ctx.step = wrapped` 拦截 step | [`MiddlewareServerFnArgs::set_step_interceptor`] |
+//! | `ctx.step = wrapped` 拦截 step | [`MiddlewareServerFnArgs::push_step_wrapper`]（可叠加） |
 //!
 //! 剩下的差异是**语言必然**，不是设计取舍：
 //!
 //! 1. `TCtxExt` 的类型交集：TS 编译期 `UnionToIntersection`，Rust 运行期
 //!    serde 反序列化（同 axum extensions）。
-//! 2. `ctx.step` 是方法不是字段，所以「拦截」被收成显式 API
-//!    （`set_step_interceptor`），而不是赋值覆盖。
+//! 2. `ctx.step` 是方法不是字段：擦除下移到包装层（`engine` 上的属性），
+//!    `T` 的推导留在方法签名上。所以「拦截」是 `push_step_wrapper` +
+//!    不调 `next()`，**不是**赋值覆盖。
 //!
-//! Rust 侧还**多**一项能力：拦截器能返回 `Park`（在 step 边界停下整条
-//! drive），`server` 也能 `take_over`（跳过 handler 直接出结果）。见
-//! `docs/decisions/0002-rust-step-hooks.md`。
+//! Rust 侧还**多**两项能力：包装层能 `park`（在 step 边界停下整条 drive），
+//! `server` 也能 `take_over`（跳过 handler 直接出结果）。见
+//! `docs/decisions/0016-step-onion.md`。
 //!
 //! # 使用者不用写 `<Ext>`（内置中间件固定 `Middleware<(), ()>`）
 //!
@@ -63,6 +64,6 @@ pub use reseed::{LoadResults, ReseedPlan, reseed};
 /// ```
 pub mod prelude {
     pub use aa_workflow_core::middleware::{
-        Middleware, MiddlewareServerFn, MiddlewareServerFnArgs, StepAction, StepEvent, StepInterceptor,
+        Middleware, MiddlewareServerFn, MiddlewareServerFnArgs, StepCall, StepWrapper,
     };
 }

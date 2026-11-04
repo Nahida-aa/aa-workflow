@@ -14,17 +14,16 @@
 //! | 读源时机 | 首次 drive（`startRun` 里） | 首次 drive（首个真实 step 入口） |
 //! | 源在首驱前没了 | 导入 0 条 → 真跑 | 查不到 → 真跑（**相同**） |
 //!
-//! # 为什么是 step 拦截器
+//! # 为什么是 step 包装层
 //!
-//! 要对「即将执行的 step」在**执行之前**介入——[`StepAction::Skip`] 正是
-//! 这个时机；TS 版靠覆盖 `ctx.step` 表达同一件事，Rust 版对齐为受控的
-//! [`MiddlewareServerFnArgs::set_step_interceptor`]。
+//! 要对「即将执行的 step」在**执行之前**介入；TS 版靠覆盖 `ctx.step` 表达
+//! 同一件事，Rust 版对齐为可叠加的
+//! [`MiddlewareServerFnArgs::push_step_wrapper`]——不调 `next()` 即短路，
+//! 用 [`StepCall::skip`] 把源结果作为本 step 的 checkpoint 落盘。
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use aa_workflow_core::middleware::{
-    Middleware, MiddlewareServerFnArgs, StepAction, StepEvent, StepInterceptor,
-};
+use aa_workflow_core::middleware::{Middleware, MiddlewareServerFnArgs, StepCall, StepWrapper};
 
 /// 一次 redo 的计划：从哪里播种、哪些 step 重跑。
 #[derive(Debug, Clone)]
@@ -76,29 +75,39 @@ where
                 let cache: Arc<Mutex<Option<HashMap<String, serde_json::Value>>>> =
                     Arc::new(Mutex::new(None));
 
-                let intercept: StepInterceptor = Arc::new(move |ev: &StepEvent<'_>| {
-                    // redoSet 里的 step 要真跑。
-                    if redo.contains(ev.step_id) {
-                        return None;
-                    }
-                    let mut guard = cache.lock().expect("reseed cache lock");
-                    if guard.is_none() {
-                        *guard = match load_results(&plan.source_run_id) {
-                            Ok(m) => Some(m),
-                            // 源读不到 → 「没有可复用结果」，真跑（与引擎版
-                            // 「导入 0 条」同义）。
-                            Err(_) => Some(HashMap::new()),
-                        };
-                    }
-                    match guard.as_ref().and_then(|m| m.get(ev.step_id)) {
-                        Some(result) => Some(StepAction::Skip {
-                            result: result.clone(),
-                        }),
-                        // 源里没有这个 step（新加的 / 上次失败的）→ 真跑。
-                        None => None,
-                    }
+                let wrapper: StepWrapper = Arc::new(move |call: StepCall| {
+                    let cache = cache.clone();
+                    let redo = redo.clone();
+                    let plan = plan.clone();
+                    let load_results = load_results.clone();
+                    Box::pin(async move {
+                        // 判定在同步块里完成，**先释放锁再 await**。
+                        // 锁中毒按「没有可复用结果」处理 → 真跑。
+                        let reused = (|| {
+                            // redoSet 里的 step 要真跑。
+                            if redo.contains(&call.step_id) {
+                                return None;
+                            }
+                            let mut guard = cache.lock().ok()?;
+                            if guard.is_none() {
+                                *guard = match load_results(&plan.source_run_id) {
+                                    Ok(m) => Some(m),
+                                    // 源读不到 → 「没有可复用结果」，真跑（与引擎版
+                                    // 「导入 0 条」同义）。
+                                    Err(_) => Some(HashMap::new()),
+                                };
+                            }
+                            guard.as_ref().and_then(|m| m.get(&call.step_id)).cloned()
+                        })();
+                        match reused {
+                            // 短路：源结果作为本 step 的 checkpoint 落盘。
+                            Some(result) => call.skip(result).await,
+                            // 源里没有这个 step（新加的 / 上次失败的）→ 真跑。
+                            None => call.next().await,
+                        }
+                    })
                 });
-                sc.set_step_interceptor(intercept);
+                sc.push_step_wrapper(wrapper);
             }
 
             sc.next(None).await

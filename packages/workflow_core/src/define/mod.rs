@@ -898,8 +898,7 @@ mod tests {
     use crate::engine::{RunWorkflowOptions, run_workflow};
     use crate::event::RunStatus;
     use crate::middleware::{
-        Middleware, MiddlewareServerFn, MiddlewareServerFnArgs, StepAction, StepEvent,
-        StepInterceptor,
+        Middleware, MiddlewareServerFn, MiddlewareServerFnArgs, StepCall, StepWrapper,
     };
     use crate::run_store::{InMemoryStore, RunStore};
     use serde_json::Value;
@@ -1083,29 +1082,42 @@ mod tests {
         );
     }
 
-    /// **step 拦截器**（本仓有意扩展）：server 里 `set_step_interceptor`，
-    /// 对真实执行的 step 作出 Skip/Park/透传决定。
+    /// **step 包装链**（本仓有意扩展）：server 里 `push_step_wrapper`，
+    /// 不调 `next` 即短路（原 Skip）；调引擎 pause 原语即泊车（原 Park）。
     #[tokio::test]
-    async fn step_interceptor_can_skip_and_park() {
+    async fn step_wrapper_can_skip_and_park() {
         let store = Arc::new(InMemoryStore::new());
         let ran = Arc::new(Mutex::new(Vec::new()));
         let ran_mw = ran.clone();
 
         let wf = create_workflow(CreateWorkflowConfig::new("mw-interceptor").input::<Value>())
             .middleware([Middleware::new().server(move |mut sc: MiddlewareServerFnArgs| {
-                let intercept: StepInterceptor = Arc::new(|ev: &StepEvent<'_>| {
-                    match ev.step_id {
-                        "b" => Some(StepAction::Skip {
-                            result: serde_json::json!("B-CACHED"),
-                        }),
-                        "c" => Some(StepAction::Park {
-                            signal_name: "__test-park".into(),
-                            meta: None,
-                        }),
-                        _ => None,
-                    }
+                let engine = sc.ctx.engine.clone();
+                let w: StepWrapper = Arc::new(move |call: StepCall| {
+                    let engine = engine.clone();
+                    Box::pin(async move {
+                        match call.step_id.as_str() {
+                            // 短路：不调 next，用 skip 把缓存值作为 checkpoint 落盘。
+                            "b" => call.skip(serde_json::json!("B-CACHED")).await,
+                            // 泊车：不调 next，改调引擎的 pause 原语。
+                            "c" => {
+                                let _ = crate::engine::exec_pause_with(
+                                    &engine,
+                                    "c",
+                                    "__test-park",
+                                    "parked by test wrapper",
+                                    None,
+                                    None,
+                                    None,
+                                )
+                                .await;
+                                Err(crate::engine::WorkflowParked.into())
+                            }
+                            _ => call.next().await,
+                        }
+                    })
                 });
-                sc.set_step_interceptor(intercept);
+                sc.push_step_wrapper(w);
                 Box::pin(async move { sc.next(None).await })
             })])
             .handler({
