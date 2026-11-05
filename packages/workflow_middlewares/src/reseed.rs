@@ -40,8 +40,21 @@ pub struct ReseedPlan {
 ///
 /// 返回的 map 应只包含该 run 日志里 `STEP_FINISHED` 的结果；`redo_set` 过滤由本
 /// 中间件负责（保持读函数简单）。
+/// 从源 run 读「step_id → (结果, 该事件在源日志里的下标)」。
+///
+/// 下标用于写 `STEP_FINISHED.meta.imported_from.index`——与引擎版
+/// `reseed_run` 的记录方式一致，丢了就只能事后重算。
 pub type LoadResults =
-    dyn Fn(&str) -> anyhow::Result<HashMap<String, serde_json::Value>> + Send + Sync;
+    dyn Fn(&str) -> anyhow::Result<HashMap<String, SourceStep>> + Send + Sync;
+
+/// 源 run 里一个 step 的结果与出处。
+#[derive(Clone, Debug)]
+pub struct SourceStep {
+    /// step 的结果。
+    pub result: serde_json::Value,
+    /// 该 `STEP_FINISHED` 在源 run 日志里的下标。
+    pub index: usize,
+}
 
 /// 按 plan 复用源 run 的 step 结果。
 ///
@@ -59,7 +72,7 @@ pub type LoadResults =
 /// ```
 pub fn reseed<F>(plan: ReseedPlan, load_results: F) -> Middleware
 where
-    F: Fn(&str) -> anyhow::Result<HashMap<String, serde_json::Value>> + Send + Sync + 'static,
+    F: Fn(&str) -> anyhow::Result<HashMap<String, SourceStep>> + Send + Sync + 'static,
 {
     let redo: std::collections::HashSet<String> = plan.redo_set.iter().cloned().collect();
     let plan = Arc::new(plan);
@@ -84,14 +97,21 @@ where
                 sc.wrap_step(step_layer({
                     let redo = redo.clone();
                     let lookup = lookup.clone();
+                    let source_run_id = plan.source_run_id.clone();
                     move |req: &aa_workflow_core::middleware::StepRequest| {
                         // redoSet 里的 step 要真跑。
                         if redo.contains(&req.step_id) {
                             return Decision::Pass;
                         }
                         match lookup.get(&req.step_id).cloned() {
-                            // 短路：源结果作为本 step 的 checkpoint 落盘。
-                            Some(result) => Decision::Skip(result),
+                            // 短路：源结果作为本 step 的 checkpoint 落盘，**带溯源**。
+                            Some(src) => Decision::SkipImported {
+                                result: src.result,
+                                from: aa_workflow_core::event::ImportedFrom {
+                                    run_id: source_run_id.clone(),
+                                    index: src.index,
+                                },
+                            },
                             // 源里没有这个 step（新加的 / 上次失败的）→ 真跑。
                             None => Decision::Pass,
                         }

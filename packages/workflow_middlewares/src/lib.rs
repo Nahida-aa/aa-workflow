@@ -56,7 +56,7 @@ mod reseed;
 
 pub use dag::{DAG_PLAN_FIELD, GetEvents, INTERIM_GOAL_SIGNAL, dag_policies};
 pub use interim_goals::{INTERIM_GOALS_FIELD, interim_goals};
-pub use reseed::{LoadResults, ReseedPlan, reseed};
+pub use reseed::{LoadResults, ReseedPlan, SourceStep, reseed};
 
 /// 供文档链接用：把常用名字提上来，避免调用方再导一遍 core。
 ///

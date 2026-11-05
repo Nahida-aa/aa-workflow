@@ -11,23 +11,23 @@ use aa_workflow_core::{
     RunWorkflowOptions, WorkflowCtx,
 };
 
-use aa_workflow_middlewares::{reseed, ReseedPlan};
+use aa_workflow_middlewares::{reseed, ReseedPlan, SourceStep};
 
-/// 源 run 的结果提取器：把日志里的 STEP_FINISHED 收成 map。
-fn loader(store: Arc<InMemoryStore>) -> impl Fn(&str) -> anyhow::Result<HashMap<String, serde_json::Value>>
-+ Send
-+ Sync
-+ 'static {
+/// 源 run 的结果提取器：把日志里的 STEP_FINISHED 收成 map（带日志下标，
+/// 供 `STEP_FINISHED.meta.imported_from.index` 使用）。
+fn loader(
+    store: Arc<InMemoryStore>,
+) -> impl Fn(&str) -> anyhow::Result<HashMap<String, SourceStep>> + Send + Sync + 'static {
     move |run_id: &str| {
         let mut m = HashMap::new();
-        for e in store.get_events(run_id)? {
+        for (index, e) in store.get_events(run_id)?.into_iter().enumerate() {
             if let WorkflowEvent::StepFinished {
                 step_id,
                 result: Some(r),
                 ..
             } = e
             {
-                m.insert(step_id, r);
+                m.insert(step_id, SourceStep { result: r, index });
             }
         }
         Ok(m)
@@ -130,6 +130,38 @@ async fn redo_reuses_steps_outside_redo_set() {
         })
         .collect();
     assert_eq!(finished, vec!["a", "b", "c"]);
+
+    // 复用的 checkpoint 必须带**导入溯源**（与引擎版 `reseed_run` 一致）
+    let imported: Vec<(String, String, usize)> = store
+        .get_events("rev2")
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            WorkflowEvent::StepFinished {
+                step_id,
+                meta: Some(m),
+                ..
+            } => m
+                .imported_from
+                .as_ref()
+                .map(|f| (step_id.clone(), f.run_id.clone(), f.index)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        imported.len(),
+        2,
+        "只有 a/b 被复用，它们才应有 imported_from"
+    );
+    for (step_id, from_run, _index) in &imported {
+        assert!(step_id == "a" || step_id == "b", "只该是 a/b，得到 {step_id}");
+        assert_eq!(from_run, "rev1", "溯源应指向源 run");
+    }
+    // 真跑的 c 不应有溯源
+    assert!(
+        !imported.iter().any(|(id, _, _)| id == "c"),
+        "真执行的 step 不该有 imported_from"
+    );
 }
 
 #[tokio::test]

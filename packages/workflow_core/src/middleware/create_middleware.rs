@@ -191,7 +191,26 @@ impl StepRequest {
         let engine = self.engine;
         let step_id = self.step_id;
         Box::pin(async move {
-            crate::engine::record_skipped_step(&engine, &step_id, result)
+            crate::engine::record_skipped_step(&engine, &step_id, result, None)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    /// [`skip`](Self::skip) + 事件上的 `meta`（例如导入溯源
+    /// [`ImportedFrom`](crate::event::ImportedFrom)）。
+    ///
+    /// 复用已有结果时必须能用这个而不是 `skip`：`STEP_FINISHED.meta` 里的
+    /// 溯源是**可观测性数据**，丢了就只能事后从源日志重算。
+    pub fn skip_with_meta(
+        self,
+        result: Value,
+        meta: crate::event::StepMeta,
+    ) -> BoxFuture<'static, std::result::Result<Value, StepServiceError>> {
+        let engine = self.engine;
+        let step_id = self.step_id;
+        Box::pin(async move {
+            crate::engine::record_skipped_step(&engine, &step_id, result, Some(meta))
                 .await
                 .map_err(Into::into)
         })

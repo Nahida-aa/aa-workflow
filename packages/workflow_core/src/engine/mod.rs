@@ -516,6 +516,7 @@ pub(crate) async fn record_skipped_step(
 engine: &Arc<EngineRuntime>,
 step_id: &str,
 result: serde_json::Value,
+meta: Option<crate::event::StepMeta>,
 ) -> anyhow::Result<serde_json::Value> {
 let ts = now_ms();
 let ev = WorkflowEvent::StepFinished {
@@ -530,7 +531,7 @@ let ev = WorkflowEvent::StepFinished {
         result: Some(result.clone()),
         error: None,
     }],
-    meta: None,
+    meta,
 };
 engine.append(&ev)?;
 engine.set_live(

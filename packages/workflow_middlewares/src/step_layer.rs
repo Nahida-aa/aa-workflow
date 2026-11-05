@@ -22,6 +22,14 @@ pub enum Decision {
     Pass,
     /// 短路：不执行闭包，把 `result` 作为 checkpoint 落盘。
     Skip(serde_json::Value),
+    /// 短路 + **导入溯源**：与 [`Skip`](Self::Skip) 相同，但 `STEP_FINISHED.meta`
+    /// 里记下这条 checkpoint 来自哪个 run 的哪条事件。
+    SkipImported {
+        /// step 的结果。
+        result: serde_json::Value,
+        /// 出处。
+        from: aa_workflow_core::event::ImportedFrom,
+    },
     /// 在边界泊车（整条 drive 结束）。
     Park {
         signal: String,
@@ -89,6 +97,12 @@ impl Service<StepRequest> for PolicyService {
             }
             // 短路 / 泊车都需要 engine（落 checkpoint、pause）——请求里带着。
             Decision::Skip(result) => req.skip(result),
+            Decision::SkipImported { result, from } => req.skip_with_meta(
+                result,
+                aa_workflow_core::event::StepMeta {
+                    imported_from: Some(from),
+                },
+            ),
             Decision::Park { signal, meta } => req.park(signal, meta),
         }
     }
