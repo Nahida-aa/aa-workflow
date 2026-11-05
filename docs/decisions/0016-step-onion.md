@@ -37,7 +37,12 @@ ours:  ctx.step("load", f)    →  Leaf(持有 f)          → call(StepRequest)
 ```
 
 `f` 在**调用点**就确定了，所以每次 `ctx.step(...)` 就是「注册一个持有该闭包的
-service，然后调用它」——与 axum 在注册期确定 handler 没有本质差别。
+service，然后调用它」——与 axum 完全同构。
+
+**不要**把它说成「axum 只注册一次、我们每个 step 都注册」——那是错的：axum 的
+`.route()` 也是每调用一次注册一次（多个路由、循环里的 `.route()` 都是）。
+唯一的差别是注册与 `call` 之间隔多久（axum 隔到请求到达，我们紧接着调），
+而那不是形状差异——axum 的 `oneshot`、测试代码同样是「注册完立刻调用」。
 
 ```rust
 // 请求：纯数据（+ engine 句柄，供 skip / park 落盘）
