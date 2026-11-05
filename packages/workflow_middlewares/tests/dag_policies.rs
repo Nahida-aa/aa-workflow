@@ -100,13 +100,13 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
     let out = run_workflow(
         RunWorkflowOptions::new(Arc::new(mk()), store.clone())
             .input(serde_json::json!({}))
-            .meta(serde_json::json!({
+            .meta(aa_workflow_core::define::MetaBag::from_json(serde_json::json!({
                 "__dagPlan": {
                     "source_run_id": "r1",
                     "from": ["translate"],
                     "goals": ["merge"],
                 }
-            }))
+            })))
             .run_id("r2"),
     )
     .outcome()

@@ -40,8 +40,8 @@ use serde_json::Value;
 pub trait MetaKey {
     /// `ctx.meta` 里这个字段的键名。
     const KEY: &'static str;
-    /// 字段的值类型。
-    type Value: serde::de::DeserializeOwned;
+    /// 字段的值类型。既要能读（反序列化）也要能写（构造 options 时序列化）。
+    type Value: serde::de::DeserializeOwned + serde::Serialize;
 }
 
 /// 读 `ctx.meta` 的入口 —— 与 [`ExtBag`](crate::define::ExtBag) 同构。
@@ -100,6 +100,53 @@ impl MetaBag {
         let v = self.raw.get(K::KEY)?.clone();
         serde_json::from_value(v).ok()
     }
+
+    /// 写入一个字段（构造 `RunWorkflowOptions.meta` 时用）。
+    ///
+    /// 链式调用可以叠加多个字段：
+    ///
+    /// ```ignore
+    /// meta: MetaBag::new()
+    ///     .set::<DagPlanKey>(plan)
+    ///     .set::<ReseedKey>(reseed_plan),
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// 值无法序列化时 panic——调用点在构造 options 处，属于编程错误。
+    #[must_use]
+    pub fn set<K: MetaKey>(mut self, value: K::Value) -> Self {
+        let serialized = serde_json::to_value(&value).unwrap_or_else(|e| {
+            panic!(
+                "ctx.meta.{}: 值无法序列化为 JSON（{}）",
+                K::KEY,
+                e
+            )
+        });
+        if !self.raw.is_object() {
+            self.raw = Value::Object(Default::default());
+        }
+        self.raw
+            .as_object_mut()
+            .expect("just ensured object")
+            .insert(K::KEY.to_string(), serialized);
+        self
+    }
+
+    /// 空袋（无任何 meta）。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 从原始 JSON 构造。
+    ///
+    /// 迁移旧代码（`json!({ "字段": ... })`）时用；新代码优先
+    /// [`set`](Self::set)——它让键名与类型来自同一个 `MetaKey`，拼错会编译报错。
+    #[must_use]
+    pub fn from_json(raw: Value) -> Self {
+        Self::from_value(raw)
+    }
 }
 
 /// 为 meta key 声明 `ctx.meta` 上的访问器 —— 对齐 `impl_ext_accessors!`。
@@ -141,7 +188,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[derive(serde::Deserialize, Debug, PartialEq)]
+    #[derive(serde::Deserialize, serde::Serialize, Debug, PartialEq)]
     pub struct DagPlan {
         goals: Vec<String>,
     }
@@ -206,4 +253,43 @@ mod tests {
         // 其余字段照常可读（按 key 独立反序列化）
         assert_eq!(bag.as_value()["other"], 1);
     }
+
+    #[test]
+    fn set_then_get_round_trips() {
+        // `set`（写 options）与 `get`（读 ctx.meta）共用同一个 KEY，必须对称。
+        let plan = DagPlan {
+            goals: vec!["a".into(), "b".into()],
+        };
+        let bag = MetaBag::new().set::<DagPlanKey>(plan);
+        assert_eq!(
+            bag.dag_plan(),
+            DagPlan {
+                goals: vec!["a".into(), "b".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn set_chains_multiple_fields() {
+        let bag = MetaBag::new()
+            .set::<DagPlanKey>(DagPlan { goals: vec![] })
+            .set::<OtherKey>(42u32);
+        assert!(bag.try_dag_plan().is_some());
+        assert_eq!(bag.try_other(), Some(42));
+    }
+
+    #[test]
+    fn empty_bag_set_is_still_object() {
+        // 空袋上 set 之后必须变成 JSON object，再读得到
+        let bag = MetaBag::default().set::<OtherKey>(7u32);
+        assert!(bag.as_value().is_object());
+        assert_eq!(bag.try_other(), Some(7));
+    }
+
+    pub struct OtherKey;
+    impl MetaKey for OtherKey {
+        const KEY: &'static str = "__other";
+        type Value = u32;
+    }
+    crate::impl_meta_accessors!(OtherKey => OtherAccess, other, try_other);
 }

@@ -162,6 +162,47 @@ create_workflow(cfg)
    在编译期已保证有值，可以直接返回非 `Option`。
    这与 `ExtBag` 的 `get` / `try_get` 双入口一致，不需要新概念。
 
+## 构造 `meta`：`MetaBag::set`，不用合并结构体
+
+**被否决：结构体字面量 + `..Default::default()`。**
+
+看起来最惯用：
+
+```rust
+RunWorkflowOptions {
+    workflow: wf,
+    meta: Meta { dag_plan: Some(plan), ..Default::default() },
+    ..Default::default()
+}
+```
+
+但 `Meta` 这个合并结构体**没法由多个外部 crate 自动生成**——已验证（三 crate
+worktree：`pkg_a` / `pkg_b` 各自有 meta 类型，`app` 必须手写 `struct Meta`
+把它们拼起来；Rust 没有「往别人的 struct 加字段」这回事）。
+
+让使用者写 `struct Meta` 就是 0013/0015 否决过的 `Combined`，换了个名字而已。
+
+**决策：`meta` 字段类型是 `MetaBag`，用 `set::<K>()` 构造。**
+
+```rust
+RunWorkflowOptions {
+    workflow: wf,
+    meta: MetaBag::new()
+        .set::<DagPlanKey>(plan)
+        .set::<ReseedKey>(rp),
+    input: Some(json!({})),
+    ..Default::default()          // 其余字段用 ..default()，这仍是对的
+}
+```
+
+零合并：每个中间件包只声明自己的 `MetaKey`，使用者按 key 逐项 `set`，
+不需要知道「合并后是什么类型」。
+
+**代价**：`meta` 这一格不能用 `..Default::default()` 省略——它是 `MetaBag`
+而不是 `Option`。其余字段照常。
+
+`MetaBag::get` 与 `set` 共用同一个 `KEY`，写读对称，拼错两边都编译报错。
+
 ## 证据
 
 ### 已实现（第一阶段）：`MetaBag` + 访问器

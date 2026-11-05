@@ -155,7 +155,10 @@ pub struct RunWorkflowOptions {
     /// 存在的理由：Rust 的中间件无法覆盖 `ctx.step`（方法是 `&self` 上的），
     /// 钩子也拿不到 `ctx`——策略参数需要一个钩子能读到的通道，见
     /// `docs/decisions/0011-run-meta-and-plugins.md`。
-    pub meta: Option<serde_json::Value>,
+    ///
+    /// 构造：`MetaBag::new().set::<DagPlanKey>(plan)`——按 key 类型化写入，
+    /// 与 `ctx.meta.dag_plan()` 的读取对称（见 `docs/decisions/0017`）。
+    pub meta: crate::define::MetaBag,
     /// 命中即停（本地扩展；上游用 handler 内 early `return`）。
     pub interim_goals: Option<Vec<String>>,
     /// re-seed 计划（redo 侧，`reseedRun`，f2-lite 自有）。只在**全新
@@ -265,7 +268,7 @@ impl RunWorkflowOptions {
             run_store,
             run_id: None,
             input: serde_json::Value::Null,
-            meta: None,
+            meta: crate::define::MetaBag::new(),
             interim_goals: None,
             reseed_run: None,
             attach: false,
@@ -279,8 +282,11 @@ impl RunWorkflowOptions {
 
     /// **Run 级参数**（本仓有意扩展）——中间件的 wrap 前置与策略钩子读取。
     /// 与 `input` 的分工见 [`RunWorkflowOptions::meta`] 字段文档。
-    pub fn meta(mut self, v: serde_json::Value) -> Self {
-        self.meta = Some(v);
+    ///
+    /// 类型化写入用 [`MetaBag::set`]：
+    /// `opts.meta(MetaBag::new().set::<DagPlanKey>(plan))`。
+    pub fn meta(mut self, v: crate::define::MetaBag) -> Self {
+        self.meta = v;
         self
     }
 
@@ -952,7 +958,7 @@ async fn drive(
     let inner = Arc::new(EngineRuntime {
         run_id: run_id.clone(),
         input: opts.input.clone(),
-        meta: opts.meta.clone(),
+        meta: Some(opts.meta.as_value().clone()),
         state_mirror,
         prev_state_snapshot: Mutex::new(state),
         store: store.clone(),
