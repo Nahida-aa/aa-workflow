@@ -60,7 +60,7 @@ options 必须满足。
 
 ### 类型由中间件定义（复用 `ctx.ext` 的模式）
 
-与 [`ExtNamespace`](0015-ext-namespaces.md) 完全同构：
+与 [`ExtNamespace`](0015-ext-namespaces.md) 同构，**但多一层**——见下节「为什么不能只照抄」。
 
 ```rust
 pub trait MetaKey {
@@ -82,6 +82,30 @@ impl_meta_accessors!(DagPlanKey => DagPlanAccess, dag_plan, try_dag_plan);
 读取侧与 `ctx.ext` **写法一致**（`MetaBag` ↔ `ExtBag`，`impl_meta_accessors!` ↔
 `impl_ext_accessors!`），使用者学一套就够。
 
+### 为什么不能只照抄 `ctx.ext`（重要）
+
+`ctx.ext` 的类型支持**不是** `middleware()` 累积出来的——`middleware()` 的签名是
+`fn middleware(&mut self, impl IntoIterator<Item = AnyMiddleware>) -> Self`，
+返回 `Self`，类型不变。`ctx.ext` 的类型来自**扩展 trait**：
+
+```rust
+impl_ext_accessors!(AuthNs => AuthAccess, auth, try_auth);   // → impl AuthAccess for ExtBag
+use auth_pkg::AuthAccess;                                     // 使用者 use 一下就能调
+```
+
+也就是说 `ctx.ext.auth()` 能否编译，只取决于 trait 在不在作用域里，与挂了哪些
+中间件**完全无关**。代价是：**「这个扩展真的会被写入吗」编译期不知道**，
+缺失时 panic（`ExtBag::get` 的文档明写了这点）。
+
+meta 如果照抄，能得到的只有：
+- ✅ 字段名拼错 → 编译报错
+- ✅ 结构不对 → 编译报错
+- ❌ **忘了传 `__dagPlan` → 运行期 panic**
+
+用户的要求是「编译检查能报错就不要 debug 才发现」，第三条必须也在编译期。
+要做到它，就必须让**声明**进入类型——这就是下面的 `MetaMiddleware<K>`。
+
+
 ### 中间件携带声明：`MetaMiddleware<K>`
 
 ```rust
@@ -94,8 +118,8 @@ pub fn dag(spec: DagSpec) -> MetaMiddleware<DagPlanKey>   // 包着 Middleware +
 
 ### 链式单注册（偏离 0014）
 
-数组要求元素同型，`MetaMiddleware<A>` 与 `MetaMiddleware<B>` 放不进同一个 `[T; N]`。
-唯一不要求使用者写类型参数的办法是逐个注册：
+数组要求**元素完全同型**，`MetaMiddleware<A>` 与 `MetaMiddleware<B>` 放不进同一个
+`[T; N]`。逐个注册是唯一不要求使用者写类型参数的办法：
 
 ```rust
 create_workflow(cfg)
@@ -126,9 +150,17 @@ create_workflow(cfg)
 2. **偏离 0014**：`.middleware()` 从收数组改为收单个。
 3. **`MetaMiddleware<K>` 与 `Middleware` 是两个类型**：中间件包要同时提供
    （`dag()` 返回带声明的版本；不需要 meta 的场景用普通 `Middleware`）。
-4. **`MetaBag::get` 仍可能 panic**（与 `ExtBag` 一致）：声明了却运行期没有值
-   （例如中间件没写 `next(Some(..))`）是另一类错误，编译期管不到——meta 是
-   **输入**，值由调用方提供，只能保证「类型对上了」。
+4. **中间件内部读 meta 走 `MetaBag`**（与 `ctx.ext` 对称）：
+
+   ```rust
+   sc.ctx.meta: MetaBag                       // 不再是 Option<Value>
+   sc.ctx.meta.try_dag_plan()                 // Option<DagPlan>——中间件用这个
+   ```
+
+   **中间件必须用 `try_*`**：meta 是调用方给的，中间件阶段它可能没传
+   （例如没传 `__dagPlan` 表示「不启用 DAG」）。而 handler 侧的 `dag_plan()`
+   在编译期已保证有值，可以直接返回非 `Option`。
+   这与 `ExtBag` 的 `get` / `try_get` 双入口一致，不需要新概念。
 
 ## 证据
 
@@ -139,7 +171,10 @@ create_workflow(cfg)
 
 - `middleware()` 改成收单个后，是否保留一个批量入口（如 `.middlewares([...])`
   收 `AnyMiddleware`，不带类型声明）？——保留能让简单场景不退化。
-- 中间件内部（`MiddlewareServerFnArgs`）怎么读 meta：现在 `sc.ctx.meta` 是擦除的
-  `Option<Value>`；是否换成 `MetaBag`？（换成 `MetaBag` 不需要泛型参数，
-  与 `sc.ctx.ext` 一致）
 - 缺失声明时，报错点在 `run_workflow` 调用处而非 `.handler()` 处；诊断信息要写清缺哪个 key。
+
+## 已定
+
+- 中间件内部读 meta：换成 `MetaBag`，用 `try_*` 取（见「代价」第 4 条）。
+  与 `ctx.ext` 的 `ExtBag` 对称，且不需要给 `MiddlewareServerFnArgs` 加泛型。
+
