@@ -129,15 +129,21 @@ impl ReseedRun {
     }
 }
 
-#[derive(Clone)]
-pub struct RunWorkflowOptions {
+pub struct RunWorkflowOptions<W = AnyWorkflowDefinition>
+where
+    W: crate::define::WorkflowMetaSpec + Into<AnyWorkflowDefinition> + Clone,
+{
     /// 要驱动的 workflow。**必填**（由 [`Self::new`] 保证）。
     ///
     /// 用上游的名字，让本字段与 TanStack 的 `RunWorkflowOptions.workflow` 一字不差。
     /// `AnyWorkflowDefinition` = 擦除态的 [`WorkflowDefinition`]（上游是
     /// `WorkflowDefinition<any,any,any>` 的别名；Rust 没有 `any` 的双向可赋值，
     /// 所以擦除态是独立类型）。内部持 `Arc`，clone 只加引用计数。
-    pub workflow: AnyWorkflowDefinition,
+    ///
+    /// **`W` 决定 [`Self::meta`] 的类型**：传具体的 `WorkflowDefinition<.., M>`
+    /// 时，`meta` 必须是 `MetaBag<M>`（缺字段编译报错）；传擦除态
+    /// `AnyWorkflowDefinition` 时不约束（声明已在擦除时丢失）。
+    pub workflow: W,
     /// 事件日志 / run 元数据的落盘位置。**必填**（由 [`Self::new`] 保证）。
     pub run_store: Arc<dyn RunStore>,
 
@@ -158,7 +164,10 @@ pub struct RunWorkflowOptions {
     ///
     /// 构造：`MetaBag::new().set::<DagPlanKey>(plan)`——按 key 类型化写入，
     /// 与 `ctx.meta.dag_plan()` 的读取对称（见 `docs/decisions/0017`）。
-    pub meta: crate::define::MetaBag,
+    ///
+    /// 类型由 [`Self::workflow`] 决定：声明了 meta 需求的 workflow 要求这里
+    /// 提供对应字段，**缺了在构造处编译报错**。
+    pub meta: <W as crate::define::WorkflowMetaSpec>::Meta,
     /// 命中即停（本地扩展；上游用 handler 内 early `return`）。
     pub interim_goals: Option<Vec<String>>,
     /// re-seed 计划（redo 侧，`reseedRun`，f2-lite 自有）。只在**全新
@@ -254,21 +263,50 @@ pub struct RunWorkflowOptions {
     pub publish: Option<PublisherFn>,
 }
 
-impl RunWorkflowOptions {
-    /// **必填项在这里**：`workflow` + `run_store`。构造完这两个就一定齐了。
-    /// `workflow` 收 `impl Into<AnyWorkflowDefinition>`，所以三种写法都直接可用：
-    /// 擦除态 `WorkflowDefinition`、带类型的 `WorkflowDefinition<TInput, …>`
-    /// （`create_workflow` 的产物），以及它们的 `Arc`。
-    pub fn new(
-        workflow: impl Into<AnyWorkflowDefinition>,
-        run_store: Arc<dyn RunStore>,
-    ) -> Self {
+// 手写而不是 `derive`：`meta` 的类型是关联类型 `<W as WorkflowMetaSpec>::Meta`，
+// `derive` 不会给它加 `Clone` 约束。
+impl<W> Clone for RunWorkflowOptions<W>
+where
+    W: crate::define::WorkflowMetaSpec + Into<AnyWorkflowDefinition> + Clone,
+    <W as crate::define::WorkflowMetaSpec>::Meta: Clone,
+{
+    fn clone(&self) -> Self {
         Self {
-            workflow: workflow.into(),
+            workflow: self.workflow.clone(),
+            run_store: Arc::clone(&self.run_store),
+            run_id: self.run_id.clone(),
+            input: self.input.clone(),
+            meta: self.meta.clone(),
+            interim_goals: self.interim_goals.clone(),
+            reseed_run: self.reseed_run.clone(),
+            attach: self.attach,
+            deadline: self.deadline,
+            min_yield_remaining_ms: self.min_yield_remaining_ms,
+            yield_resume_at: self.yield_resume_at,
+            thread_id: self.thread_id.clone(),
+            publish: self.publish.clone(),
+        }
+    }
+}
+
+impl<W> RunWorkflowOptions<W>
+where
+    W: crate::define::WorkflowMetaSpec + Into<AnyWorkflowDefinition> + Clone,
+    <W as crate::define::WorkflowMetaSpec>::Meta: crate::define::EmptyMeta,
+{
+    /// **必填项在这里**：`workflow` + `run_store`。构造完这两个就一定齐了。
+    ///
+    /// `workflow` 的类型 `W` 会**保留**（不擦除），因为 `meta` 的类型由它决定：
+    /// 声明了 meta 需求的 workflow 必须配对应的 `MetaBag`（见 [`Self::meta`]）。
+    ///
+    /// 擦除态的 `AnyWorkflowDefinition` 也能传——那时 `meta` 不受约束。
+    pub fn new(workflow: W, run_store: Arc<dyn RunStore>) -> Self {
+        Self {
+            workflow,
             run_store,
             run_id: None,
             input: serde_json::Value::Null,
-            meta: crate::define::MetaBag::new(),
+            meta: <<W as crate::define::WorkflowMetaSpec>::Meta as crate::define::EmptyMeta>::empty_meta(),
             interim_goals: None,
             reseed_run: None,
             attach: false,
@@ -279,13 +317,19 @@ impl RunWorkflowOptions {
             publish: None,
         }
     }
+}
 
+impl<W> RunWorkflowOptions<W>
+where
+    W: crate::define::WorkflowMetaSpec + Into<AnyWorkflowDefinition> + Clone,
+    <W as crate::define::WorkflowMetaSpec>::Meta: crate::define::EmptyMeta,
+{
     /// **Run 级参数**（本仓有意扩展）——中间件的 wrap 前置与策略钩子读取。
     /// 与 `input` 的分工见 [`RunWorkflowOptions::meta`] 字段文档。
     ///
     /// 类型化写入用 [`MetaBag::set`]：
     /// `opts.meta(MetaBag::new().set::<DagPlanKey>(plan))`。
-    pub fn meta(mut self, v: crate::define::MetaBag) -> Self {
+    pub fn meta(mut self, v: <W as crate::define::WorkflowMetaSpec>::Meta) -> Self {
         self.meta = v;
         self
     }
@@ -467,7 +511,10 @@ pub use crate::registry::select_workflow_version;
 /// On resume, `ctx.step` short-circuits succeeded checkpoints (cached result,
 /// `run` not re-executed) and rethrows failed ones. Multiplex step results
 /// however you like — the log is the only source of truth.
-pub fn run_workflow(mut opts: RunWorkflowOptions) -> RunEventStream {
+pub fn run_workflow<W>(mut opts: RunWorkflowOptions<W>) -> RunEventStream
+where
+    W: crate::define::WorkflowMetaSpec + Into<AnyWorkflowDefinition> + Clone,
+{
     // run_id 必须**只在这里定一次**并写回 `opts`：stream 自己要按它回 store 读
     // 结果（[`Self::outcome`]），drive 也要按它写日志。两处各生成一次的话，
     // `opts.run_id` 为 `None` 时跨过一个 ms 边界就会拿到两个不同的 id。
@@ -482,6 +529,27 @@ pub fn run_workflow(mut opts: RunWorkflowOptions) -> RunEventStream {
     // `outcome()` 要在 drain 之后回 store 读状态，所以这条 clone 得活过引擎。
     let store = opts.run_store.clone();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<WorkflowEvent>();
+
+    // **擦除**：`W` 只服务于编译期的 meta 校验，运行期一律看擦除态。
+    // meta 的值原样搬过去（类型层丢了，值还在）。
+    let mut opts = RunWorkflowOptions {
+        workflow: opts.workflow.clone().into(),
+        run_store: opts.run_store.clone(),
+        run_id: opts.run_id.clone(),
+        input: opts.input.clone(),
+        meta: crate::define::MetaBag::<crate::define::Nil>::from_value(
+            crate::define::MetaValue::erased(&opts.meta).clone(),
+        ),
+        interim_goals: opts.interim_goals.clone(),
+        reseed_run: opts.reseed_run.clone(),
+        attach: opts.attach,
+        deadline: opts.deadline,
+        min_yield_remaining_ms: opts.min_yield_remaining_ms,
+        yield_resume_at: opts.yield_resume_at,
+        thread_id: opts.thread_id.clone(),
+        publish: opts.publish.clone(),
+    };
+    let _ = &mut opts;
 
     // 入口分派（上游 `run-workflow.ts:165-168` 的 attach 分支）。attach 是
     // **只读**的：不 spawn drive、不写日志、不改 RunState，直接把日志重放进流。

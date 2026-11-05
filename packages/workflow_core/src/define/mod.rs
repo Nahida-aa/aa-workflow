@@ -24,9 +24,9 @@ pub mod ext;
 pub mod meta;
 pub mod meta_spec;
 mod state_handle;
-pub use define_workflow::{CreateWorkflowConfig, WorkflowBuilder, create_workflow};
+pub use define_workflow::{CreateWorkflowConfig, MetaMiddleware, WorkflowBuilder, create_workflow};
 pub use ext::{DefExt, ExtBag, ExtNamespace, merge_ext_value};
-pub use meta::{MetaBag, MetaKey};
+pub use meta::{EmptyMeta, MetaBag, MetaKey};
 pub use meta_spec::{Cons, Nil, Push};
 pub use state_handle::StateHandle;
 
@@ -690,6 +690,65 @@ pub struct WorkflowDefinition<
 // is only `PhantomData`. The type parameters carry no data, so `Clone` holds
 // unconditionally — a definition stays cloneable whatever the authoring site
 // declared.
+impl<TInput, TOutput, TState, TMeta> WorkflowDefinition<TInput, TOutput, TState, TMeta> {
+    /// 这个 workflow **需要**的 meta 类型 —— `RunWorkflowOptions` 用它约束
+    /// `meta` 字段（见 `docs/decisions/0017`）。
+    ///
+    /// 类型层是 `Cons<K1, Cons<K2, Nil>>`，值层是 `MetaBag<同样的列表>`。
+    pub fn meta_type() -> PhantomData<crate::define::MetaBag<TMeta>> {
+        PhantomData
+    }
+}
+
+/// 「一个 workflow 的 meta 需求是什么」——`RunWorkflowOptions` 用它把
+/// `workflow` 字段的类型传导到 `meta` 字段。
+///
+/// 两实现覆盖两种用法：
+///
+/// - 具体的 `WorkflowDefinition<.., M>`：`Meta = MetaBag<M>`，**meta 受约束**；
+/// - 擦除态 [`AnyWorkflowDefinition`]：`Meta = MetaBag`（即 `MetaBag<Nil>`），
+///   不做约束——擦除时声明已经丢了。
+///
+/// 所以「声明了 meta 的 workflow」必须**不擦除**地传给 options 才有编译检查；
+/// 一旦 `Arc::new(wf)` 转成擦除态，约束就没了。这是有意的：擦除态本身就是
+/// 「我放弃了编译期信息」。
+pub trait WorkflowMetaSpec {
+    /// 这个 workflow 要求的 `meta` 类型。
+    type Meta: Clone + crate::define::EmptyMeta + MetaValue;
+}
+
+/// meta 的擦除形态——运行期一律看它（`run_workflow` 入口把类型层擦掉）。
+pub trait MetaValue {
+    /// 擦除后的 JSON。
+    fn erased(&self) -> &serde_json::Value;
+}
+
+impl<P> MetaValue for crate::define::MetaBag<P> {
+    fn erased(&self) -> &serde_json::Value {
+        self.as_value()
+    }
+}
+
+impl<TInput, TOutput, TState, TMeta: Clone> WorkflowMetaSpec
+    for WorkflowDefinition<TInput, TOutput, TState, TMeta>
+{
+    type Meta = crate::define::MetaBag<TMeta>;
+}
+
+impl WorkflowMetaSpec for AnyWorkflowDefinition {
+    type Meta = crate::define::MetaBag;
+}
+
+impl WorkflowMetaSpec for Arc<AnyWorkflowDefinition> {
+    type Meta = crate::define::MetaBag;
+}
+
+impl<TInput, TOutput, TState, TMeta: Clone> WorkflowMetaSpec
+    for Arc<WorkflowDefinition<TInput, TOutput, TState, TMeta>>
+{
+    type Meta = crate::define::MetaBag<TMeta>;
+}
+
 impl<TInput, TOutput, TState, TMeta> Clone for WorkflowDefinition<TInput, TOutput, TState, TMeta> {
     fn clone(&self) -> Self {
         WorkflowDefinition {
@@ -764,18 +823,18 @@ impl std::ops::Deref for AnyWorkflowDefinition {
     }
 }
 
-impl<TInput, TOutput, TState> From<WorkflowDefinition<TInput, TOutput, TState>>
+impl<TInput, TOutput, TState, TMeta: Clone> From<WorkflowDefinition<TInput, TOutput, TState, TMeta>>
     for AnyWorkflowDefinition
 {
-    fn from(w: WorkflowDefinition<TInput, TOutput, TState>) -> Self {
+    fn from(w: WorkflowDefinition<TInput, TOutput, TState, TMeta>) -> Self {
         Self(Arc::new(w.erase()))
     }
 }
 
-impl<TInput, TOutput, TState> From<Arc<WorkflowDefinition<TInput, TOutput, TState>>>
+impl<TInput, TOutput, TState, TMeta: Clone> From<Arc<WorkflowDefinition<TInput, TOutput, TState, TMeta>>>
     for AnyWorkflowDefinition
 {
-    fn from(w: Arc<WorkflowDefinition<TInput, TOutput, TState>>) -> Self {
+    fn from(w: Arc<WorkflowDefinition<TInput, TOutput, TState, TMeta>>) -> Self {
         // Unique refcount → move the fields out, no clone at all. Shared →
         // fall back to a clone (only PhantomData actually differs).
         let inner = Arc::try_unwrap(w).unwrap_or_else(|shared| (*shared).clone());
@@ -789,13 +848,14 @@ impl From<Arc<AnyWorkflowDefinition>> for AnyWorkflowDefinition {
     }
 }
 
-impl<TInput, TOutput, TState> WorkflowDefinition<TInput, TOutput, TState> {
+impl<TInput, TOutput, TState, TMeta> WorkflowDefinition<TInput, TOutput, TState, TMeta> {
     /// Drop the type parameters, keeping every real field. The parameters are
     /// `PhantomData` only — the handler, validator and middleware types are
     /// already erased (`WorkflowHandler` etc.) — so this is a field move, and
     /// the only thing erased is the *authoring-site* type information.
     fn erase(self) -> WorkflowDefinition {
         WorkflowDefinition {
+            _meta: PhantomData,
             id: self.id,
             version: self.version,
             description: self.description,
@@ -810,7 +870,6 @@ impl<TInput, TOutput, TState> WorkflowDefinition<TInput, TOutput, TState> {
             _input: PhantomData,
             _output: PhantomData,
             _state: PhantomData,
-            _meta: PhantomData,
         }
     }
 }

@@ -36,7 +36,7 @@ impl DriveOpts<'_> {
         workflow: Arc<WorkflowDefinition<TInput, TOutput, TState>>,
         store: Arc<dyn RunStore>,
         input: serde_json::Value,
-    ) -> RunWorkflowOptions {
+    ) -> RunWorkflowOptions<Arc<WorkflowDefinition<TInput, TOutput, TState>>> {
         let mut ro = RunWorkflowOptions::new(workflow, store).input(input);
         if let Some(id) = self.run_id {
             ro = ro.run_id(id);

@@ -80,10 +80,19 @@ pub trait MetaKey {
 ///
 /// **读取侧不关心 `P`**：`ctx.meta` 是 `MetaBag`（默认 `P = Nil`），按 key 取值即可。
 /// 之所以能这样分：写侧要证明「齐了」，读侧只需要「有什么读什么」。
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct MetaBag<P = Nil> {
     raw: Value,
     _provided: std::marker::PhantomData<P>,
+}
+
+impl<P: Clone> Clone for MetaBag<P> {
+    fn clone(&self) -> Self {
+        MetaBag {
+            raw: self.raw.clone(),
+            _provided: std::marker::PhantomData,
+        }
+    }
 }
 
 impl Default for MetaBag<Nil> {
@@ -96,6 +105,7 @@ impl Default for MetaBag<Nil> {
 }
 
 impl<P> MetaBag<P> {
+
     /// 从引擎的擦除表示构造。非对象（`null` / 缺失）视为空袋。
     pub fn from_value(raw: Value) -> MetaBag<Nil> {
         MetaBag {
@@ -319,4 +329,20 @@ mod tests {
         type Value = u32;
     }
     crate::impl_meta_accessors!(OtherKey => OtherAccess, other, try_other);
+}
+
+/// 能构造「空」的 meta —— `RunWorkflowOptions::new` 用它给默认值，
+/// 那时 `P` 由 workflow 的类型决定，调用点写不出来。
+pub trait EmptyMeta {
+    /// 空的 meta（没有任何字段）。
+    fn empty_meta() -> Self;
+}
+
+impl<P> EmptyMeta for MetaBag<P> {
+    fn empty_meta() -> Self {
+        MetaBag {
+            raw: Value::Object(Default::default()),
+            _provided: std::marker::PhantomData,
+        }
+    }
 }

@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/meta_missing.rs:33:15
+   |
+33 |         .meta(MetaBag::<Nil>::new());
+   |          ---- ^^^^^^^^^^^^^^^^^^^^^ expected `MetaBag<Cons<LoopLimitKey, Nil>>`, found `MetaBag`
+   |          |
+   |          arguments to this method are incorrect
+   |
+   = note: expected struct `MetaBag<Cons<LoopLimitKey, Nil>>`
+              found struct `MetaBag<Nil>`
+note: method defined here
+  --> src/engine/run_workflow.rs
+   |
+   |     pub fn meta(mut self, v: <W as crate::define::WorkflowMetaSpec>::Meta) -> Self {
+   |            ^^^^

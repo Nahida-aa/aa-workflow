@@ -205,47 +205,58 @@ RunWorkflowOptions {
 
 ## 证据
 
-### 已实现（第一阶段）：`MetaBag` + 访问器
+### 已实现：`MetaBag` + 访问器
 
 - `packages/workflow_core/src/define/meta.rs`：`MetaKey` / `MetaBag` /
   `impl_meta_accessors!`，与 `ext.rs` 逐项对称。
 - `BaseCtx.meta: MetaBag`（原 `Option<Value>`）。
-- 目前提供：**字段名与结构错误的编译期检查**；缺失值仍是运行期 panic。
 
-### 已验证（第二阶段设计）：从 workflow 提取 options 的类型
+### 已实现：声明累积 + 从 workflow 推断
 
-spike 跑通，形状如下（**使用者不写任何类型参数**）：
+**关键简化**（用户指出）：`run_workflow` 只收一个 `RunWorkflowOptions`，而
+`workflow` 就在它里面——所以 `meta` 的类型**从 `workflow` 字段推断**，不需要
+「提供 vs 需要」的比对，也不需要额外的类型参数。
 
 ```rust
-let wf = create_workflow().middleware(dag()).middleware(reseed()).handler();
-//   wf: Workflow<Cons<DagPlanKey, Cons<ReseedKey, Nil>>>
-
-let opts = RunOptions::of(&wf)                       // 类型从 wf 提取
-    .set::<DagPlanKey>(plan)                         // 推进「已提供」集合
-    .set::<ReseedKey>(rp);
-
-run(wf, opts);   // 要求「已提供」== 「需要」
+pub struct RunWorkflowOptions<W: WorkflowMetaSpec> {
+    pub workflow: W,
+    pub meta: <W as WorkflowMetaSpec>::Meta,   // ← 由 W 决定
+    ...
+}
 ```
 
-关键点：`RunOptions<L, F>` 携带**两个**列表——`L` 是 workflow 声明的需求，
-`F` 是已经 `set` 过的；`run` 处要求 `F == L`。
+`MetaBag<P>` 的 `set` 推进 `P`，所以「类型说提供了什么」与「实际数据」天然同步：
 
-漏 `set` 一个 key 时，编译器报：
-
-```
-expected `Cons<ReseedKey, Nil>`, found `Nil`
+```rust
+MetaBag::<Nil>::new()                   // MetaBag<Nil>
+    .set::<DagPlanKey>(plan)            // MetaBag<Cons<DagPlanKey, Nil>>
 ```
 
-——缺哪个一眼可见。这是「忘了传值也编译报错」的实现方式。
+漏提供字段时，编译错误是：
 
-`RunOptions::of(&wf) -> RunOptions<L>` 是**零注解**的关键：类型从 workflow 定义
-提取，而不是使用者书写（后者是本文否决的方案 A）。
+```
+expected struct `MetaBag<Cons<LoopLimitKey, Nil>>`
+     found struct `MetaBag<Nil>`
+```
+
+——缺哪个 key 一眼可见。
+
+**擦除态不约束**：`AnyWorkflowDefinition` 的 `Meta` 是 `MetaBag<Nil>`。
+声明在擦除时丢了，约束也就没了。这是有意的：擦除态本身就表示「放弃了
+编译期信息」。所以想得到检查，就别把 workflow 转成擦除态再传。
+
+### 测试
+
+- `tests/meta_typed.rs`：声明了 meta 的 workflow 配上正确的 `MetaBag`，
+  值确实到达 `ctx.meta`；擦除态不受约束。
+- `tests/ui/meta_missing.rs` + `trybuild`：**锁定编译失败**。运行期测试锁不住
+  编译期错误，只能靠 UI 测试。改变报错文案时用 `TRYBUILD=overwrite` 重新生成。
 
 ## 待定
 
 - `.middleware()` 收单个还是保留批量入口。
-- 第二阶段落地时，`RunWorkflowOptions` 与 `run_workflow` 的签名改动面
-  （现有调用点全部要改成 `RunOptions::of(&wf)` 链式）。
+- 一个中间件声明多个 key（元组）——`Declares` 的 GAT 约束未能编译通过，
+  暂时只支持单 key。
 
 
 ## 已定
