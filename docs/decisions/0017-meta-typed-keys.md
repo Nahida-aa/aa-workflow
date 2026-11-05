@@ -164,14 +164,48 @@ create_workflow(cfg)
 
 ## 证据
 
-类型层累积已用 spike 验证可行（`.middleware(a).middleware(b).run()` 能编译，
-累积出嵌套类型）。生产实现与测试待补。
+### 已实现（第一阶段）：`MetaBag` + 访问器
+
+- `packages/workflow_core/src/define/meta.rs`：`MetaKey` / `MetaBag` /
+  `impl_meta_accessors!`，与 `ext.rs` 逐项对称。
+- `BaseCtx.meta: MetaBag`（原 `Option<Value>`）。
+- 目前提供：**字段名与结构错误的编译期检查**；缺失值仍是运行期 panic。
+
+### 已验证（第二阶段设计）：从 workflow 提取 options 的类型
+
+spike 跑通，形状如下（**使用者不写任何类型参数**）：
+
+```rust
+let wf = create_workflow().middleware(dag()).middleware(reseed()).handler();
+//   wf: Workflow<Cons<DagPlanKey, Cons<ReseedKey, Nil>>>
+
+let opts = RunOptions::of(&wf)                       // 类型从 wf 提取
+    .set::<DagPlanKey>(plan)                         // 推进「已提供」集合
+    .set::<ReseedKey>(rp);
+
+run(wf, opts);   // 要求「已提供」== 「需要」
+```
+
+关键点：`RunOptions<L, F>` 携带**两个**列表——`L` 是 workflow 声明的需求，
+`F` 是已经 `set` 过的；`run` 处要求 `F == L`。
+
+漏 `set` 一个 key 时，编译器报：
+
+```
+expected `Cons<ReseedKey, Nil>`, found `Nil`
+```
+
+——缺哪个一眼可见。这是「忘了传值也编译报错」的实现方式。
+
+`RunOptions::of(&wf) -> RunOptions<L>` 是**零注解**的关键：类型从 workflow 定义
+提取，而不是使用者书写（后者是本文否决的方案 A）。
 
 ## 待定
 
-- `middleware()` 改成收单个后，是否保留一个批量入口（如 `.middlewares([...])`
-  收 `AnyMiddleware`，不带类型声明）？——保留能让简单场景不退化。
-- 缺失声明时，报错点在 `run_workflow` 调用处而非 `.handler()` 处；诊断信息要写清缺哪个 key。
+- `.middleware()` 收单个还是保留批量入口。
+- 第二阶段落地时，`RunWorkflowOptions` 与 `run_workflow` 的签名改动面
+  （现有调用点全部要改成 `RunOptions::of(&wf)` 链式）。
+
 
 ## 已定
 

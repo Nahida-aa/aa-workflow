@@ -21,9 +21,11 @@ use crate::middleware::Middleware;
 
 mod define_workflow;
 pub mod ext;
+pub mod meta;
 mod state_handle;
 pub use define_workflow::{CreateWorkflowConfig, WorkflowBuilder, create_workflow};
 pub use ext::{DefExt, ExtBag, ExtNamespace, merge_ext_value};
+pub use meta::{MetaBag, MetaKey};
 pub use state_handle::StateHandle;
 
 /// Boxed async step-returning future. Steps are spawned inside the engine's
@@ -129,12 +131,12 @@ pub struct BaseCtx<TInput = serde_json::Value, TState = serde_json::Value> {
     /// 上游是类型交集（`ctx.user` 是字段）；Rust 里是**按命名空间存取**
     /// （`ctx.ext.user()`）——使用者不需要定义任何合并类型。见 [`ExtBag`]。
     pub ext: ExtBag,
-    /// **Run 级参数**（`RunWorkflowOptions.meta`，本仓有意扩展）——中间件的
-    /// wrap 前置与策略钩子读取；handler 不消费、不落 `RunState`。与 `input`
-    /// 的分工：input 是业务数据（不可变、handler 消费），meta 是策略参数
-    /// （每次 drive 可换、中间件消费）。
-    #[doc(hidden)]
-    pub meta: Option<serde_json::Value>,
+    /// **Run 级参数**（`RunWorkflowOptions.meta`，本仓有意扩展）——按 key 类型化
+    /// 读取，与 [`ext`](Self::ext) 同构（见 [`MetaBag`] / `docs/decisions/0017`）。
+    ///
+    /// 与 `input` 的分工：input 是业务数据（不可变、handler 消费），meta 是
+    /// 策略参数（每次 drive 可换、中间件消费）。不落 `RunState`。
+    pub meta: MetaBag,
     /// Engine-side runtime, mirror of TanStack's closure-captured `engine`.
     /// Not part of the public API.
     #[doc(hidden)]
@@ -165,7 +167,9 @@ impl BaseCtx<serde_json::Value, serde_json::Value> {
         Self {
             run_id: engine.run_id.clone(),
             input: engine.input.clone(),
-            meta: engine.meta.clone(),
+            meta: MetaBag::from_value(
+                engine.meta.clone().unwrap_or(serde_json::Value::Null),
+            ),
             state,
             ext: {
                 let raw = engine.ext_extra.lock().expect("ext lock").clone();

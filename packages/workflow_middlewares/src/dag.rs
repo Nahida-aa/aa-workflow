@@ -80,8 +80,8 @@ pub fn dag_policies(shape: Arc<DagShape>, get_events: Arc<GetEvents>) -> Middlew
             let plan = sc
                 .ctx
                 .meta
-                .as_ref()
-                .and_then(|m| m.get(DAG_PLAN_FIELD))
+                .as_value()
+                .get(DAG_PLAN_FIELD)
                 .and_then(|v| v.as_object())
                 .cloned();
 

@@ -60,8 +60,8 @@ where
             let goals: Vec<String> = sc
                 .ctx
                 .meta
-                .as_ref()
-                .and_then(|m| m.get(INTERIM_GOALS_FIELD))
+                .as_value()
+                .get(INTERIM_GOALS_FIELD)
                 .and_then(|v| v.as_array())
                 .map(|a| {
                     a.iter()
