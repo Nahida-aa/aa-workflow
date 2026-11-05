@@ -1,119 +1,145 @@
-# 0017 — 插件的 meta 字段在编译期可见：`MetaKey` + 链式注册累积
+# 0017 — 中间件让 `RunWorkflowOptions.meta` 的类型在编译期可见
 
 **状态**：草案（2026-11-05），待评审
 **关联**：[0011](0011-run-meta-and-plugins.md)（meta 通道的来源）、
-[0013](0013-middleware-generics.md) / [0015](0015-ext-namespaces.md)
-（两次否决「让使用者算类型」）、[0014](0014-middleware-takes-array.md)（收数组，本文偏离）
+[0015](0015-ext-namespaces.md)（`ctx.ext` 的命名空间模式，本文复用）、
+[0013](0013-middleware-generics.md)（否决「让使用者算类型」）、
+[0014](0014-middleware-takes-array.md)（收数组，本文偏离）、
+[0016](0016-step-onion.md)（钩子 = 中间件，因此不需要插件）
 
 ## 问题
 
-`RunWorkflowOptions.meta` 现在是 `Option<serde_json::Value>`。插件消费其中的字段
-（`__dagPlan`、`__reseed`…），但**使用方在写代码时看不到有哪些字段、各是什么类型**：
+`RunWorkflowOptions.meta` 现在是 `Option<serde_json::Value>`，中间件从中读策略参数
+（`__dagPlan`、`__reseed`…）。但**使用方写代码时看不到有哪些字段、各是什么类型**：
 参数名写错、结构不对，都要等运行期反序列化失败才发现。
 
-用户确定的验收标准：**编译期可见，写代码时就报错**（debug 时才发现不算解决）。
+验收标准（用户确定）：**编译期可见，写代码时就报错**。
+
+## 先决条件：不需要插件系统
+
+Rust 侧**目前没有插件**。需要检查它是否必要：
+
+- 钩子已经都是中间件（[0016](0016-step-onion.md)：step 的包装就是 tower `Layer`，
+  生命周期钩子只是挂在执行路径不同位置的层）；
+- 中间件若能影响 `RunWorkflowOptions` 的类型，插件原本独有的能力（声明参数）也随之落位。
+
+两条都成立，**插件没有剩余的必要性**。本文因此完全以中间件承载。
 
 ## 被否决的选项
 
-### A. `RunWorkflowOptions<M>` 泛型参数由使用者填写
+### A. `RunWorkflowOptions<M>` 由使用者填类型
+
+`run_workflow::<MyMeta>(opts)`——使用者必须自己算出 M。
+[0013](0013-middleware-generics.md) / [0015](0015-ext-namespaces.md) 已两次否决。
+
+### B. 模块增强（TS 的 `declare module`）
+
+Rust 没有等价物；靠 trait 一致性模拟会与孤儿规则冲突，且注册是**全局**的
+（一个 workflow 声明的字段，进程里所有 workflow 都看得到）。
+
+### C. 从 handler 的 ctx 反推
+
+**方向反了。** handler 默认写法是闭包：
 
 ```rust
-run_workflow::<MyMeta>(opts)
+.handler(|ctx| async move { let plan = ctx.meta.dag_plan(); .. })
 ```
 
-**否决**：这正是 [0013](0013-middleware-generics.md) / [0015](0015-ext-namespaces.md)
-两次否决过的形状——「使用者必须自己算出类型」。插件可能来自多个外部开发者，
-使用者既不知道也不该知道它们怎么拼成一个类型。
+闭包的参数类型是**推断**出来的，不是标注的。靠它反推要么要求使用者手写
+`|ctx: Ctx<_, _, Meta<...>>|`（回到 A），要么改掉闭包用法。
 
-### B. 模块增强（TS 的做法）
+类型必须**从中间件流向 handler**：中间件声明 → builder 累积 → handler 只需读取 →
+options 必须满足。
 
-```rust
-// 插件包
-impl MetaRegistry for ... { /* 全局注册 "__dagPlan" */ }
-```
+### D. 中间件在运行期控制
 
-**否决**：Rust 没有 TS 的 `declare module`，全局注册只能靠 trait 一致性——
-同一个 key 被两个 crate 注册就冲突，且**全局可见**（一个 workflow 注册的字段，
-进程里所有 workflow 都看得到）。多 workflow 场景会互相污染。
-
-### C. 让中间件在运行期控制 meta 的类型
-
-**否决**：中间件在运行期执行，拿到的 ctx 是擦除的。类型必须在编译期确定，
-而编译期能拿到插件信息的唯一位置是**构建 workflow 的那一行**。
+中间件在运行期执行，ctx 是擦除的；类型必须在编译期确定，而编译期能拿到
+中间件信息的唯一位置是**构建 workflow 的那一行**。
 
 ## 决策
 
-**类型由插件定义，在构建 workflow 时累积给使用方；使用者零注解。**
+### 类型由中间件定义（复用 `ctx.ext` 的模式）
 
-### 插件侧：一个 key 类型
+与 [`ExtNamespace`](0015-ext-namespaces.md) 完全同构：
 
 ```rust
 pub trait MetaKey {
     const KEY: &'static str;
-    type Value;
+    type Value: serde::de::DeserializeOwned;
 }
 
-// 插件包里（外部 crate 自己定义，不必改 core）
+// 中间件包（外部 crate 自己定义）
 pub struct DagPlanKey;
 impl MetaKey for DagPlanKey {
     const KEY: &'static str = "__dagPlan";
     type Value = DagPlan;
 }
 
-pub fn dag(spec: DagSpec) -> TypedMiddleware<DagPlanKey> { .. }
+impl_meta_accessors!(DagPlanKey => DagPlanAccess, dag_plan, try_dag_plan);
+// → ctx.meta.dag_plan()  /  ctx.meta.try_dag_plan()
 ```
 
-`TypedMiddleware<K>` 与现有 `Middleware` 的关系：它包着一个 `Middleware`（策略逻辑
-不变），额外携带 `K` 作为**类型标记**——运行期零开销（`PhantomData`）。
+读取侧与 `ctx.ext` **写法一致**（`MetaBag` ↔ `ExtBag`，`impl_meta_accessors!` ↔
+`impl_ext_accessors!`），使用者学一套就够。
 
-### 使用方：链式注册，类型自动累积
+### 中间件携带声明：`MetaMiddleware<K>`
+
+```rust
+pub fn dag(spec: DagSpec) -> MetaMiddleware<DagPlanKey>   // 包着 Middleware + 类型标记
+```
+
+`K` 是**纯类型标记**（`PhantomData`，运行期零开销）。一个中间件消费多个 key 时
+用元组：`MetaMiddleware<(DagPlanKey, ReseedKey)>`——累积时展开成两个条目，
+读取时各取各的。**不需要新机制**。
+
+### 链式单注册（偏离 0014）
+
+数组要求元素同型，`MetaMiddleware<A>` 与 `MetaMiddleware<B>` 放不进同一个 `[T; N]`。
+唯一不要求使用者写类型参数的办法是逐个注册：
 
 ```rust
 create_workflow(cfg)
-    .m(dag(spec))         // Builder<Cons<DagPlan, Nil>>
-    .m(reseed(plan))      // Builder<Cons<DagPlan, Cons<ReseedPlan, Nil>>>
+    .middleware(auth())        // 普通中间件，无 meta 声明
+    .middleware(dag(spec))     // → 累积 DagPlanKey
+    .middleware(reseed(plan))  // → 累积 ReseedKey
     .handler(|ctx| async move {
-        let plan: &DagPlan = ctx.meta.get::<DagPlanKey>();   // 强类型，无 unwrap
+        let plan = ctx.meta.dag_plan();      // 强类型，无需 unwrap
         ...
     })
-    .run(opts)            // opts.meta: MetaOf<...> —— 类型不符则编译报错
+    .run(opts)                 // opts.meta 缺字段 → 编译报错
 ```
 
-`.m()` 逐个注册（**偏离 [0014](0014-middleware-takes-array.md) 的收数组**）：
-数组要求元素同型，`TypedMiddleware<A>` 与 `TypedMiddleware<B>` 放不进同一个 `[T; N]`。
-用户已明确此处不必对齐上游 TS。
+`.middleware()` 改为收**单个**中间件、可反复调用。`0014` 的「收数组」在这一点上
+被偏离——用户已确认此处不必对齐上游 TS。
 
-### 累积机制
+### 编译期检查落在哪
 
-HList（`Cons<H, T>` / `Nil`）而不是 tuple：
-- tuple 需要为每个长度写 `impl`，且 `(A, B)` 与 `(A, B, C)` 是不同类型，
-  追加要在末尾做，标准库没有现成 trait；
-- HList 只需两个 `impl`（`Nil` 与 `Cons`），追加是 O(1) 类型操作。
-
-`ctx.meta` 类型是 `Meta<L>`：持有 HList 的值，`get::<K>()` 按 key 类型取字段，
-**返回 `&K::Value` 而不是 `Option`**——编译期保证插件注册了就一定有值
-（缺失值在 `.run(opts)` 处就报错了，见下）。
+- `.middleware(..)`：累积「声明了哪些 key」的类型集合（类型层累加，值层不动）
+- `run_workflow(wf, opts)`：`opts.meta` 的类型必须能覆盖该集合，缺则**编译报错**
+- handler 侧：`ctx.meta.dag_plan()` 直接可用，无需 `Option`
 
 ## 代价
 
-1. **builder 的泛型逐层嵌套**：5 个插件 → `Builder<Cons<A, Cons<B, Cons<C, Cons<D, Cons<E, Nil>>>>>>`。
-   编译期没问题，但**错误信息会很长**，且 `Builder` 不能存进 `Vec`（类型必须静态确定）。
-   缓解：把嵌套藏在 `type` 别名后面；错误信息靠 `#[diagnostic::on_unimplemented]` 改善。
-2. **偏离 0014**：`.middleware([...])` 保留（无类型中间件仍可批量注册），
-   `.m()` 是新入口。两个入口并存，使用者要分清哪个携带类型。
-3. **`TypedMiddleware<K>` 与 `Middleware` 是两个类型**：策略包的公开 API 要同时提供
-   （例如 `dag()` 返回带类型的版本，`dag_erased()` 返回普通版本给不需要 meta 的场景）。
-4. **缺失字段的检查在 `.run()` 处**：`opts.meta` 缺字段时，报错点是 `run_workflow`
-   的调用处而非 `.handler()` 处。诊断信息要写清缺哪个 key。
+1. **builder 的泛型逐层嵌套**：N 个带声明的中间件 → N 层嵌套类型。编译期没问题，
+   但错误信息会很长，且 builder 不能存进 `Vec`（类型必须静态确定）。
+   缓解：用 `type` 别名隐藏；用 `#[diagnostic::on_unimplemented]` 改善报错。
+2. **偏离 0014**：`.middleware()` 从收数组改为收单个。
+3. **`MetaMiddleware<K>` 与 `Middleware` 是两个类型**：中间件包要同时提供
+   （`dag()` 返回带声明的版本；不需要 meta 的场景用普通 `Middleware`）。
+4. **`MetaBag::get` 仍可能 panic**（与 `ExtBag` 一致）：声明了却运行期没有值
+   （例如中间件没写 `next(Some(..))`）是另一类错误，编译期管不到——meta 是
+   **输入**，值由调用方提供，只能保证「类型对上了」。
 
 ## 证据
 
-类型层可行已验证（spike：`.m(a).m(b).run()` 能编译，且累积出 HList 类型）。
-生产实现与测试待补。
+类型层累积已用 spike 验证可行（`.middleware(a).middleware(b).run()` 能编译，
+累积出嵌套类型）。生产实现与测试待补。
 
 ## 待定
 
-- `ctx.meta.get::<K>()` 的名字与形状：`get` / `get_ref` / 直接字段访问？
-- 中间件内部（非 handler）怎么读 meta：现在是 `sc.ctx.meta`（擦除的 `Option<Value>`），
-  是否也换成 `Meta<L>`？若换，`MiddlewareServerFnArgs` 也要带泛型参数。
-- 一个插件消费**多个** key 时，`TypedMiddleware<(K1, K2)>` 还是返回 `Meta<Cons<..>>`？
+- `middleware()` 改成收单个后，是否保留一个批量入口（如 `.middlewares([...])`
+  收 `AnyMiddleware`，不带类型声明）？——保留能让简单场景不退化。
+- 中间件内部（`MiddlewareServerFnArgs`）怎么读 meta：现在 `sc.ctx.meta` 是擦除的
+  `Option<Value>`；是否换成 `MetaBag`？（换成 `MetaBag` 不需要泛型参数，
+  与 `sc.ctx.ext` 一致）
+- 缺失声明时，报错点在 `run_workflow` 调用处而非 `.handler()` 处；诊断信息要写清缺哪个 key。
