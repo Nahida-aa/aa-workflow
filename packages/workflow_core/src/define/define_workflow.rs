@@ -319,7 +319,7 @@ impl<TInput, TOutput, TState> WorkflowBuilder<TInput, TOutput, TState> {
         // 中间件折叠（对齐 TS `composeMiddlewares` 的洋葱模型）：
         // 最内层 = typed ctx + handler；每个 middleware 的 `server` 包住内层。
         // server 经 `MiddlewareServerFnArgs` 拿到完整 ctx，可 `next(ext)` /
-        // `set_step_interceptor` / `take_over`。
+        // `wrap_step` / `take_over`。
         let innermost: WorkflowHandler = Arc::new(move |ctx: WorkflowCtx| {
             let handler = Arc::clone(&handler);
             let output_validator = output_validator.clone();

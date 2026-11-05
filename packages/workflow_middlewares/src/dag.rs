@@ -39,9 +39,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use aa_workflow_core::middleware::{
-    Middleware, MiddlewareServerFnArgs, StepCall, StepWrapper,
+    Middleware, MiddlewareServerFnArgs, StepRequest,
 };
 use aa_workflow_dag::DagShape;
+
+use crate::step_layer::{step_layer, Decision};
 
 /// 保留信号名（与 `__timer` 同族）。
 pub const INTERIM_GOAL_SIGNAL: &str = "__interim-goal";
@@ -136,35 +138,29 @@ pub fn dag_policies(shape: Arc<DagShape>, get_events: Arc<GetEvents>) -> Middlew
             // 计划是不变的，直接按值捕获；无锁、无状态。
             let plan = Arc::new(st);
 
-            let wrapper: StepWrapper = Arc::new(move |call: StepCall| {
-                let plan = plan.clone();
-                Box::pin(async move {
-                    // ① 临时目标：入口判定——此前所有 step 完成后 goals 已全齐
-                    //    则泊车。当前 step 尚未执行，所以 `completed` 不含它。
-                    if !plan.goals.is_empty()
-                        && plan.goals.iter().all(|g| call.completed.contains(g))
-                    {
-                        // 泊车会整条 drive 结束，不可能在同一 drive 内触发第二次
-                        // （不需要额外的 `parked` 标记）。
-                        return call
-                            .park(
-                                INTERIM_GOAL_SIGNAL,
-                                Some(serde_json::json!({ "goals": plan.goals })),
-                            )
-                            .await;
-                    }
+            sc.wrap_step(step_layer(move |req: &StepRequest| {
+                // ① 临时目标：入口判定——此前所有 step 完成后 goals 已全齐
+                //    则泊车。当前 step 尚未执行，所以 `completed` 不含它。
+                if !plan.goals.is_empty()
+                    && plan.goals.iter().all(|g| req.completed.contains(g))
+                {
+                    // 泊车会整条 drive 结束，不可能在同一 drive 内触发第二次
+                    // （不需要额外的 `parked` 标记）。
+                    return Decision::Park {
+                        signal: INTERIM_GOAL_SIGNAL.to_string(),
+                        meta: Some(serde_json::json!({ "goals": plan.goals })),
+                    };
+                }
 
-                    // ② redo：有源结果 → 复用（`skip` 会落 STEP_FINISHED，
-                    //    所以它同样进入下一次调用的 `completed`）。
-                    if let Some(result) = plan.lookup.get(&call.step_id).cloned() {
-                        return call.skip(result).await;
-                    }
+                // ② redo：有源结果 → 复用（`skip` 会落 STEP_FINISHED，
+                //    所以它同样进入下一次调用的 `completed`）。
+                if let Some(result) = plan.lookup.get(&req.step_id).cloned() {
+                    return Decision::Skip(result);
+                }
 
-                    // ③ redoSet 里的 step（或源里没有的）真跑。
-                    call.next().await
-                })
-            });
-            sc.push_step_wrapper(wrapper);
+                // ③ redoSet 里的 step（或源里没有的）真跑。
+                Decision::Pass
+            }));
 
             sc.next(None).await
         })

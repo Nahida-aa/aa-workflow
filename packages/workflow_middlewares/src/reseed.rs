@@ -18,12 +18,14 @@
 //!
 //! 要对「即将执行的 step」在**执行之前**介入；TS 版靠覆盖 `ctx.step` 表达
 //! 同一件事，Rust 版对齐为可叠加的
-//! [`MiddlewareServerFnArgs::push_step_wrapper`]——不调 `next()` 即短路，
+//! [`MiddlewareServerFnArgs::wrap_step`]——装一个 tower `Layer`，
 //! 用 [`StepCall::skip`] 把源结果作为本 step 的 checkpoint 落盘。
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aa_workflow_core::middleware::{Middleware, MiddlewareServerFnArgs, StepCall, StepWrapper};
+use aa_workflow_core::middleware::{Middleware, MiddlewareServerFnArgs};
+
+use crate::step_layer::{step_layer, Decision};
 
 /// 一次 redo 的计划：从哪里播种、哪些 step 重跑。
 #[derive(Debug, Clone)]
@@ -72,30 +74,29 @@ where
             // 本 run 就是源 run？不做任何事（禁止自我播种）。
             if plan.source_run_id != sc.ctx.run_id {
                 // **drive 开始时加载一次**，而不是在包装层里懒加载 + 缓存：
-                // `load_results` 是同步函数，放在这里不会阻塞；省掉
-                // `Arc<Mutex<Option<...>>>` 之后包装层就是纯的（只读 plan）。
+                // `load_results` 是同步函数，放在这里不会阻塞；省掉可变状态后
+                // 层就是纯的（只读 plan）。
                 //
                 // 源读不到 → 空表，「没有可复用结果」→ 全部真跑
                 // （与引擎版「导入 0 条」同义）。
                 let lookup = Arc::new(load_results(&plan.source_run_id).unwrap_or_default());
 
-                let wrapper: StepWrapper = Arc::new(move |call: StepCall| {
-                    let lookup = lookup.clone();
+                sc.wrap_step(step_layer({
                     let redo = redo.clone();
-                    Box::pin(async move {
+                    let lookup = lookup.clone();
+                    move |req: &aa_workflow_core::middleware::StepRequest| {
                         // redoSet 里的 step 要真跑。
-                        if redo.contains(&call.step_id) {
-                            return call.next().await;
+                        if redo.contains(&req.step_id) {
+                            return Decision::Pass;
                         }
-                        match lookup.get(&call.step_id).cloned() {
+                        match lookup.get(&req.step_id).cloned() {
                             // 短路：源结果作为本 step 的 checkpoint 落盘。
-                            Some(result) => call.skip(result).await,
+                            Some(result) => Decision::Skip(result),
                             // 源里没有这个 step（新加的 / 上次失败的）→ 真跑。
-                            None => call.next().await,
+                            None => Decision::Pass,
                         }
-                    })
-                });
-                sc.push_step_wrapper(wrapper);
+                    }
+                }));
             }
 
             sc.next(None).await

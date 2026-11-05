@@ -1,7 +1,7 @@
 //! 临时目标的中间件版——**对齐 TS `server` 形状**。
 //!
 //! TS 版包装 `ctx.step`（它是可覆盖的函数属性）来「每个 step 完成后」检查目标；
-//! Rust 对齐为 [`MiddlewareServerFnArgs::push_step_wrapper`]——可叠加的包装层，
+//! Rust 对齐为 [`MiddlewareServerFnArgs::wrap_step`]——可叠加的 tower `Layer`，
 //! 不调 `next()` 即短路，用 [`StepCall::park`] 在边界泊车。
 //!
 //! # 行为
@@ -23,7 +23,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use aa_workflow_core::middleware::{Middleware, MiddlewareServerFnArgs, StepCall, StepWrapper};
+use aa_workflow_core::middleware::{Middleware, MiddlewareServerFnArgs, StepRequest};
+
+use crate::step_layer::{step_layer, Decision};
 
 /// 保留信号名（与 `__timer` 同族）。
 pub const INTERIM_GOAL_SIGNAL: &str = "__interim-goal";
@@ -81,35 +83,28 @@ where
                     .collect();
                 let goals_done_at_start = goals.iter().all(|g| finished_at_start.contains(g));
 
-                // **无状态包装层**：判定全部读 `call.completed`（引擎给的
-                // 「本 drive 已成功 step」快照），不再自带 `done` 累积集合。
+                // **无状态层**：判定全部读 `req.completed`（引擎给的
+                // 「本 drive 已成功 step」快照），不自己累积。
                 //
                 // 为什么可以不累积：进入某个 step 时，此前所有 step 的
                 // `STEP_FINISHED` 都已落盘（在它们自己的链返回前），引擎在
-                // 构造 `StepCall` 时取的快照就是准确的。
+                // 构造请求时取的快照就是准确的。
                 //
                 // 为什么不用 `parked` 标记：泊车会整条 drive 结束
                 // （`WorkflowParked`），不可能在同一 drive 内触发第二次。
-                let wrapper: StepWrapper = Arc::new(move |call: StepCall| {
-                    let goals = goals.clone();
-                    Box::pin(async move {
-                        if goals_done_at_start {
-                            return call.next().await;
-                        }
-                        // 入口判定：goals 是否已全齐（不含本 step——它还没跑）。
-                        let reached = goals.iter().all(|g| call.completed.contains(g));
-                        if reached {
-                            return call
-                                .park(
-                                    INTERIM_GOAL_SIGNAL,
-                                    Some(serde_json::json!({ INTERIM_GOALS_FIELD: goals })),
-                                )
-                                .await;
-                        }
-                        call.next().await
-                    })
-                });
-                sc.push_step_wrapper(wrapper);
+                sc.wrap_step(step_layer(move |req: &StepRequest| {
+                    if goals_done_at_start {
+                        return Decision::Pass;
+                    }
+                    // 入口判定：goals 是否已全齐（不含本 step——它还没跑）。
+                    if goals.iter().all(|g| req.completed.contains(g)) {
+                        return Decision::Park {
+                            signal: INTERIM_GOAL_SIGNAL.to_string(),
+                            meta: Some(serde_json::json!({ INTERIM_GOALS_FIELD: goals })),
+                        };
+                    }
+                    Decision::Pass
+                }));
             }
 
             sc.next(None).await

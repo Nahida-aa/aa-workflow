@@ -9,8 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use aa_workflow_core::define::StepCtx;
 use aa_workflow_core::middleware::{
-    Middleware, MiddlewareServerFnArgs, StepCall, StepWrapper,
+    Middleware, MiddlewareServerFnArgs, StepRequest, StepService, StepServiceError, StepFuture,
 };
+use tower::{Layer, Service};
 use aa_workflow_core::{
     create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunWorkflowOptions,
     WorkflowCtx,
@@ -21,19 +22,55 @@ fn recorder(seen: Arc<Mutex<Vec<(String, Vec<String>)>>>) -> Middleware {
     Middleware::new().server(move |mut sc: MiddlewareServerFnArgs| {
         let seen = seen.clone();
         Box::pin(async move {
-            let wrapper: StepWrapper = Arc::new(move |call: StepCall| {
-                let seen = seen.clone();
-                Box::pin(async move {
-                    let mut list: Vec<String> = call.completed.iter().cloned().collect();
-                    list.sort();
-                    seen.lock().unwrap().push((call.step_id.clone(), list));
-                    call.next().await
-                })
-            });
-            sc.push_step_wrapper(wrapper);
+            sc.wrap_step(RecordLayer { seen });
             sc.next(None).await
         })
     })
+}
+
+#[derive(Clone)]
+struct RecordLayer {
+    seen: Arc<Mutex<Vec<(String, Vec<String>)>>>,
+}
+
+impl Layer<StepService> for RecordLayer {
+    type Service = RecordService;
+    fn layer(&self, inner: StepService) -> Self::Service {
+        RecordService {
+            inner,
+            seen: self.seen.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RecordService {
+    inner: StepService,
+    seen: Arc<Mutex<Vec<(String, Vec<String>)>>>,
+}
+
+impl Service<StepRequest> for RecordService {
+    type Response = serde_json::Value;
+    type Error = StepServiceError;
+    type Future = StepFuture;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: StepRequest) -> Self::Future {
+        let mut list: Vec<String> = req.completed.iter().cloned().collect();
+        list.sort();
+        self.seen.lock().unwrap().push((req.step_id.clone(), list));
+        let mut inner = self.inner.clone();
+        Box::pin(async move {
+            std::future::poll_fn(|cx| inner.poll_ready(cx)).await?;
+            inner.call(req).await
+        })
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

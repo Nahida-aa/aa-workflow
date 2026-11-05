@@ -976,7 +976,7 @@ async fn drive(
         interim_goal_parks: AtomicUsize::new(0),
         pending_retries: Mutex::new(pending_retries),
         // 收集中间件的 step 边界钩子（注册顺序 = 声明顺序）。
-        step_wrappers: Mutex::new(Vec::new()),
+        step_layers: Mutex::new(Vec::new()),
         ext_extra: Mutex::new(serde_json::Value::Null),
     });
     inner.publish(&WorkflowEvent::RunStarted {
@@ -1001,7 +1001,7 @@ async fn drive(
     // 而链本身存在 `EngineRuntime` 上——不清空就形成 `engine → wrappers →
     // engine` 的引用环，engine 永不 drop，它的 publish sender 也就永不 drop，
     // 流不会结束（`drain()` 永久等待）。
-    if let Ok(mut list) = inner.step_wrappers.lock() {
+    if let Ok(mut list) = inner.step_layers.lock() {
         list.clear();
     }
     // 尾段 state delta：ctx 在 handler 内 drop 时已把最终 state 同步进

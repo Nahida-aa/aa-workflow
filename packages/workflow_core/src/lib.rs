@@ -62,7 +62,8 @@ pub use event::{
 };
 pub use define::ext::{DefExt, ExtBag, ExtNamespace};
 pub use middleware::{
-    AnyMiddleware, Middleware, MiddlewareServerFn, MiddlewareServerFnArgs, StepCall, StepWrapper,
+    AnyMiddleware, Middleware, MiddlewareServerFn, MiddlewareServerFnArgs, StepRequest,
+    StepService, StepServiceError,
 };
 pub use resource::{Gate, GateGuard, ResourceKey};
 pub use run_store::{DeleteReason, InMemoryStore, PendingApproval, RunAwaitable, RunState, RunStore, WaitForState};

@@ -267,13 +267,14 @@ pub struct EngineRuntime {
     /// wrap 前置与 step 钩子经此读取策略参数；不参与 handler、不落 \`RunState\`。
     pub meta: Option<serde_json::Value>,
     pub pending_retries: Mutex<std::collections::HashMap<String, PendingRetry>>,
-    /// **Step 包装链**（本仓有意扩展：TS 靠覆盖 `ctx.step` 达到同样能力）。
+    /// **Step 中间件层**（本仓有意扩展：TS 靠覆盖 `ctx.step` 达到同样能力）。
     ///
-    /// 由 [`Middleware::server`] 经
-    /// `MiddlewareServerFnArgs::push_step_wrapper` 追加；**可叠加**，
-    /// 先注册的在最外层（见 `docs/decisions/0016`）。
-    /// `exec_step` 入口把真实执行当作最内层 `next` 交给这条链。
-    pub step_wrappers: Mutex<Vec<crate::middleware::StepWrapper>>,
+    /// 由 `MiddlewareServerFnArgs::wrap_step` 追加；**可叠加**，先注册的在外层
+    /// （见 `docs/decisions/0016`）。每次 `exec_step` 用它把当次的叶子包起来。
+    ///
+    /// 存的是「怎么包」（`Fn(StepService) -> StepService`）而不是包好的链：
+    /// 叶子**每个 step 都不同**（执行体是当次闭包），只能等到调用时应用。
+    pub step_layers: Mutex<Vec<StepLayer>>,
     /// 中间件在 server 里经 `MiddlewareServerFnArgs::next(ext)` 合并进来的 ctx 扩展
     /// （擦除层 Value；驱动收尾反序列化进 handler 的 `TCtxExt`）。
     pub ext_extra: Mutex<serde_json::Value>,
@@ -458,60 +459,54 @@ impl EngineRuntime {
     /// F2-lite interim goal：goal 步骤 checkpoint 时记入 done 集合；全齐且
     /// 本 drive 启动时尚未全齐 → 返回 true（调用者经保留信号 `__interim-goal`
     /// 泊车）。转移检查防重挂；未到达的 goal 永不触发。
-    /// 追加 step 包装层（中间件经 `MiddlewareServerFnArgs::push_step_wrapper` 调用）。
-    pub fn push_step_wrapper(&self, w: crate::middleware::StepWrapper) {
-        self.step_wrappers
-            .lock()
-            .expect("step wrappers lock")
-            .push(w);
+    /// 装一层 step 中间件（中间件经 `MiddlewareServerFnArgs::wrap_step` 调用）。
+    ///
+    /// **先注册的在外层**：层按注册顺序存，折叠时反向应用。
+    pub fn wrap_step<L>(&self, layer: L)
+    where
+        L: tower::Layer<crate::middleware::StepService> + Send + Sync + 'static,
+        L::Service: tower::Service<
+                crate::middleware::StepRequest,
+                Response = serde_json::Value,
+                Error = crate::middleware::StepServiceError,
+            > + Clone
+            + Send
+            + 'static,
+        <L::Service as tower::Service<crate::middleware::StepRequest>>::Future: Send + 'static,
+    {
+        let f: StepLayer = Arc::new(move |inner| {
+            crate::middleware::StepService::new(tower::Layer::layer(&layer, inner))
+        });
+        self.step_layers.lock().expect("step layers lock").push(f);
     }
 
-    /// 把真实执行包进已注册的链（先注册的在外层），返回整条链的入口。
-    ///
-    /// `next` 是洋葱最内层——真正跑闭包、落 `STEP_FINISHED` 的那段。
-    fn compose_step_wrappers(
-        self: &Arc<Self>,
-        step_id: &str,
-        next: crate::middleware::NextStep,
-    ) -> BoxFuture<'static, anyhow::Result<serde_json::Value>> {
-        // 取快照后立刻释放锁：包装层内会 await，不能持锁跨越。
-        let wrappers: Vec<crate::middleware::StepWrapper> =
-            self.step_wrappers.lock().expect("step wrappers lock").clone();
-        let step_id = Arc::new(step_id.to_string());
-        let run_meta = Arc::new(self.meta.clone());
-        // 已完成的 step：**进入链时取一次快照**。上一个 step 的 STEP_FINISHED
-        // 在它自己的链返回前已落盘，所以这里读到的是准确的「此前完成集」。
-        let completed = Arc::new(self.completed_steps());
-        let engine = self.clone();
-        // 反向折叠：[A, B] → A(B(terminal))，A 在外层先执行。
-        let entry = wrappers
-            .into_iter()
-            .rev()
-            .fold(next, move |inner, w| {
-                let inner = Arc::new(Mutex::new(Some(inner)));
-                let step_id = step_id.clone();
-                let run_meta = run_meta.clone();
-                let completed = completed.clone();
-                let engine = engine.clone();
-                crate::middleware::NextStep::new(move || {
-                    let next = inner
-                        .lock()
-                        .expect("step next lock")
-                        .take()
-                        .expect("step wrapper may call next() at most once");
-                    w(crate::middleware::StepCall {
-                        step_id: (*step_id).clone(),
-                        run_id: engine.run_id.clone(),
-                        run_meta: (*run_meta).clone(),
-                        completed: completed.clone(),
-                        next,
-                        engine: engine.clone(),
-                    })
-                })
-            });
-        entry.take_and_call()
+    /// 把「当次的执行体」包成完整链：叶子 + 已注册的层（先注册的在外层）。
+    fn build_step_chain(&self, exec: StepExec) -> crate::middleware::StepService {
+        let leaf = crate::middleware::StepService::new(crate::middleware::StepLeaf::new(exec));
+        let layers: Vec<StepLayer> = self
+            .step_layers
+            .lock()
+            .expect("step layers lock")
+            .clone();
+        // 反向折叠：[A, B] → A(B(leaf))，A 在外层先执行。
+        layers.into_iter().rev().fold(leaf, |inner, f| f(inner))
     }
+
 }
+
+/// 一层的构造：给内层、返回包好的 service（与 `tower::Layer` 同构）。
+type StepLayer = Arc<
+    dyn Fn(crate::middleware::StepService) -> crate::middleware::StepService + Send + Sync,
+>;
+
+/// 当次 step 的执行体（`ctx.step` 传进来的闭包）。
+type StepExec = Arc<
+    dyn Fn() -> crate::define::BoxFuture<
+            'static,
+            std::result::Result<serde_json::Value, crate::middleware::StepServiceError>,
+        > + Send
+        + Sync,
+>;
 
 /// 短路时落一条 `STEP_FINISHED`（对齐原来的 `StepAction::Skip`）：
 /// 与正常完成同样记账（事件 + live 状态 + publish），只是没有真实执行。
@@ -611,47 +606,64 @@ where
     if is_cancelled(&inner.store, &inner.run_id) {
         return Err(WorkflowCancelled.into());
     }
-    // **Step 包装链**（本仓有意扩展：TS 靠覆盖 ctx.step 达到同样能力）。
-    // 时机在重放短路之后——已 checkpoint 的 step 不会到达包装层。
-    // 快照在调用时取，所以包装层内不能再追加（只能在装配期 push）。
-    // 注意：锁 guard 必须先释放（下面 `compose_step_wrappers` 会再取一次，
-    // 若把 `.lock()` 写在 `if` 条件里，guard 的生命周期会延续到整个 if 块）。
-    let has_wrappers = !inner
-        .step_wrappers
+    // **Step 中间件层**（本仓有意扩展：TS 靠覆盖 ctx.step 达到同样能力）。
+    // 时机在重放短路之后——已 checkpoint 的 step 不会到达这些层。
+    //
+    // 每次调用现建叶子（持有当次闭包）+ 现组合层链——与 axum 的
+    // 「注册 handler，然后 call(request)」同构。
+    let has_layers = !inner
+        .step_layers
         .lock()
-        .expect("step wrappers lock")
+        .expect("step layers lock")
         .is_empty();
-    if has_wrappers {
-        // `run` 只要求 `Send`（闭包本身可能不 `Sync`），而 `NextStep` 要求 `Sync`；
-        // 放进 `Mutex` 既满足 `Sync`，也天然保证「只被执行一次」。
-        let run_slot = Arc::new(Mutex::new(Some(run)));
-        let raw = inner
-            .compose_step_wrappers(step_id, crate::middleware::NextStep::new({
+    if has_layers {
+        // `run` 只要求 `Send`（闭包本身可能不 `Sync`），而叶子要 `Sync`；
+        // 放进 `Mutex` 既满足要求，也保证只执行一次。
+        let run_slot: Arc<Mutex<Option<F>>> = Arc::new(Mutex::new(Some(run)));
+        let exec: StepExec = {
+            let inner = inner.clone();
+            let step_id = step_id.to_string();
+            let opts = opts.clone();
+            let run_slot = run_slot.clone();
+            Arc::new(move || {
                 let inner = inner.clone();
-                let step_id = step_id.to_string();
+                let step_id = step_id.clone();
                 let opts = opts.clone();
                 let run_slot = run_slot.clone();
-                move || {
-                    let inner = inner.clone();
-                    let step_id = step_id.clone();
-                    let opts = opts.clone();
-                    let run_slot = run_slot.clone();
-                    Box::pin(async move {
-                        let run = run_slot
-                            .lock()
-                            .expect("step run slot")
-                            .take()
-                            .expect("step run may execute at most once");
-                        exec_step_unwrapped(&inner, &step_id, &opts, run)
-                            .await
-                            .and_then(|v| serde_json::to_value(v).map_err(anyhow::Error::from))
-                    })
-                }
-            }))
-            .await?;
+                Box::pin(async move {
+                    let run = run_slot
+                        .lock()
+                        .expect("step run slot")
+                        .take()
+                        .ok_or_else(|| anyhow::anyhow!("step run executed more than once"))?;
+                    exec_step_unwrapped(&inner, &step_id, &opts, run)
+                        .await
+                        .and_then(|v| serde_json::to_value(v).map_err(anyhow::Error::from))
+                        .map_err(Into::into)
+                })
+            })
+        };
+        let mut chain = inner.build_step_chain(exec);
+        let req = crate::middleware::StepRequest {
+            step_id: step_id.to_string(),
+            run_id: inner.run_id.clone(),
+            run_meta: inner.meta.clone(),
+            // 已完成的 step：**进入链时取一次快照**。上一个 step 的
+            // `STEP_FINISHED` 在它自己的链返回前已落盘，所以这里准确。
+            completed: Arc::new(inner.completed_steps()),
+            engine: inner.clone(),
+        };
+        // tower 惯例：先 ready 再 call。
+        let raw = {
+            std::future::poll_fn(|cx| tower::Service::poll_ready(&mut chain, cx))
+                .await
+                .map_err(|e| anyhow::anyhow!("step service not ready: {e}"))?;
+            tower::Service::call(&mut chain, req).await
+        }
+        .map_err(|e| anyhow::anyhow!("step middleware failed: {e}"))?;
         return serde_json::from_value(raw).map_err(|e| {
             anyhow::anyhow!(
-                "step `{step_id}`: a step wrapper result does not deserialize into \
+                "step `{step_id}`: a step middleware result does not deserialize into \
                  `{}`: {e}",
                 std::any::type_name::<T>()
             )

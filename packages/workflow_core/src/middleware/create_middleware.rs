@@ -8,7 +8,7 @@
 //! ```ignore
 //! let mw = Middleware::new().server(|mut sc: MiddlewareServerFnArgs| {
 //!     Box::pin(async move {
-//!         sc.set_step_interceptor(intercept);                              // ① 拦截 step
+//!         sc.wrap_step(TimeoutLayer::new(d));                              // ① 给 step 加层
 //!         sc.next(Some(DefExt::<AuthNs>::new(auth).into_value())).await    // ② 扩展 + 推进
 //!     })
 //! });
@@ -22,7 +22,7 @@
 //! | `MiddlewareServerFn<TCtxIn, TExtension>` | [`MiddlewareServerFn`] |
 //! | `({ ctx, next }) => …` | [`MiddlewareServerFnArgs`]（`ctx` 字段 + `next` 方法） |
 //! | `next({ context })` | [`MiddlewareServerFnArgs::next`]（一次调用：合并 + 推进） |
-//! | `ctx.step = wrapped` | [`MiddlewareServerFnArgs::set_step_interceptor`] |
+//! | `ctx.step = wrapped` | [`MiddlewareServerFnArgs::wrap_step`]（tower `Layer`，可叠加） |
 //! | `AnyMiddleware = Middleware<any, any>` | [`AnyMiddleware`]（别名，可混装） |
 //!
 //! # 为什么没有 `TCtxIn` / `TExtension` 两个泛型
@@ -68,24 +68,41 @@ pub struct MiddlewareServerFnArgs {
 }
 
 impl MiddlewareServerFnArgs {
-    /// 包裹 `ctx.step`：对**本次 drive 内每个真实执行的 step**包一层。
+    /// 给 `ctx.step` 加一层（**tower `Layer`**）。
     ///
     /// 对齐 TS 的 `ctx.step = A(ctx.step)`——可多次注册，**先注册的在最外层**，
     /// 与中间件本身的洋葱顺序一致（见 `docs/decisions/0016`）。
     ///
-    /// ```ignore
-    /// let w: StepWrapper = Arc::new(|call: StepCall| {
-    ///     Box::pin(async move {
-    ///         if should_reuse(&call.step_id) {
-    ///             return Ok(cached);       // 不调 next = 短路
-    ///         }
-    ///         call.next().await            // 正常推进
-    ///     })
-    /// });
-    /// sc.push_step_wrapper(w);
+    /// 每层包装的是「本次 step 的叶子 service」——它的形状与 axum 的路由同构：
+    ///
+    /// ```text
+    /// axum:  .route("/x", handler)  →  Router(持有 handler) → call(Request)
+    /// ours:  ctx.step("load", f)    →  Leaf(持有 f)          → call(StepRequest)
     /// ```
-    pub fn push_step_wrapper(&self, w: StepWrapper) {
-        self.erased.engine.push_step_wrapper(w);
+    ///
+    /// 所以 tower 生态里请求类型无关的层可以直接用：
+    ///
+    /// ```ignore
+    /// sc.wrap_step(tower::timeout::TimeoutLayer::new(Duration::from_secs(30)));
+    /// sc.wrap_step(tower::limit::ConcurrencyLimitLayer::new(4));
+    /// sc.wrap_step(MyReseedLayer::new(plan));       // 自己写的也算
+    /// ```
+    ///
+    /// 自定义层实现 `tower::Service<StepRequest, Response = Value, Error = StepError>`；
+    /// **短路 = 不调 `inner.call(req)`**。
+    pub fn wrap_step<L>(&self, layer: L)
+    where
+        L: tower::Layer<StepService> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<
+                StepRequest,
+                Response = Value,
+                Error = StepServiceError,
+            > + Clone
+            + Send
+            + 'static,
+        <L::Service as tower::Service<StepRequest>>::Future: Send + 'static,
+    {
+        self.erased.engine.wrap_step(layer.clone());
     }
 
     /// 推进到内层中间件与 handler —— 对齐上游 `next(opts)`（`run-workflow.ts:1502`）。
@@ -128,57 +145,67 @@ impl MiddlewareServerFnArgs {
     }
 }
 
-/// 一次 step 调用的上下文（wrapper 看到的）。
-pub struct StepCall {
+/// step 服务的错误类型。
+///
+/// **必须是 `Box<dyn Error + Send + Sync>`**（tower 的 `BoxError`）：
+/// `timeout` / `retry` / `limit` 这些现成层都把它当输出错误类型，
+/// 用 `anyhow::Error` 装不进去。`anyhow::Error: Into<BoxError>`，
+/// 所以引擎内部的 `anyhow` 错误直接 `?` 就能转。
+pub type StepServiceError = Box<dyn std::error::Error + Send + Sync>;
+
+/// step 服务的 future 类型（装箱，因为层的组合是运行期的）。
+pub type StepFuture =
+    BoxFuture<'static, std::result::Result<Value, StepServiceError>>;
+
+/// 一次 step 调用的**请求**——`tower::Service` 的输入。
+///
+/// 纯数据（外加 engine 句柄，用于 [`Self::skip`] / [`Self::park`] 这类需要落盘
+/// 的动作）。执行体**不在**请求里：它由当次的叶子 service 持有，见
+/// [`StepLeaf`]。
+pub struct StepRequest {
     /// 本次 step 的 id。
     pub step_id: String,
     /// 所属 run 的 id（策略按 run 去重时用）。
     pub run_id: String,
     /// Run 级参数（`RunWorkflowOptions.meta`，策略输入）。
     pub run_meta: Option<Value>,
-    /// **本 drive 内已成功的 step 快照**（含本次之前的全部，不含本次）。
+    /// **本 drive 内已成功的 step 快照**（含此前全部，不含本次）。
     ///
-    /// 这是策略判断「哪些目标已达成」的唯一真值源——包装层因此**不需要**
-    /// 自带可变状态（`Arc<Mutex<HashSet>>`），并发分支之间也就不会出现
-    /// 「各记各的、互相看不见」。
-    ///
-    /// 数据来自引擎的 `live` 表（日志的内存投影），在本次调用构造时取快照。
+    /// 策略判断「哪些目标已达成」的唯一真值源——层因此不需要自带可变状态，
+    /// 并发分支之间也就不会「各记各的、互相看不见」。
     pub completed: std::sync::Arc<std::collections::HashSet<String>>,
-    /// 进入下一层（含真实执行）。**不调即短路**。
-    pub(crate) next: NextStep,
     /// 落 checkpoint / 泊车用。
     pub(crate) engine: std::sync::Arc<crate::engine::EngineRuntime>,
 }
 
-impl StepCall {
-    /// 推进到下一层。**至多一次**——第二次调用报错。
-    ///
-    /// 不调 `next` 即为短路：后面的包装层与真实执行都不跑。
-    pub fn next(self) -> BoxFuture<'static, Result<Value>> {
-        self.next.take_and_call()
-    }
-
+impl StepRequest {
     /// 短路并**落 checkpoint**：不执行闭包，把 `result` 作为本 step 的
     /// `STEP_FINISHED` 写入日志，随后原样返回。
     ///
-    /// 这是「复用已有结果」（reseed / redo 之外的重放）的正确写法——
-    /// 直接 `Ok(cached)` 只是让本次 drive 看到值，日志里没有记录，
-    /// 续驱 / 并行分支会重新计算，产生不一致。
-    pub fn skip(self, result: Value) -> BoxFuture<'static, Result<Value>> {
+    /// 这是「复用已有结果」的正确写法——直接 `Ok(cached)` 只让本次 drive
+    /// 看到值，日志里没有记录，续驱 / 并行分支会重新计算，产生不一致。
+    pub fn skip(
+        self,
+        result: Value,
+    ) -> BoxFuture<'static, std::result::Result<Value, StepServiceError>> {
         let engine = self.engine;
         let step_id = self.step_id;
         Box::pin(async move {
-            crate::engine::record_skipped_step(&engine, &step_id, result).await
+            crate::engine::record_skipped_step(&engine, &step_id, result)
+                .await
+                .map_err(Into::into)
         })
     }
 
     /// **在本 step 边界泊车**：落 `SIGNAL_AWAITED` + 投影 RunState，随后整条
     /// drive 以「已挂起」结束（调用方看到的是 `Err(WorkflowParked)`）。
     ///
-    /// 不调 `next`——泊车意味着后续 step 与闭包都不执行。
-    /// `signal_name` 用保留名（`__interim-goal` / `__timer` / `__approval`）时
-    /// 由宿主侧续驱；自定义名字则等外部 `signal_run` 投递。
-    pub fn park(self, signal_name: impl Into<String>, meta: Option<Value>) -> BoxFuture<'static, Result<Value>> {
+    /// 不调内层——泊车意味着后续 step 与闭包都不执行。
+    pub fn park(
+        self,
+        signal_name: impl Into<String>,
+        meta: Option<Value>,
+    ) -> BoxFuture<'static, std::result::Result<Value, StepServiceError>> {
         let engine = self.engine;
         let step_id = self.step_id;
         let signal_name = signal_name.into();
@@ -193,47 +220,58 @@ impl StepCall {
                 None,
             )
             .await;
-            Err(crate::engine::WorkflowParked.into())
+            Err(Box::new(crate::engine::WorkflowParked) as StepServiceError)
         })
     }
 }
 
-/// `StepCall::next` 的实现（**至多一次**：用 `take()` 保证只推进一次）。
+/// 擦除后的 step 服务：链的每一层包完都归成它。
+///
+/// 用 `tower` 官方的 `BoxCloneService`——层在运行期追加，而
+/// `ServiceBuilder` 的层组合是编译期的，靠它对接。
+pub type StepService =
+    tower::util::BoxCloneService<StepRequest, Value, StepServiceError>;
+
+/// 叶子 service：**持有当次 `ctx.step` 的执行闭包**。
+///
+/// 每次 `ctx.step(id, f)` 现建一个——等价于 axum 的「注册一个 handler」。
 #[derive(Clone)]
-pub(crate) struct NextStep(
-    pub(crate) Arc<
-        std::sync::Mutex<
-            Option<Box<dyn FnOnce() -> BoxFuture<'static, Result<Value>> + Send + Sync>>,
-        >,
+pub(crate) struct StepLeaf {
+    exec: std::sync::Arc<
+        dyn Fn() -> BoxFuture<'static, std::result::Result<Value, StepServiceError>>
+            + Send
+            + Sync,
     >,
-);
+}
 
-impl NextStep {
+impl StepLeaf {
     pub(crate) fn new(
-        f: impl FnOnce() -> BoxFuture<'static, Result<Value>> + Send + Sync + 'static,
+        exec: std::sync::Arc<
+        dyn Fn() -> BoxFuture<'static, std::result::Result<Value, StepServiceError>>
+            + Send
+            + Sync,
+    >,
     ) -> Self {
-        Self(Arc::new(std::sync::Mutex::new(Some(Box::new(f)))))
-    }
-
-    /// 取走并执行。第二次调用返回错误（对齐 `next()` 的至多一次语义）。
-    pub(crate) fn take_and_call(&self) -> BoxFuture<'static, Result<Value>> {
-        let taken = self.0.lock().ok().and_then(|mut g| g.take());
-        match taken {
-            Some(f) => f(),
-            None => Box::pin(async {
-                anyhow::bail!("step wrapper called next() more than once for the same step")
-            }),
-        }
+        Self { exec }
     }
 }
 
-/// step 包装层：返回本次 step 的结果。**可叠加**，先注册的在最外层。
-///
-/// 替代旧的单值 `StepInterceptor`（见 `docs/decisions/0016`）：
-/// - 短路（原 `Skip`）= 不调 `next`，直接返回缓存值；
-/// - 泊车（原 `Park`）= 不调 `next`，改调引擎的 pause 原语后返回 `WorkflowParked`。
-pub type StepWrapper =
-    Arc<dyn Fn(StepCall) -> BoxFuture<'static, Result<Value>> + Send + Sync>;
+impl tower::Service<StepRequest> for StepLeaf {
+    type Response = Value;
+    type Error = StepServiceError;
+    type Future = StepFuture;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _req: StepRequest) -> Self::Future {
+        (self.exec)()
+    }
+}
 
 /// 中间件（对齐 TS `Middleware`：一个 server 函数）。
 ///

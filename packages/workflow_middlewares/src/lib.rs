@@ -13,14 +13,14 @@
 //! | --- | --- |
 //! | `next({ context: {...} })` 扩展 ctx | [`MiddlewareServerFnArgs::next`]`(ext)`（一次调用，同构） |
 //! | 在 `next` 前后加行为（计时 / 日志） | `server` 闭包里 `sc.next(..).await` 前后 |
-//! | `ctx.step = wrapped` 拦截 step | [`MiddlewareServerFnArgs::push_step_wrapper`]（可叠加） |
+//! | `ctx.step = wrapped` 拦截 step | [`MiddlewareServerFnArgs::wrap_step`]（tower `Layer`，可叠加） |
 //!
 //! 剩下的差异是**语言必然**，不是设计取舍：
 //!
 //! 1. `TCtxExt` 的类型交集：TS 编译期 `UnionToIntersection`，Rust 运行期
 //!    serde 反序列化（同 axum extensions）。
 //! 2. `ctx.step` 是方法不是字段：擦除下移到包装层（`engine` 上的属性），
-//!    `T` 的推导留在方法签名上。所以「拦截」是 `push_step_wrapper` +
+//!    `T` 的推导留在方法签名上。所以「拦截」是 `wrap_step` +
 //!    不调 `next()`，**不是**赋值覆盖。
 //!
 //! Rust 侧还**多**两项能力：包装层能 `park`（在 step 边界停下整条 drive），
@@ -50,6 +50,7 @@
 //! （`__interimGoals` / `__dagPlan`），而不是往引擎加字段——`interim_goals` /
 //! `reseed_run` 这类**策略**不该长在引擎上（见 `docs/decisions/0001`）。
 mod dag;
+mod step_layer;
 mod interim_goals;
 mod reseed;
 
@@ -64,6 +65,6 @@ pub use reseed::{LoadResults, ReseedPlan, reseed};
 /// ```
 pub mod prelude {
     pub use aa_workflow_core::middleware::{
-        Middleware, MiddlewareServerFn, MiddlewareServerFnArgs, StepCall, StepWrapper,
+        Middleware, MiddlewareServerFn, MiddlewareServerFnArgs, StepRequest,
     };
 }

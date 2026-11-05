@@ -898,7 +898,7 @@ mod tests {
     use crate::engine::{RunWorkflowOptions, run_workflow};
     use crate::event::RunStatus;
     use crate::middleware::{
-        Middleware, MiddlewareServerFn, MiddlewareServerFnArgs, StepCall, StepWrapper,
+        Middleware, MiddlewareServerFn, MiddlewareServerFnArgs, StepRequest,
     };
     use crate::run_store::{InMemoryStore, RunStore};
     use serde_json::Value;
@@ -1082,7 +1082,7 @@ mod tests {
         );
     }
 
-    /// **step 包装链**（本仓有意扩展）：server 里 `push_step_wrapper`，
+    /// **step 中间件层**（本仓有意扩展）：server 里 `wrap_step`，
     /// 不调 `next` 即短路（原 Skip）；调引擎 pause 原语即泊车（原 Park）。
     #[tokio::test]
     async fn step_wrapper_can_skip_and_park() {
@@ -1092,32 +1092,8 @@ mod tests {
 
         let wf = create_workflow(CreateWorkflowConfig::new("mw-interceptor").input::<Value>())
             .middleware([Middleware::new().server(move |mut sc: MiddlewareServerFnArgs| {
-                let engine = sc.ctx.engine.clone();
-                let w: StepWrapper = Arc::new(move |call: StepCall| {
-                    let engine = engine.clone();
-                    Box::pin(async move {
-                        match call.step_id.as_str() {
-                            // 短路：不调 next，用 skip 把缓存值作为 checkpoint 落盘。
-                            "b" => call.skip(serde_json::json!("B-CACHED")).await,
-                            // 泊车：不调 next，改调引擎的 pause 原语。
-                            "c" => {
-                                let _ = crate::engine::exec_pause_with(
-                                    &engine,
-                                    "c",
-                                    "__test-park",
-                                    "parked by test wrapper",
-                                    None,
-                                    None,
-                                    None,
-                                )
-                                .await;
-                                Err(crate::engine::WorkflowParked.into())
-                            }
-                            _ => call.next().await,
-                        }
-                    })
-                });
-                sc.push_step_wrapper(w);
+                // 用 tower 的 Layer：对 "b" 短路、对 "c" 泊车。
+                sc.wrap_step(TestPolicyLayer);
                 Box::pin(async move { sc.next(None).await })
             })])
             .handler({
@@ -1175,6 +1151,51 @@ mod tests {
             )),
             "Park 应落一条 __test-park 的 SignalAwaited"
         );
+    }
+
+    /// 测试用的一层：对 `b` 短路、对 `c` 泊车、其余放行。
+    #[derive(Clone)]
+    struct TestPolicyLayer;
+
+    impl tower::Layer<crate::middleware::StepService> for TestPolicyLayer {
+        type Service = TestPolicyService;
+        fn layer(&self, inner: crate::middleware::StepService) -> Self::Service {
+            TestPolicyService { inner }
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestPolicyService {
+        inner: crate::middleware::StepService,
+    }
+
+    impl tower::Service<StepRequest> for TestPolicyService {
+        type Response = serde_json::Value;
+        type Error = crate::middleware::StepServiceError;
+        type Future = crate::middleware::StepFuture;
+
+        fn poll_ready(
+            &mut self,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            self.inner.poll_ready(cx)
+        }
+
+        fn call(&mut self, req: StepRequest) -> Self::Future {
+            match req.step_id.as_str() {
+                // 短路：不调内层，用 skip 把缓存值作为 checkpoint 落盘。
+                "b" => req.skip(serde_json::json!("B-CACHED")),
+                // 泊车：不调内层。
+                "c" => req.park("__test-park", None),
+                _ => {
+                    let mut inner = self.inner.clone();
+                    Box::pin(async move {
+                        std::future::poll_fn(|cx| inner.poll_ready(cx)).await?;
+                        inner.call(req).await
+                    })
+                }
+            }
+        }
     }
 
     /// `next` 对齐上游 `next(opts)`：第二次调用报错（上游用 `advanced` 标志，

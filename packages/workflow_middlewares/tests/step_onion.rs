@@ -9,8 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use aa_workflow_core::define::StepCtx;
 use aa_workflow_core::middleware::{
-    Middleware, MiddlewareServerFnArgs, StepCall, StepWrapper,
+    Middleware, MiddlewareServerFnArgs, StepRequest, StepService, StepServiceError, StepFuture,
 };
+use tower::{Layer, Service};
 use aa_workflow_core::{
     create_workflow, event::WorkflowEvent, run_workflow, CreateWorkflowConfig, InMemoryStore,
     RunStore, RunWorkflowOptions, WorkflowCtx,
@@ -21,38 +22,119 @@ fn observer(tag: &'static str, log: Arc<Mutex<Vec<String>>>) -> Middleware {
     Middleware::new().server(move |mut sc: MiddlewareServerFnArgs| {
         let log = log.clone();
         Box::pin(async move {
-            let wrapper: StepWrapper = Arc::new(move |call: StepCall| {
-                let log = log.clone();
-                Box::pin(async move {
-                    let step_id = call.step_id.clone();
-                    log.lock().unwrap().push(format!("{tag}:before:{step_id}"));
-                    let r = call.next().await;
-                    log.lock().unwrap().push(format!("{tag}:after:{step_id}"));
-                    r
-                })
-            });
-            sc.push_step_wrapper(wrapper);
+            sc.wrap_step(ObserverLayer { tag, log });
             sc.next(None).await
         })
     })
+}
+
+#[derive(Clone)]
+struct ObserverLayer {
+    tag: &'static str,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl Layer<StepService> for ObserverLayer {
+    type Service = ObserverService;
+    fn layer(&self, inner: StepService) -> Self::Service {
+        ObserverService {
+            inner,
+            tag: self.tag,
+            log: self.log.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ObserverService {
+    inner: StepService,
+    tag: &'static str,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+impl Service<StepRequest> for ObserverService {
+    type Response = serde_json::Value;
+    type Error = StepServiceError;
+    type Future = StepFuture;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: StepRequest) -> Self::Future {
+        let tag = self.tag;
+        let log = self.log.clone();
+        let step_id = req.step_id.clone();
+        let mut inner = self.inner.clone();
+        Box::pin(async move {
+            log.lock().unwrap().push(format!("{tag}:before:{step_id}"));
+            std::future::poll_fn(|cx| inner.poll_ready(cx)).await?;
+            let r = inner.call(req).await;
+            log.lock().unwrap().push(format!("{tag}:after:{step_id}"));
+            r
+        })
+    }
 }
 
 /// 装一个对指定 step 短路的包装层。
 fn skipper(id: &'static str, value: &'static str) -> Middleware {
     Middleware::new().server(move |mut sc: MiddlewareServerFnArgs| {
         Box::pin(async move {
-            let wrapper: StepWrapper = Arc::new(move |call: StepCall| {
-                Box::pin(async move {
-                    if call.step_id == id {
-                        return call.skip(serde_json::json!(value)).await;
-                    }
-                    call.next().await
-                })
-            });
-            sc.push_step_wrapper(wrapper);
+            sc.wrap_step(SkipLayer { id, value });
             sc.next(None).await
         })
     })
+}
+
+#[derive(Clone)]
+struct SkipLayer {
+    id: &'static str,
+    value: &'static str,
+}
+
+impl Layer<StepService> for SkipLayer {
+    type Service = SkipService;
+    fn layer(&self, inner: StepService) -> Self::Service {
+        SkipService {
+            inner,
+            id: self.id,
+            value: self.value,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SkipService {
+    inner: StepService,
+    id: &'static str,
+    value: &'static str,
+}
+
+impl Service<StepRequest> for SkipService {
+    type Response = serde_json::Value;
+    type Error = StepServiceError;
+    type Future = StepFuture;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: StepRequest) -> Self::Future {
+        if req.step_id == self.id {
+            return req.skip(serde_json::json!(self.value));
+        }
+        let mut inner = self.inner.clone();
+        Box::pin(async move {
+            std::future::poll_fn(|cx| inner.poll_ready(cx)).await?;
+            inner.call(req).await
+        })
+    }
 }
 
 fn workflow(
@@ -189,17 +271,7 @@ async fn wrapper_order_decides_who_wins() {
         Middleware::new().server(move |mut sc: MiddlewareServerFnArgs| {
             let counter = counter.clone();
             Box::pin(async move {
-                let wrapper: StepWrapper = Arc::new(move |call: StepCall| {
-                    let counter = counter.clone();
-                    Box::pin(async move {
-                        if call.step_id != "b" {
-                            return call.next().await;
-                        }
-                        counter.fetch_add(1, Ordering::SeqCst);
-                        call.skip(serde_json::json!(value)).await
-                    })
-                });
-                sc.push_step_wrapper(wrapper);
+                sc.wrap_step(ShortCircuitLayer { value, counter });
                 sc.next(None).await
             })
         })
@@ -231,4 +303,53 @@ async fn wrapper_order_decides_who_wins() {
         1,
         "只有一个包装层真的短路了（外层决定后内层没机会）"
     );
+}
+
+#[derive(Clone)]
+struct ShortCircuitLayer {
+    value: &'static str,
+    counter: Arc<AtomicUsize>,
+}
+
+impl Layer<StepService> for ShortCircuitLayer {
+    type Service = ShortCircuitService;
+    fn layer(&self, inner: StepService) -> Self::Service {
+        ShortCircuitService {
+            inner,
+            value: self.value,
+            counter: self.counter.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ShortCircuitService {
+    inner: StepService,
+    value: &'static str,
+    counter: Arc<AtomicUsize>,
+}
+
+impl Service<StepRequest> for ShortCircuitService {
+    type Response = serde_json::Value;
+    type Error = StepServiceError;
+    type Future = StepFuture;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: StepRequest) -> Self::Future {
+        if req.step_id != "b" {
+            let mut inner = self.inner.clone();
+            return Box::pin(async move {
+                std::future::poll_fn(|cx| inner.poll_ready(cx)).await?;
+                inner.call(req).await
+            });
+        }
+        self.counter.fetch_add(1, Ordering::SeqCst);
+        req.skip(serde_json::json!(self.value))
+    }
 }
