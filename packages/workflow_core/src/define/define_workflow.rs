@@ -12,6 +12,8 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use super::meta_spec::{Nil, Push};
+use super::MetaKey;
 use super::{AnyWorkflowDefinition, BaseCtx, InitializeFn, RetryPolicy, StateValidatorFn, WorkflowCtx, WorkflowDefinition, WorkflowHandler};
 use crate::middleware::{AnyMiddleware, Middleware};
 
@@ -225,6 +227,7 @@ pub fn create_workflow<TInput, TOutput, TState>(
     config: CreateWorkflowConfig<TInput, TOutput, TState>,
 ) -> WorkflowBuilder<TInput, TOutput, TState> {
     WorkflowBuilder {
+        _meta: PhantomData,
         config,
         middlewares: Vec::new(),
         previous: Vec::new(),
@@ -236,13 +239,38 @@ pub fn create_workflow<TInput, TOutput, TState>(
 ///
 /// 没有 `TCtxExt`：扩展走 [`ExtBag`](crate::define::ExtBag) 的命名空间获取，
 /// 不参与类型层（见 `docs/decisions/0015`）。
-pub struct WorkflowBuilder<TInput, TOutput, TState> {
+/// 一个**声明了 meta 需求**的中间件。
+///
+/// 与普通 [`Middleware`] 的区别只有一个：类型参数 `K` 让 workflow 知道
+/// 「我需要哪些 meta 字段」，于是 `RunWorkflowOptions.meta` 缺字段时
+/// **编译报错**。运行期零开销（`K` 只在类型层）。
+///
+/// 一个中间件消费多个字段时用元组：`MetaMiddleware<(DagPlanKey, ReseedKey)>`。
+pub struct MetaMiddleware<K> {
+    /// 实际的中间件（与普通中间件完全一样）。
+    pub middleware: Middleware,
+    /// 类型标记：声明消费哪些 meta 字段。
+    pub declares: PhantomData<K>,
+}
+
+impl<K> MetaMiddleware<K> {
+    /// 用普通中间件 + 声明构造。
+    pub fn new(middleware: Middleware) -> Self {
+        Self {
+            middleware,
+            declares: PhantomData,
+        }
+    }
+}
+
+pub struct WorkflowBuilder<TInput, TOutput, TState, TMeta = Nil> {
     config: CreateWorkflowConfig<TInput, TOutput, TState>,
     middlewares: Vec<Middleware>,
     previous: Vec<AnyWorkflowDefinition>,
+    _meta: PhantomData<TMeta>,
 }
 
-impl<TInput, TOutput, TState> WorkflowBuilder<TInput, TOutput, TState> {
+impl<TInput, TOutput, TState, TMeta> WorkflowBuilder<TInput, TOutput, TState, TMeta> {
     /// 注册中间件数组 —— 对齐上游
     /// `middleware(middlewares: ReadonlyArray<AnyMiddleware>)`
     /// （`types.ts:494`、`define-workflow.ts:149`）。
@@ -273,6 +301,39 @@ impl<TInput, TOutput, TState> WorkflowBuilder<TInput, TOutput, TState> {
         self
     }
 
+    /// 注册一个**声明了 meta 需求**的中间件。
+    ///
+    /// 与 [`middleware`](Self::middleware) 的区别：它的 `K` 会累积进 workflow
+    /// 的类型参数，于是 `RunWorkflowOptions.meta` 必须提供对应字段，
+    /// **否则在构造 options 处编译报错**（见 `docs/decisions/0017`）。
+    ///
+    /// ```ignore
+    /// create_workflow(cfg)
+    ///     .middleware(auth())          // 不消费 meta
+    ///     .meta_middleware(dag(spec))  // → 累积 DagPlanKey
+    ///     .handler(|ctx| async move {
+    ///         let plan = ctx.meta.dag_plan();     // 强类型
+    ///     })
+    /// ```
+    ///
+    /// 为什么单独一个方法而不是让 `middleware` 收 `MetaMiddleware`：数组要求
+    /// 元素**完全同型**，`MetaMiddleware<A>` 与 `MetaMiddleware<B>` 装不进同一个
+    /// `[T; N]`，而它们混装恰恰是最常见的用法。
+    pub fn meta_middleware<K>(self, mw: MetaMiddleware<K>) -> WorkflowBuilder<TInput, TOutput, TState, TMeta::Out>
+    where
+        K: MetaKey,
+        TMeta: Push<K>,
+    {
+        let mut this = WorkflowBuilder {
+            config: self.config,
+            middlewares: self.middlewares,
+            previous: self.previous,
+            _meta: PhantomData,
+        };
+        this.middlewares.push(mw.middleware);
+        this
+    }
+
     /// Older versions of the same workflow to route resumed runs to (see
     /// [`select_workflow_version`](crate::engine::select_workflow_version)).
     pub fn previous_versions(
@@ -290,7 +351,7 @@ impl<TInput, TOutput, TState> WorkflowBuilder<TInput, TOutput, TState> {
     pub fn handler<F, Fut, AOut>(
         self,
         handler: F,
-    ) -> WorkflowDefinition<TInput, AOut, TState>
+    ) -> WorkflowDefinition<TInput, AOut, TState, TMeta>
     where
         TInput: serde::de::DeserializeOwned + Send + Sync + 'static,
         TState: serde::de::DeserializeOwned + serde::Serialize + Send + Sync + 'static,
@@ -400,6 +461,7 @@ impl<TInput, TOutput, TState> WorkflowBuilder<TInput, TOutput, TState> {
             _input: PhantomData,
             _output: PhantomData,
             _state: PhantomData,
+            _meta: PhantomData,
         }
     }
 }

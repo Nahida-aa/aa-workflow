@@ -24,6 +24,25 @@
 //! `try_*`**——中间件在 run 开始时就执行，那时还没有「handler 已被保证」这回事。
 use serde_json::Value;
 
+use super::meta_spec::Nil;
+
+impl MetaBag<crate::define::meta_spec::Nil> {
+    /// 空袋（无任何 meta）。**构造 `RunWorkflowOptions.meta` 的起点**。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 从原始 JSON 构造（丢掉了「提供了哪些」的类型信息）。
+    ///
+    /// 只用于不需要编译期检查的场合（例如把已有 JSON 原样透传）。
+    /// 新代码优先 [`set`](MetaBag::set)——它让键名与类型来自同一个 `MetaKey`。
+    #[must_use]
+    pub fn from_json(raw: Value) -> Self {
+        Self::from_value(raw)
+    }
+}
+
 /// 一个 meta 字段：`KEY` 是 JSON 里的键，`Value` 是读取时反序列化成的类型。
 ///
 /// 中间件作者为每个消费的字段定义**一个零大小类型**实现它，于是声明与读取
@@ -47,26 +66,46 @@ pub trait MetaKey {
 /// 读 `ctx.meta` 的入口 —— 与 [`ExtBag`](crate::define::ExtBag) 同构。
 ///
 /// 每个 key **独立**反序列化：一个解析失败只影响它自己。
-#[derive(Clone, Default, Debug)]
-pub struct MetaBag {
+///
+/// # 类型参数 `P`：已经提供的 key 列表
+///
+/// 只在**构造**（`RunWorkflowOptions.meta`）时有用：`set::<K>()` 一次推进一位，
+/// 于是「提供了哪些」是类型的一部分，`run_workflow` 才能校验「够不够」。
+///
+/// ```ignore
+/// MetaBag::new()                          // MetaBag<Nil>
+///     .set::<DagPlanKey>(plan)            // MetaBag<Cons<DagPlanKey, Nil>>
+///     .set::<ReseedKey>(rp)               // MetaBag<Cons<DagPlanKey, Cons<ReseedKey, Nil>>>
+/// ```
+///
+/// **读取侧不关心 `P`**：`ctx.meta` 是 `MetaBag`（默认 `P = Nil`），按 key 取值即可。
+/// 之所以能这样分：写侧要证明「齐了」，读侧只需要「有什么读什么」。
+#[derive(Clone, Debug)]
+pub struct MetaBag<P = Nil> {
     raw: Value,
+    _provided: std::marker::PhantomData<P>,
 }
 
-impl MetaBag {
-    /// 从引擎的擦除表示构造。非对象（`null` / 缺失）视为空袋。
-    pub fn from_value(raw: Value) -> Self {
+impl Default for MetaBag<Nil> {
+    fn default() -> Self {
         Self {
+            raw: Value::Object(Default::default()),
+            _provided: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<P> MetaBag<P> {
+    /// 从引擎的擦除表示构造。非对象（`null` / 缺失）视为空袋。
+    pub fn from_value(raw: Value) -> MetaBag<Nil> {
+        MetaBag {
             raw: if raw.is_object() {
                 raw
             } else {
                 Value::Object(Default::default())
             },
+            _provided: std::marker::PhantomData,
         }
-    }
-
-    /// 空袋（没有 meta）。
-    pub fn empty() -> Self {
-        Self::default()
     }
 
     /// 擦除形态（调试 / 透传用）。
@@ -115,13 +154,12 @@ impl MetaBag {
     ///
     /// 值无法序列化时 panic——调用点在构造 options 处，属于编程错误。
     #[must_use]
-    pub fn set<K: MetaKey>(mut self, value: K::Value) -> Self {
+    pub fn set<K: MetaKey>(mut self, value: K::Value) -> MetaBag<P::Out>
+    where
+        P: super::meta_spec::Push<K>,
+    {
         let serialized = serde_json::to_value(&value).unwrap_or_else(|e| {
-            panic!(
-                "ctx.meta.{}: 值无法序列化为 JSON（{}）",
-                K::KEY,
-                e
-            )
+            panic!("ctx.meta.{}: 值无法序列化为 JSON（{}）", K::KEY, e)
         });
         if !self.raw.is_object() {
             self.raw = Value::Object(Default::default());
@@ -130,23 +168,12 @@ impl MetaBag {
             .as_object_mut()
             .expect("just ensured object")
             .insert(K::KEY.to_string(), serialized);
-        self
+        MetaBag {
+            raw: self.raw,
+            _provided: std::marker::PhantomData,
+        }
     }
 
-    /// 空袋（无任何 meta）。
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// 从原始 JSON 构造。
-    ///
-    /// 迁移旧代码（`json!({ "字段": ... })`）时用；新代码优先
-    /// [`set`](Self::set)——它让键名与类型来自同一个 `MetaKey`，拼错会编译报错。
-    #[must_use]
-    pub fn from_json(raw: Value) -> Self {
-        Self::from_value(raw)
-    }
 }
 
 /// 为 meta key 声明 `ctx.meta` 上的访问器 —— 对齐 `impl_ext_accessors!`。
@@ -172,7 +199,7 @@ macro_rules! impl_meta_accessors {
             fn $try_getter(&self) -> Option<<$key as $crate::define::MetaKey>::Value>;
         }
 
-        impl $trait_name for $crate::define::MetaBag {
+        impl<P> $trait_name for $crate::define::MetaBag<P> {
             fn $getter(&self) -> <$key as $crate::define::MetaKey>::Value {
                 self.get::<$key>()
             }
@@ -202,7 +229,7 @@ mod tests {
 
     #[test]
     fn reads_a_declared_field() {
-        let bag = MetaBag::from_value(json!({ "__dagPlan": { "goals": ["a", "b"] } }));
+        let bag = MetaBag::<Nil>::from_value(json!({ "__dagPlan": { "goals": ["a", "b"] } }));
         assert_eq!(
             bag.dag_plan(),
             DagPlan {
@@ -213,7 +240,7 @@ mod tests {
 
     #[test]
     fn missing_field_is_none_from_try() {
-        let bag = MetaBag::from_value(json!({}));
+        let bag = MetaBag::<Nil>::from_value(json!({}));
         assert_eq!(bag.try_dag_plan(), None);
     }
 
@@ -222,14 +249,14 @@ mod tests {
     fn missing_field_panics_from_get() {
         // handler 侧用它——但那只有在「声明累积」保证过之后才安全；
         // 现在（第一阶段）它仍然是运行期 panic，测试锁定这个行为。
-        let bag = MetaBag::from_value(json!({}));
+        let bag = MetaBag::<Nil>::from_value(json!({}));
         let _ = bag.dag_plan();
     }
 
     #[test]
     fn malformed_field_is_none_from_try() {
         // 结构不对 → try_get 返回 None（不是 panic）
-        let bag = MetaBag::from_value(json!({ "__dagPlan": "not an object" }));
+        let bag = MetaBag::<Nil>::from_value(json!({ "__dagPlan": "not an object" }));
         assert_eq!(bag.try_dag_plan(), None);
     }
 
@@ -237,7 +264,7 @@ mod tests {
     fn non_object_meta_is_empty_bag() {
         // `null` / 缺失 / 标量都视为空袋（与 ExtBag 一致）
         for raw in [json!(null), json!("x"), json!(42)] {
-            let bag = MetaBag::from_value(raw);
+            let bag = MetaBag::<Nil>::from_value(raw);
             assert!(bag.is_empty());
             assert_eq!(bag.try_dag_plan(), None);
         }
@@ -245,7 +272,7 @@ mod tests {
 
     #[test]
     fn one_bad_field_does_not_affect_others() {
-        let bag = MetaBag::from_value(json!({
+        let bag = MetaBag::<Nil>::from_value(json!({
             "__dagPlan": "broken",
             "other": 1
         }));
@@ -260,7 +287,7 @@ mod tests {
         let plan = DagPlan {
             goals: vec!["a".into(), "b".into()],
         };
-        let bag = MetaBag::new().set::<DagPlanKey>(plan);
+        let bag = MetaBag::<Nil>::new().set::<DagPlanKey>(plan);
         assert_eq!(
             bag.dag_plan(),
             DagPlan {
@@ -271,7 +298,7 @@ mod tests {
 
     #[test]
     fn set_chains_multiple_fields() {
-        let bag = MetaBag::new()
+        let bag = MetaBag::<Nil>::new()
             .set::<DagPlanKey>(DagPlan { goals: vec![] })
             .set::<OtherKey>(42u32);
         assert!(bag.try_dag_plan().is_some());
@@ -281,7 +308,7 @@ mod tests {
     #[test]
     fn empty_bag_set_is_still_object() {
         // 空袋上 set 之后必须变成 JSON object，再读得到
-        let bag = MetaBag::default().set::<OtherKey>(7u32);
+        let bag = MetaBag::<Nil>::default().set::<OtherKey>(7u32);
         assert!(bag.as_value().is_object());
         assert_eq!(bag.try_other(), Some(7));
     }

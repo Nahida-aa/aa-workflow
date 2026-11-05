@@ -22,10 +22,12 @@ use crate::middleware::Middleware;
 mod define_workflow;
 pub mod ext;
 pub mod meta;
+pub mod meta_spec;
 mod state_handle;
 pub use define_workflow::{CreateWorkflowConfig, WorkflowBuilder, create_workflow};
 pub use ext::{DefExt, ExtBag, ExtNamespace, merge_ext_value};
 pub use meta::{MetaBag, MetaKey};
+pub use meta_spec::{Cons, Nil, Push};
 pub use state_handle::StateHandle;
 
 /// Boxed async step-returning future. Steps are spawned inside the engine's
@@ -167,7 +169,7 @@ impl BaseCtx<serde_json::Value, serde_json::Value> {
         Self {
             run_id: engine.run_id.clone(),
             input: engine.input.clone(),
-            meta: MetaBag::from_value(
+            meta: MetaBag::<Nil>::from_value(
                 engine.meta.clone().unwrap_or(serde_json::Value::Null),
             ),
             state,
@@ -648,6 +650,11 @@ pub struct WorkflowDefinition<
     TInput = serde_json::Value,
     TOutput = serde_json::Value,
     TState = serde_json::Value,
+    /// 这个 workflow **需要**哪些 meta 字段（HList；`Nil` = 不需要）。
+    ///
+    /// 由 `.middleware(带声明的中间件)` 在类型层累积，见 `docs/decisions/0017`。
+    /// `RunWorkflowOptions::meta` 的类型由它决定，缺字段在构造处编译报错。
+    TMeta = Nil,
 > {
     pub id: String,
     pub version: Option<String>,
@@ -676,13 +683,14 @@ pub struct WorkflowDefinition<
     _input: PhantomData<TInput>,
     _output: PhantomData<TOutput>,
     _state: PhantomData<TState>,
+    _meta: PhantomData<TMeta>,
 }
 
 // `#[derive(Clone)]` would demand `TInput: Clone + TOutput: Clone + …` for what
 // is only `PhantomData`. The type parameters carry no data, so `Clone` holds
 // unconditionally — a definition stays cloneable whatever the authoring site
 // declared.
-impl<TInput, TOutput, TState> Clone for WorkflowDefinition<TInput, TOutput, TState> {
+impl<TInput, TOutput, TState, TMeta> Clone for WorkflowDefinition<TInput, TOutput, TState, TMeta> {
     fn clone(&self) -> Self {
         WorkflowDefinition {
             id: self.id.clone(),
@@ -699,6 +707,7 @@ impl<TInput, TOutput, TState> Clone for WorkflowDefinition<TInput, TOutput, TSta
             _input: PhantomData,
             _output: PhantomData,
             _state: PhantomData,
+            _meta: PhantomData,
         }
     }
 }
@@ -801,6 +810,7 @@ impl<TInput, TOutput, TState> WorkflowDefinition<TInput, TOutput, TState> {
             _input: PhantomData,
             _output: PhantomData,
             _state: PhantomData,
+            _meta: PhantomData,
         }
     }
 }
@@ -828,6 +838,7 @@ impl WorkflowDefinition {
             _input: PhantomData,
             _output: PhantomData,
             _state: PhantomData,
+            _meta: PhantomData,
         }
     }
 
