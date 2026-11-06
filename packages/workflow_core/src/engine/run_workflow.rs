@@ -863,7 +863,7 @@ async fn drive(
             );
         }
     }
-    let log_len = events.len();
+    let next_log_index = events.len();
 
 
     let state_mirror: Arc<Mutex<serde_json::Value>> = Arc::new(Mutex::new(state.clone()));
@@ -881,7 +881,7 @@ async fn drive(
         prev_state_snapshot: Mutex::new(state),
         store: store.clone(),
         gate: Arc::new(Gate::new()),
-        log_len: AtomicUsize::new(log_len),
+        next_log_index: AtomicUsize::new(next_log_index),
         lives: Mutex::new(lives),
 
         publish_tx: Some(publish_tx.clone()),

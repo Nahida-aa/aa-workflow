@@ -250,9 +250,21 @@ pub struct EngineRuntime {
     pub prev_state_snapshot: Mutex<serde_json::Value>,
     pub store: Arc<dyn RunStore>,
     pub gate: Arc<Gate>,
-    /// Monotonic next-appendix index. Concurrent steps (via `try_join!`)
-    /// CAS-retry on it so the append-only log never corrupts.
-    log_len: AtomicUsize,
+    /// **乐观的**日志尾部位置：下一次 append 期望落在这个下标。
+    ///
+    /// 与上游 `EngineRuntime.nextLogIndex`（`run-workflow.ts:803`）同名同义，
+    /// 初值同样是已加载事件的条数（`:562` 的 `history.length`）。
+    ///
+    /// **它不是权威长度。** 并发 step（`try_join!`）会同时读到同一个值，第二个
+    /// 落盘时 store 返回 `Conflict { actual }`——那时以 `actual` 为准（见
+    /// [`Self::append`]）。权威长度永远是 `store.get_events(run_id).len()`；
+    /// 这个字段只是一份缓存，避免每次追加都扫一遍日志。
+    ///
+    /// 叫 `next_log_index` 而不是 `log_len`：代码里它的每个用处都是「作为
+    /// 下一个要写的下标」，而不是「已经有多少条」。两者数值恰好相等，但
+    /// 语义不同——冲突时它会被**直接改成** `actual`，那时它就不是任何一次
+    /// 写入算出来的长度了。
+    next_log_index: AtomicUsize,
     /// Derived per-step states (replay short-circuit + result cache).
     lives: Mutex<std::collections::HashMap<String, StepState>>,
     /// Phase-1 补偿登记（undo 轴）：handler 内 `ctx.compensate` 按代码确定性
@@ -338,17 +350,19 @@ fn live_projection(ev: &WorkflowEvent) -> Option<(String, crate::event::StepStat
 /// 一个重放时并不存在的事件——而这个函数唯一的职责，就是把这条约束钉在
 /// 一个函数体里，而不是散给每个调用点去记。
 ///
-/// 与上游只有两处**语法层**差异，语义相同：
+/// 与上游只有一处**语法层**差异，语义相同：
 ///
-/// - 上游 `await appendEvent` 失败会抛异常；这里返回 `Err`，让调用点用 `?`
-///   接住。**失败时绝不 emit**——这正是 append-first 的另一半。
-/// - `index` 由调用方算好（上游是 `engine.nextLogIndex++`）；Rust 的游标是
-///   [`EngineRuntime::log_len`]，CAS 重定基在 [`EngineRuntime::append`] 里，
-///   属于「怎么拿到正确的 index」那一层，不属于本函数。
+/// - 上游 `await appendEvent` 抛 `LogConflictError`；这里返回 `Err`，让调用方
+///   用 `?` 接住或重试。**失败时绝不 emit**——这正是 append-first 的另一半。
 ///
-/// **本函数不碰 live 表**。live 投影是 Rust 独有的派生状态（上游的重放短路
-/// 直接查 `history` 数组，日志就是内存状态），它的同步由调用方在
-/// [`EngineRuntime::emit_and_append`] 里做——那里知道自己在为哪个 engine 记账。
+/// `index` 由调用方算好，与上游的 `engine.nextLogIndex++` 同职：上游调用点
+/// 自增一个数字字段，这里在 [`EngineRuntime::append`] 里从
+/// [`EngineRuntime::next_log_index`] 取（并按 store 报回的 `actual` 重定基）。
+/// 「怎么拿到正确的 index」属于调用层，不属于本函数。
+///
+/// **本函数不碰 live 表**。live 投影是本仓独有的派生状态（上游的重放短路
+/// 直接查 `history` 数组，日志就是内存状态），它的同步由调用方做——
+/// [`EngineRuntime::append`] 知道自己在为哪个 engine 记账。
 pub(crate) fn emit_and_append(
     run_store: &dyn crate::run_store::RunStore,
     run_id: &str,
@@ -372,30 +386,33 @@ impl EngineRuntime {
     ///                     engine.nextLogIndex++, engine.emit, event)
     /// ```
     ///
-    /// 即「算 index → 调自由函数」。这里同样的三步，只是 `nextLogIndex++`
-    /// 换成了 CAS 重定基（`try_join!` 的并行 step 会同时追加，见 `log_len`
-    /// 字段文档；上游单线程驱动，没有这个问题）。
+    /// 即「算 index → 调自由函数」。这里同样的三步，与上游两处不同：
     ///
-    /// 比上游多一步 `set_live`：本仓另有一份 `lives` 派生投影（上游的重放
-    /// 短路直接查 `history` 数组，日志就是内存状态）。内容由事件形状推导
-    /// （[`live_projection`]），调用者只说「发生了什么」。
+    /// 1. **冲突处理**。上游的 `nextLogIndex++` 撞车时抛 `LogConflictError`，
+    ///    由上层按 `signalId` 判断是幂等还是 lost race（`types.ts:701`）。
+    ///    这里把冲突当**并发噪声**：store 报回 `actual` 就重定基重试——`try_join!`
+    ///    的两个分支各自写自己的 `STEP_FINISHED`，本来就不争同一个序号，只是
+    ///    各自算出的下标撞了。
+    /// 2. **多一步 `set_live`**。本仓另有一份 `lives` 派生投影（上游的重放短路
+    ///    直接查 `history` 数组，日志就是内存状态）。内容由事件形状推导
+    ///    （[`live_projection`]），调用者只说「发生了什么」。
     ///
     /// 落盘失败时**不 emit、不动 live**——订阅者不该看到日志里没有的事件。
     fn append(&self, ev: &WorkflowEvent) -> Result<(), WorkflowError> {
         {
             let emit = |e: &WorkflowEvent| self.publish(e);
             loop {
-                let idx = self.log_len.load(Ordering::Acquire);
+                let idx = self.next_log_index.load(Ordering::Acquire);
                 match emit_and_append(self.store.as_ref(), &self.run_id, idx, &emit, ev) {
                     Ok(()) => {
-                        self.log_len.store(idx + 1, Ordering::Release);
+                        self.next_log_index.store(idx + 1, Ordering::Release);
                         break;
                     }
                     Err(WorkflowError::Store(crate::error::StoreError::Conflict {
                         actual,
                         ..
                     })) => {
-                        self.log_len.store(actual, Ordering::Release);
+                        self.next_log_index.store(actual, Ordering::Release);
                     }
                     // 落盘失败：**不 emit**，也不动 live。
                     Err(e) => return Err(e),
