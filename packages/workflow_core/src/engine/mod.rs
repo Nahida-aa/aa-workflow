@@ -164,7 +164,7 @@ pub(crate) async fn run_compensations(
         run_id: run_id.to_string(),
         error: RunError::from_anyhow(original),
     };
-    if let Err(e) = engine.emit_and_append(&started) {
+    if let Err(e) = engine.append(&started) {
         return Err((String::new(), RunError::from_anyhow(&anyhow::anyhow!(e))));
     }
 
@@ -197,7 +197,7 @@ pub(crate) async fn run_compensations(
                         run_id: run_id.to_string(),
                         compensation_id: comp.id.clone(),
                     };
-                    if let Err(e) = engine.emit_and_append(&ev) {
+                    if let Err(e) = engine.append(&ev) {
                         return Err((
                             comp.id.clone(),
                             RunError::from_anyhow(&anyhow::anyhow!(e)),
@@ -214,7 +214,7 @@ pub(crate) async fn run_compensations(
                             compensation_id: comp.id.clone(),
                             error: err.clone(),
                         };
-                        if let Err(e) = engine.emit_and_append(&ev) {
+                        if let Err(e) = engine.append(&ev) {
                             return Err((
                                 comp.id.clone(),
                                 RunError::from_anyhow(&anyhow::anyhow!(e)),
@@ -315,9 +315,9 @@ fn live_projection(ev: &WorkflowEvent) -> Option<(String, crate::event::StepStat
     Some((step_id, st))
 }
 
-/// **落盘 → 更新 live 投影 → 广播**。所有「引擎主动记一条事件」的唯一入口。
+/// **先落盘，再广播**。
 ///
-/// 参数与上游 `emitAndAppend`（`run-workflow.ts:1693`）**一一对应、同名同序**：
+/// 与上游 `emitAndAppend`（`run-workflow.ts:1693`）**逐字对应**：
 ///
 /// ```ts
 /// async function emitAndAppend(
@@ -327,95 +327,85 @@ fn live_projection(ev: &WorkflowEvent) -> Option<(String, crate::event::StepStat
 ///   emit: (event: WorkflowEvent) => void,
 ///   event: WorkflowEvent,
 /// ): Promise<void> {
-///   await runStore.appendEvent(runId, index, event)   // 先落盘
-///   emit(event)                                        // 再广播
+///   // Append-first: the log is the durable truth. Only emit
+///   // observably after we know it's persisted.
+///   await runStore.appendEvent(runId, index, event)
+///   emit(event)
 /// }
 /// ```
 ///
-/// 顺序是硬约束：**日志是唯一真相**，只有确认落盘后才对外可见（否则订阅者
-/// 会看到一个重放时并不存在的事件）。
+/// 为什么顺序是硬约束：**日志是唯一真相**。先广播后落盘，订阅者就会看到
+/// 一个重放时并不存在的事件——而这个函数唯一的职责，就是把这条约束钉在
+/// 一个函数体里，而不是散给每个调用点去记。
 ///
-/// 三点与上游**必然**不同，原因都不是「实现风格」，而是 Rust 侧多出来的东西：
+/// 与上游只有两处**语法层**差异，语义相同：
 ///
-/// 1. **`&mut index` 而非 `index`**。上游的 `nextLogIndex` 由调用点
-///    `engine.nextLogIndex++` 自增；这里游标属于 [`EngineRuntime::log_len`]，
-///    CAS 失败时会重定基（另一个写者先到），所以必须能写回。传 `&AtomicUsize`
-///    而不是 `&mut usize`，是因为并行分支可能同时落事件。
-/// 2. **`live` 多一步**。上游的重放短路直接查 `history` 数组，日志就是内存
-///    状态；Rust 另有一份 `lives` 投影做 O(1) 短路与 `completed_steps()` 快照。
-///    内容**由事件形状推导**（见 [`live_projection`]），调用者只说「发生了什么」。
-///    `None`（无 live 表，例如单测）时跳过。
-/// 3. **返回 `Result`**。上游 `appendEvent` 抛异常；这里落盘失败要能被 `?`
-///    接住，且**失败时绝不 emit**——这正是「append-first」的含义。
+/// - 上游 `await appendEvent` 失败会抛异常；这里返回 `Err`，让调用点用 `?`
+///   接住。**失败时绝不 emit**——这正是 append-first 的另一半。
+/// - `index` 由调用方算好（上游是 `engine.nextLogIndex++`）；Rust 的游标是
+///   [`EngineRuntime::log_len`]，CAS 重定基在 [`EngineRuntime::append`] 里，
+///   属于「怎么拿到正确的 index」那一层，不属于本函数。
 ///
-/// 不产生 live 的事件（`StateDelta` / `StepProgress` / `Custom` / run 级事件）
-/// 会被自动跳过，所以本函数对任何事件都安全；但它们本就 emit-only，该走
-/// [`EngineRuntime::publish`]，不该进这里（那会往日志里写不该持久化的东西）。
+/// **本函数不碰 live 表**。live 投影是 Rust 独有的派生状态（上游的重放短路
+/// 直接查 `history` 数组，日志就是内存状态），它的同步由调用方在
+/// [`EngineRuntime::emit_and_append`] 里做——那里知道自己在为哪个 engine 记账。
 pub(crate) fn emit_and_append(
     run_store: &dyn crate::run_store::RunStore,
     run_id: &str,
-    index: &std::sync::atomic::AtomicUsize,
+    index: usize,
     emit: &dyn Fn(&WorkflowEvent),
-    live: Option<&EngineRuntime>,
     event: &WorkflowEvent,
 ) -> Result<(), WorkflowError> {
-    // Append-first：先落盘（带 CAS 重定基），再更新 live，最后广播。
-    loop {
-        let idx = index.load(Ordering::Acquire);
-        match run_store.append_event(run_id, idx, event) {
-            Ok(()) => {
-                index.store(idx + 1, Ordering::Release);
-                break;
-            }
-            Err(crate::error::StoreError::Conflict { actual, .. }) => {
-                index.store(actual, Ordering::Release);
-            }
-            // 落盘失败：**不 emit**。订阅者不该看到日志里没有的事件。
-            Err(e) => return Err(e.into()),
-        }
-    }
-    if let Some(engine) = live
-        && let Some((step_id, st)) = live_projection(event)
-    {
-        engine.set_live(&step_id, st);
-    }
+    run_store.append_event(run_id, index, event)?;
     emit(event);
     Ok(())
 }
 
 impl EngineRuntime {
-    /// 本 engine 的 [`emit_and_append`]：把 `store` / `run_id` / `log_len` /
-    /// `publish` / `self` 五个参数一次递过去。
+    /// Appends a checkpoint **then** fans it out — the engine's only writer.
     ///
-    /// 存在的意义只是别让每个调用点重复传同一组参数——语义完全在自由函数里，
-    /// 上游也没有对应的方法，所以逻辑不放在这。
-    pub(crate) fn emit_and_append(&self, ev: &WorkflowEvent) -> Result<(), WorkflowError> {
-        emit_and_append(
-            self.store.as_ref(),
-            &self.run_id,
-            &self.log_len,
-            &|e| self.publish(e),
-            Some(self),
-            ev,
-        )
-    }
-
-    /// Appends a checkpoint with optimistic CAS; on a lost race re-bases the
-    /// cursor and retries (the other writer won, its event precedes ours).
+    /// 对应上游 `emitAndAppend`（`run-workflow.ts:1693`）的**调用现场**，
+    /// 不是那个函数本身：上游调用点是
+    ///
+    /// ```ts
+    /// await emitAndAppend(engine.runStore, engine.runId,
+    ///                     engine.nextLogIndex++, engine.emit, event)
+    /// ```
+    ///
+    /// 即「算 index → 调自由函数」。这里同样的三步，只是 `nextLogIndex++`
+    /// 换成了 CAS 重定基（`try_join!` 的并行 step 会同时追加，见 `log_len`
+    /// 字段文档；上游单线程驱动，没有这个问题）。
+    ///
+    /// 比上游多一步 `set_live`：本仓另有一份 `lives` 派生投影（上游的重放
+    /// 短路直接查 `history` 数组，日志就是内存状态）。内容由事件形状推导
+    /// （[`live_projection`]），调用者只说「发生了什么」。
+    ///
+    /// 落盘失败时**不 emit、不动 live**——订阅者不该看到日志里没有的事件。
     fn append(&self, ev: &WorkflowEvent) -> Result<(), WorkflowError> {
-        loop {
-            let idx = self.log_len.load(Ordering::Acquire);
-            match self.store.append_event(&self.run_id, idx, ev) {
-                Ok(()) => {
-                    self.log_len.store(idx + 1, Ordering::Release);
-                    return Ok(());
+        {
+            let emit = |e: &WorkflowEvent| self.publish(e);
+            loop {
+                let idx = self.log_len.load(Ordering::Acquire);
+                match emit_and_append(self.store.as_ref(), &self.run_id, idx, &emit, ev) {
+                    Ok(()) => {
+                        self.log_len.store(idx + 1, Ordering::Release);
+                        break;
+                    }
+                    Err(WorkflowError::Store(crate::error::StoreError::Conflict {
+                        actual,
+                        ..
+                    })) => {
+                        self.log_len.store(actual, Ordering::Release);
+                    }
+                    // 落盘失败：**不 emit**，也不动 live。
+                    Err(e) => return Err(e),
                 }
-                Err(crate::error::StoreError::Conflict { actual, .. }) => {
-                    self.log_len.store(actual, Ordering::Release);
-                }
-                Err(e) => return Err(e.into()),
             }
         }
+        if let Some((step_id, st)) = live_projection(ev) {
+            self.set_live(&step_id, st);
+        }
+        Ok(())
     }
 
     /// Best-effort fan-out to the host's publisher. **Never propagates**, and
@@ -470,7 +460,7 @@ impl EngineRuntime {
             run_id: self.run_id.clone(),
             compensation_id: compensation_id.to_string(),
         };
-        self.emit_and_append(&ev)
+        self.append(&ev)
     }
 
     /// Diff [`prev_state_snapshot`](Self::prev_state_snapshot) vs
@@ -621,7 +611,7 @@ let ev = WorkflowEvent::StepFinished {
     }],
     meta,
 };
-engine.emit_and_append(&ev)?;
+engine.append(&ev)?;
 Ok(result)
 }
 
@@ -864,7 +854,7 @@ where
                 step_id: step_id.to_string(),
                 attempt,
             };
-            inner.emit_and_append(&ev)?;
+            inner.append(&ev)?;
         }
         // 保留 `anyhow::Error` 而非提前字符串化，这样 attempt 能记下结构化的
         // `RunError`（attempts 会落进 STEP_FAILED，供重试与审计回看）。
@@ -913,7 +903,7 @@ where
                     attempts: attempts.clone(),
                     meta: None,
                 };
-                inner.emit_and_append(&step_finished_event)?;
+                inner.append(&step_finished_event)?;
                 return Ok(result);
             }
             Err(err) => {
@@ -952,7 +942,7 @@ where
                         error: run_err.clone(),
                         attempts: attempts.clone(),
                     };
-                    inner.emit_and_append(&ev)?;
+                    inner.append(&ev)?;
                     // 泊车（__timer + deadline）：本 drive 结束，驱动循环到期
                     // 重驱（自轮询 25ms 或 sweep）→ exec_step 入口的 pending
                     // 检查以到期后的时间放行 → 该步骤以携带的 attempts 续跑。
@@ -986,7 +976,7 @@ where
                     error: run_err.clone(),
                     attempts,
                 };
-                inner.emit_and_append(&ev)?;
+                inner.append(&ev)?;
                 // 原样上抛，不加 `step `x` failed:` 前缀：step 身份已经在
                 // `step_id` 字段里（结构化），再包一层会让同一个错误的 message
                 // 在 step 层与 run 层变成两个值。TanStack 也是直接 rethrow
@@ -1027,7 +1017,7 @@ pub fn exec_now(inner: &Arc<EngineRuntime>) -> anyhow::Result<i64> {
         step_id,
         value,
     };
-    inner.emit_and_append(&ev)?;
+    inner.append(&ev)?;
     Ok(value)
 }
 
@@ -1053,7 +1043,7 @@ pub fn exec_uuid(inner: &Arc<EngineRuntime>) -> anyhow::Result<String> {
         step_id,
         value: value.clone(),
     };
-    inner.emit_and_append(&ev)?;
+    inner.append(&ev)?;
     Ok(value)
 }
 
@@ -1209,7 +1199,7 @@ pub async fn exec_pause_with(
                 meta: meta.clone(),
             }
         };
-        inner.emit_and_append(&ev)?;
+        inner.append(&ev)?;
     }
     // 投影 RunState 信封（fresh 与崩溃后 replay 一致：都展示 Paused + 等待说明）。
     project_run_wait(
