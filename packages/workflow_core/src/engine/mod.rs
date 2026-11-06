@@ -265,27 +265,27 @@ pub struct EngineRuntime {
     /// 语义不同——冲突时它会被**直接改成** `actual`，那时它就不是任何一次
     /// 写入算出来的长度了。
     next_log_index: AtomicUsize,
-    /// 日志的**按 step 索引**：`step_id → 当前状态`。上游没有这个东西。
+    /// 本次 drive 的**内存日志副本**，对应上游 `engine.history`
+    /// （`run-workflow.ts:561` 的 `history: [...history]`）。
     ///
-    /// 上游把整份日志放在 `engine.history` 数组里，每次重放短路都线性扫
-    /// （`findCheckpoint`，`run-workflow.ts:1678`）。本仓另存一份哈希索引，
-    /// 换 O(1) 查表：
+    /// 每次 append 成功后追加一条，与落盘的日志保持同序同内容。重放短路
+    /// 和「已完成集合」都扫它——**没有第二份状态**，所以不存在「缓存与日志
+    /// 不同步」这一类 bug（本仓曾有一份按 step 索引的 `lives` 表，就是为了
+    /// 这个风险删掉的）。
     ///
-    /// | 用途 | 上游 | 本仓 |
-    /// | --- | --- | --- |
-    /// | 重放短路 | 扫 `history` 找该 step 的终态事件 | [`Self::live`] |
-    /// | 已完成集合 | `history.some(..)` 逐个判 | [`Self::completed_steps`] |
+    /// 为什么可以直接扫而不像上游那样顾虑 O(n²)：`history` 是内存数组，
+    /// n 个 step 各自扫一遍是几百次数组访问（n 通常 < 100）。上游也是这么做的。
     ///
-    /// **代价是它与日志可能不同步**——这是本仓独有的风险，上游只有一份数据
-    /// 所以没有。约束因此只有一条：
+    /// `Running` 标记**不在**这里：`StepStarted` 是 emit-only、不落盘，
+    /// 所以它单独放 [`Self::running`]。
+    history: Mutex<Vec<WorkflowEvent>>,
+    /// 正在执行的 step id（`STEP_STARTED` 已发、终态事件尚未落盘）。
     ///
-    /// > **所有检查点事件都必须经 [`Self::append`] 落盘**，它会在里面同步
-    /// > 本表（`live_projection` 复用 `fold_step_states` 的规则，不另写一套）。
-    ///
-    /// 唯一允许直接写的地方是 [`Self::set_live`] 的 `Running` 标记
-    /// （`exec_step` 里）——`StepStarted` 是 emit-only 事件、不落盘，
-    /// 但状态要反映「正在跑」。
-    lives: Mutex<std::collections::HashMap<String, StepState>>,
+    /// 对应上游把 `STEP_STARTED` 也放进 `history` 的情形——但上游的
+    /// `STEP_STARTED` 同样不落盘（`flushStateDelta` 注释里的 emit-only 约定），
+    /// 重放短路只认 `STEP_FINISHED`/`STEP_FAILED`，所以这个标记不参与
+    /// 重放判定，只是让并发重复 id 能被发现（见 `exec_step` 的 `Running` 分支）。
+    running: Mutex<std::collections::HashSet<String>>,
     /// Phase-1 补偿登记（undo 轴）：handler 内 `ctx.compensate` 按代码确定性
     /// 重登记；失败路径取走并逆序执行（见 `run_compensations`）。
     pub compensations: Mutex<Vec<Compensation>>,
@@ -331,19 +331,20 @@ pub struct EngineRuntime {
     pub(crate) default_step_retry: Option<crate::define::RetryPolicy>,
 }
 
-/// 检查点事件 → 它对 `lives` 投影的影响。`None` = 该事件不进投影。
+/// 某 step 在给定事件序列里的**最后一个**终态（重试 / redo 时后者胜）。
 ///
-/// **复用 [`fold_step_states`] 的规则**，不另写一套：重放（整段日志折叠）与
-/// 在线（单条事件投影）必须给出一致的结果，否则「续驱看到的状态」会与
-/// 「本次 drive 看到的状态」不同。做法是把它喂给一份空表——事件对
-/// `entry(step_id).or_default()` 的修改等于从 `Pending` 出发的结果，
-/// 这与 `exec_step` 在真跑前写入的 `Running` 标记相容（`StepFinished` 直接
-/// 覆盖成 `Success`）。
-fn live_projection(ev: &WorkflowEvent) -> Option<(String, crate::event::StepState)> {
-    let step_id = ev.step_id()?.to_string();
-    let folded = crate::event::fold_step_states(std::slice::from_ref(ev));
-    let st = folded.get(&step_id)?.clone();
-    Some((step_id, st))
+/// 复用 [`crate::event::fold_step_states`] 的规则：只喂该 step 的事件，
+/// 所以「单 step 查询」与「整段日志折叠」得到同一个状态，不另写一套判定。
+fn live_of(events: &[WorkflowEvent], step_id: &str) -> Option<crate::event::StepState> {
+    let mine: Vec<WorkflowEvent> = events
+        .iter()
+        .filter(|e| e.step_id() == Some(step_id))
+        .cloned()
+        .collect();
+    if mine.is_empty() {
+        return None;
+    }
+    crate::event::fold_step_states(&mine).remove(step_id)
 }
 
 /// **先落盘，再广播**。
@@ -405,18 +406,16 @@ impl EngineRuntime {
     ///                     engine.nextLogIndex++, engine.emit, event)
     /// ```
     ///
-    /// 即「算 index → 调自由函数」。这里同样的三步，与上游两处不同：
+    /// 即「算 index → 调自由函数」。这里同样的三步，与上游一处不同：
     ///
-    /// 1. **冲突处理**。上游的 `nextLogIndex++` 撞车时抛 `LogConflictError`，
-    ///    由上层按 `signalId` 判断是幂等还是 lost race（`types.ts:701`）。
-    ///    这里把冲突当**并发噪声**：store 报回 `actual` 就重定基重试——`try_join!`
-    ///    的两个分支各自写自己的 `STEP_FINISHED`，本来就不争同一个序号，只是
-    ///    各自算出的下标撞了。
-    /// 2. **多一步 `set_live`**。本仓另有一份 `lives` 派生投影（上游的重放短路
-    ///    直接查 `history` 数组，日志就是内存状态）。内容由事件形状推导
-    ///    （[`live_projection`]），调用者只说「发生了什么」。
+    /// **冲突处理**。上游的 `nextLogIndex++` 撞车时抛 `LogConflictError`，
+    /// 由上层按 `signalId` 判断是幂等还是 lost race（`types.ts:701`）。
+    /// 这里把冲突当**并发噪声**：store 报回 `actual` 就重定基重试——`try_join!`
+    /// 的两个分支各自写自己的 `STEP_FINISHED`，本来就不争同一个序号，只是
+    /// 各自算出的下标撞了。
     ///
-    /// 落盘失败时**不 emit、不动 live**——订阅者不该看到日志里没有的事件。
+    /// 落盘成功后追加进 [`Self::history`]（内存日志副本），失败时**不 emit、
+    /// 不进 history**——订阅者与重放短路都不该看到日志里没有的事件。
     fn append(&self, ev: &WorkflowEvent) -> Result<(), WorkflowError> {
         {
             let emit = |e: &WorkflowEvent| self.publish(e);
@@ -433,13 +432,13 @@ impl EngineRuntime {
                     })) => {
                         self.next_log_index.store(actual, Ordering::Release);
                     }
-                    // 落盘失败：**不 emit**，也不动 live。
+                    // 落盘失败：**不 emit**，也不进 history。
                     Err(e) => return Err(e),
                 }
             }
         }
-        if let Some((step_id, st)) = live_projection(ev) {
-            self.set_live(&step_id, st);
+        if let Ok(mut history) = self.history.lock() {
+            history.push(ev.clone());
         }
         Ok(())
     }
@@ -548,31 +547,51 @@ impl EngineRuntime {
         });
     }
 
-    fn set_live(&self, step_id: &str, st: StepState) {
-        if let Ok(mut lives) = self.lives.lock() {
-            lives.insert(step_id.to_string(), st);
+    /// 标记某 step 正在执行（`STEP_STARTED` 已 emit、终态尚未落盘）。
+    fn mark_running(&self, step_id: &str) {
+        if let Ok(mut running) = self.running.lock() {
+            running.insert(step_id.to_string());
         }
     }
 
+    /// 某 step 在**内存日志**里的当前状态（等价于上游对该 step 调用
+    /// `findCheckpoint` 再取事件）。
+    ///
+    /// 从后往前扫：同一 step id 可能有多次执行（重试、redo），**后者胜**——
+    /// 这与 [`crate::event::fold_step_states`] 的覆盖语义一致。
+    ///
+    /// 终态优先于 `Running`：`STEP_FINISHED` 落盘后即使标记没清，也该报成功。
     fn live(&self, step_id: &str) -> Option<StepState> {
-        self.lives.lock().ok()?.get(step_id).cloned()
+        let history = self.history.lock().ok()?;
+        if let Some(st) = live_of(&history, step_id) {
+            return Some(st);
+        }
+        drop(history);
+        let running = self.running.lock().ok()?;
+        running.contains(step_id).then(|| StepState {
+            status: StepStatus::Running,
+            ..Default::default()
+        })
     }
 
-    /// 本 drive 内**已成功**的 step 快照（按 `live` 表，即日志的内存投影）。
+    /// 本 drive 内**已成功**的 step 快照（扫内存日志）。
     ///
     /// 给包装层判断「哪些目标已达成」用：策略因此不必自带可变状态，
     /// 并发分支看到的也是同一份事实。
     fn completed_steps(&self) -> std::collections::HashSet<String> {
-        self.lives
-            .lock()
-            .map(|lives| {
-                lives
-                    .iter()
-                    .filter(|(_, st)| matches!(st.status, StepStatus::Success))
-                    .map(|(id, _)| id.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+        let Ok(history) = self.history.lock() else {
+            return Default::default();
+        };
+        let mut done = std::collections::HashSet::new();
+        for ev in history.iter() {
+            if let WorkflowEvent::StepFinished { step_id, .. } = ev {
+                done.insert(step_id.clone());
+            } else if let WorkflowEvent::StepFailed { step_id, .. } = ev {
+                // 失败是终态：后续同 id 的 StepFinished 会重新插入。
+                done.remove(step_id);
+            }
+        }
+        done
     }
 
 
@@ -845,11 +864,7 @@ where
             StepStatus::Running | StepStatus::Pending | StepStatus::Paused => {}
         }
     }
-    let running_marker = StepState {
-        status: StepStatus::Running,
-        ..Default::default()
-    };
-    inner.set_live(step_id, running_marker.clone());
+    inner.mark_running(step_id);
 
     inner.publish(&WorkflowEvent::StepStarted {
         ts: now_ms(),
@@ -1601,6 +1616,28 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use std::sync::atomic::AtomicBool;
     use tokio::try_join;
+
+    /// `live` 走「内存日志 + 线性扫」，同 id 多次执行时**后者胜**。
+    ///
+    /// 这是替换掉按 step 索引的 `lives` 表时唯一需要钉住的行为：
+    /// 重试 / redo 会让同一 step 出现多条终态事件，查询必须取最后一条，
+    /// 与整段日志的 `fold_step_states` 折叠结果一致。
+    #[test]
+    fn live_takes_the_last_checkpoint_for_a_step() {
+        let ev = |kind: &str| WorkflowEvent::StepFinished {
+            ts: 0,
+            run_id: "r".into(),
+            step_id: "a".into(),
+            result: Some(serde_json::json!(kind)),
+            attempts: vec![],
+            meta: None,
+        };
+        let history = vec![ev("first"), ev("second")];
+        let st = live_of(&history, "a").expect("has checkpoint");
+        assert_eq!(st.status, StepStatus::Success);
+        assert_eq!(st.result, Some(serde_json::json!("second")), "后者胜");
+        assert!(live_of(&history, "missing").is_none());
+    }
 
     /// 一个具名 step 产物。`step<T>` 泛型化后 handler 侧拿到的是这个类型，
     /// 而不是 `serde_json::Value`。

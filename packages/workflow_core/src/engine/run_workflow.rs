@@ -12,7 +12,7 @@ use std::sync::atomic::AtomicUsize;
 use crate::define::{AnyWorkflowDefinition, WorkflowDefinition};
 use crate::engine::{DEFAULT_MIN_YIELD_REMAINING_MS, EngineRuntime, WorkflowCancelled, WorkflowParked, now_ms};
 use crate::error::{RunError, RunErrorCode, WorkflowError};
-use crate::event::{RunStatus, WorkflowEvent, fold_step_states};
+use crate::event::{RunStatus, WorkflowEvent};
 use crate::resource::Gate;
 use crate::run_store::{RunState, RunStore};
 
@@ -839,7 +839,6 @@ async fn drive(
         Ok(ev) => ev,
         Err(e) => return Err(err_event(&run_id, e, RunErrorCode::Error)),
     };
-    let lives = fold_step_states(&events);
     // F2-lite 耐久重试：折叠待重试状态（每 step 取最后一份
     // STEP_RETRY_SCHEDULED）——exec_step 入口据此泊车或续跑。
     let mut pending_retries: std::collections::HashMap<String, crate::engine::PendingRetry> =
@@ -882,7 +881,10 @@ async fn drive(
         store: store.clone(),
         gate: Arc::new(Gate::new()),
         next_log_index: AtomicUsize::new(next_log_index),
-        lives: Mutex::new(lives),
+        // 内存日志副本，对应上游 `history: [...history]`（`run-workflow.ts:561`）。
+        // 重放短路与「已完成集合」都扫它，没有第二份派生状态。
+        history: Mutex::new(events),
+        running: Mutex::new(std::collections::HashSet::new()),
 
         publish_tx: Some(publish_tx.clone()),
         now_counter: AtomicUsize::new(0),
