@@ -19,7 +19,7 @@
 | 信号 | bufferSignals 收件箱（**runtime 层 opt-in**，早到持久化 + 原子消费 + signalId 去重；需 store `bufferSignal`/`consumeBufferedSignal`，`__timer` 双闸豁免） | ✅ 已对齐：`buffer_signals` 开关 + 三 adapter 收件箱 + 等待点消费落账；core 直投原语已过闸 | 无（Phase 3 已收官，剩余三项为有意设计分歧） |
 | step 重试 | `retry.durable`（attempt/deadline 持久化，sweep 恢复；`STEP_ATTEMPT_STARTED` 事件） | ✅ `RetryPolicy.durable` + `StepRetryScheduled` 泊车/续驱 + `StepAttemptStarted`，`__retry:` timer 键同上游 | 无 |
 | 补偿 | `ctx.compensate` + `COMPENSATION_REGISTERED` + `COMPENSATION_STARTED{error}` + 逆序 undo；重复 id 报错 | ✅ `ctx.compensate` + `CompensationRegistered/Started/Completed/Failed` + 逆序 undo + 重复 id 报错 | 无（仅一处键名分歧，见 §0.4） |
-| checkpoint 导入/泊车 | reseedRun / interimGoals（**f2-lite 自有，上游未采纳**；`f2-lite` 分支 `run-workflow.ts:71-84`） | ✅ 已实现（`reseed_run` + `StepFinished.meta.imported_from` 溯源；`interim_goals` 泊车 a9a7424） | 无 |
+| checkpoint 导入/泊车 | reseedRun / interimGoals（**f2-lite 自有，上游未采纳**；`f2-lite` 分支 `run-workflow.ts:71-84`） | ✅ 已实现，**在中间件层**（`reseed` / `interim_goals`，`StepFinished.meta.imported_from` 溯源）；引擎参数已于 2026-11-06 删除，见 [0018](decisions/0018-remove-engine-strategy-params.md) | 无 |
 
 > **本表 2026-10-15 逐行实测过**（此前四行「无差距」是未验证声明，且同表已出过
 > provenance 错误）。下面四小节记每行的比对依据与已确认的差距；比对基线是
@@ -66,7 +66,7 @@ StepFinished{result, attempts}——耐久重试与补偿的持久化挂载点�
 
 | 方法 | 结论 |
 | --- | --- |
-| `startRun` | ✅ 全对齐。Rust 多 `interim_goals` / `reseed_run`（f2-lite 自有，已标注） |
+| `startRun` | ✅ 全对齐。（Rust 的 `interim_goals` / `reseed_run` 已从 args 删除，落到中间件层） |
 | `deliverApproval` | ✅ 全对齐 |
 | `sweep` | ✅ 全对齐（含 `limit` 一次性设三类上限） |
 | `deliverSignal` | ⚠️ **少 `meta`** |
@@ -335,9 +335,12 @@ emit 即 append）再放行；`None` 回落既有 `find_resume` 全日志扫描�
 - 临时目标（interimGoals / 泊车）同理：core 只知道"这些 stepId checkpoint
   后挂起"，不知道也不关心它们在什么"图"上。
 
-**现状**（2026-10）：redo / 临时目标两半都已落地——
+**现状**（2026-11）：redo / 临时目标两半都已落地，**且都在中间件层**
+（引擎参数 `reseed_run` / `interim_goals` 已于 2026-11-06 删除，见
+[0018](decisions/0018-remove-engine-strategy-params.md)；下面描述的是语义，
+Rust 侧由 `reseed` / `interim_goals` 中间件实现）——
 
-- `reseed_run(source_run_id, redo_set)`：全新 run 首驱前导入
+- redo：全新 run 首驱前导入
   源 run 幸存 checkpoint（只导 `STEP_FINISHED`、失败 step 按设计重跑），
   溯源 `meta.imported_from`（index 以源 run 持久化日志为基准）。参考
   `f2-lite` 分支 `run-workflow.ts:269-295`（**本仓自有，上游未采纳**）；
@@ -345,8 +348,8 @@ emit 即 append）再放行；`None` 回落既有 `find_resume` 全日志扫描�
   因此新增 `meta` 槽（缺省省略，日志形状前后兼容）。resume 驱动忽略、
   `source_run_id == run_id` 报 validation、源缺失报 `run_lost`（f2-lite
   in-memory 对缺失源静默导零，我们显式报错——attach 同款约定）；
-- `interim_goals` 泊车/续驱（a9a7424）：goal 全 checkpoint 后泊车，
-  续驱补齐缺席 step。
+- 临时目标泊车/续驱：goal 全 checkpoint 后泊车，续驱补齐缺席 step
+  （引擎参数版见 a9a7424，现由 `interim_goals` 中间件承担）。
 
 四个原语各有一个 demo（`packages/workflow_dag/tests/dag_recovery_demo.rs`），
 引擎侧三个场景测试镜像 `f2-lite` `engine.rerun.test.ts`。

@@ -12,7 +12,7 @@ use std::sync::atomic::AtomicUsize;
 use crate::define::{AnyWorkflowDefinition, WorkflowDefinition};
 use crate::engine::{DEFAULT_MIN_YIELD_REMAINING_MS, EngineRuntime, WorkflowCancelled, WorkflowParked, now_ms};
 use crate::error::{RunError, RunErrorCode, WorkflowError};
-use crate::event::{RunStatus, StepStatus, WorkflowEvent, fold_step_states};
+use crate::event::{RunStatus, WorkflowEvent, fold_step_states};
 use crate::resource::Gate;
 use crate::run_store::{RunState, RunStore};
 
@@ -84,50 +84,6 @@ pub type PublisherFn =
 /// newtype 内部持 `Arc<WorkflowDefinition>`：`previous_versions` 是 `Vec`、另有
 /// 若干 `Arc`，按值持有会让每次 run 都 deep-copy 一遍；`Arc` 让 clone 变引用计数自增，
 /// 也避免给结构体引入生命周期参数（那会让 builder 链很难写）。
-/// re-seed 计划（redo 侧，`reseedRun`——**f2-lite 自有，上游未采纳**；
-/// 引用自 `f2-lite` 分支 `run-workflow.ts`。以**全新 run** 启动，把源 run 幸存
-/// 的 checkpoint 导入本 run 的日志——每条 stepId 不在 [`Self::redo_set`]
-/// 名单里的 `STEP_FINISHED`（失败的 step 不导入、按设计重跑）。溯源写进事件的
-/// `meta.imported_from`。
-///
-/// **理论**：一个 step 会被重新执行，当且仅当它的 checkpoint 没被导入。
-/// 引擎只导入源 run 里 stepId **不在** `redo_set` 的 `STEP_FINISHED`；`STEP_FAILED`
-/// 永不导入（所以失败的 step 默认重跑）。除名单外，源 run 成功过的都缓存结转。
-///
-/// **由此在使用时要注意**（引擎**不**替你校验这些）：
-/// - 若某个「你**没**列进 redo_set」的 step 消费了「你**列了**的 step」的
-///   结果，它保留的是旧的缓存值。例：链 A→B→C→D、`redo_set = [B, D]`：
-///   C 不在名单 → 导入 C 的旧 checkpoint、C 不重跑；D 重跑时读到的是 C 的旧
-///   结果。是否可接受取决于你的业务——引擎既不校验名单对依赖方向封闭，也不假设
-///   它不封闭。
-/// - 要强制一个封闭的重做区，把下游闭包整体列出（DAG 层：`descendants(from)`）。
-///
-/// 命名 `reseedRun`：它落到**新 run**（从源 run 幸存 checkpoint 重新播种）。
-/// `re-` 前缀保留（增量播种 + redo 词族）。参数名用 `redoSet`（非 `unsafeInvalidate`）：
-/// 词族与 `reseedRun` 对齐（重做方向，不是作废方向），且它表达的是「advisory：
-/// 不封闭**可能**有问题」，不宜用暗示硬不变量的 `unsafe`。
-#[derive(Debug, Clone)]
-pub struct ReseedRun {
-    /// checkpoint 的来源 run。
-    pub source_run_id: String,
-    /// 强制重跑的 stepId 名单（引擎透传、不校验封闭性）。空 = 全部导入、
-    /// 零重跑（对齐上游缺省）。
-    pub redo_set: Vec<String>,
-}
-
-impl ReseedRun {
-    pub fn new(source_run_id: impl Into<String>) -> Self {
-        Self {
-            source_run_id: source_run_id.into(),
-            redo_set: Vec::new(),
-        }
-    }
-
-    pub fn with_redo_set(mut self, steps: Vec<String>) -> Self {
-        self.redo_set = steps;
-        self
-    }
-}
 
 pub struct RunWorkflowOptions<W = AnyWorkflowDefinition>
 where
@@ -168,13 +124,6 @@ where
     /// 类型由 [`Self::workflow`] 决定：声明了 meta 需求的 workflow 要求这里
     /// 提供对应字段，**缺了在构造处编译报错**。
     pub meta: <W as crate::define::WorkflowMetaSpec>::Meta,
-    /// 命中即停（本地扩展；上游用 handler 内 early `return`）。
-    pub interim_goals: Option<Vec<String>>,
-    /// re-seed 计划（redo 侧，`reseedRun`，f2-lite 自有）。只在**全新
-    /// run 的 start 路径**生效：resume 驱动忽略它（重放短路已覆盖旧
-    /// checkpoint，重复导入会双写）；`source_run_id == run_id`、或源 run
-    /// 不存在时报错（`run_lost`）。语义见 [`ReseedRun`]。
-    pub reseed_run: Option<ReseedRun>,
     /// 只读回放一个已存在的 run（上游 `attach`，`run-workflow.ts:48` / `:371`）。
     ///
     /// 不碰 handler、不写日志、不改 `RunState`——把日志里已有的事件原样重放
@@ -277,8 +226,6 @@ where
             run_id: self.run_id.clone(),
             input: self.input.clone(),
             meta: self.meta.clone(),
-            interim_goals: self.interim_goals.clone(),
-            reseed_run: self.reseed_run.clone(),
             attach: self.attach,
             deadline: self.deadline,
             min_yield_remaining_ms: self.min_yield_remaining_ms,
@@ -307,8 +254,6 @@ where
             run_id: None,
             input: serde_json::Value::Null,
             meta: <<W as crate::define::WorkflowMetaSpec>::Meta as crate::define::EmptyMeta>::empty_meta(),
-            interim_goals: None,
-            reseed_run: None,
             attach: false,
             deadline: None,
             min_yield_remaining_ms: None,
@@ -349,19 +294,6 @@ where
     /// 复用该 run_id ⇒ resume。
     pub fn run_id(mut self, v: impl Into<String>) -> Self {
         self.run_id = Some(v.into());
-        self
-    }
-
-    /// 命中即停。
-    pub fn interim_goals(mut self, v: Vec<String>) -> Self {
-        self.interim_goals = Some(v);
-        self
-    }
-
-    /// re-seed 计划（redo 侧）：新 run 起步时导入源 run 幸存的
-    /// checkpoint。语义见 [`ReseedRun`]；只在全新 run 的 start 路径生效。
-    pub fn reseed_run(mut self, plan: ReseedRun) -> Self {
-        self.reseed_run = Some(plan);
         self
     }
 
@@ -503,10 +435,8 @@ pub use crate::registry::select_workflow_version;
 
 /// Runs (or resumes) a workflow by driving its async handler.
 ///
-/// Inputs:
-/// - `interim_goals`: once every listed step is checkpointed the engine parks
-///   the handler unwinds (users should propagate with `?`), and the run ends
-///   `Finished` with no output.
+/// 策略类参数（泊车目标 `interim_goals`、redo 导入 `reseed_run`）**不在引擎上**：
+/// 它们是 step 层（`wrap_step`）的能力，见 `docs/decisions/0001`。
 ///
 /// On resume, `ctx.step` short-circuits succeeded checkpoints (cached result,
 /// `run` not re-executed) and rethrows failed ones. Multiplex step results
@@ -540,8 +470,6 @@ where
         meta: crate::define::MetaBag::<crate::define::Nil>::from_value(
             crate::define::MetaValue::erased(&opts.meta).clone(),
         ),
-        interim_goals: opts.interim_goals.clone(),
-        reseed_run: opts.reseed_run.clone(),
         attach: opts.attach,
         deadline: opts.deadline,
         min_yield_remaining_ms: opts.min_yield_remaining_ms,
@@ -825,9 +753,6 @@ async fn drive(
         });
     }
 
-    // reseed_run 只在全新 run 的 start 路径生效（resume 忽略——见字段
-    // 文档）；fresh 与否在这里判定一次。
-    let is_fresh = persisted.is_none();
     let run_state = match persisted {
         Some(mut st) => {
             st.status = RunStatus::Running;
@@ -910,72 +835,6 @@ async fn drive(
         return Err(error_persisted(&store, run_state, &run_id, &e, RunErrorCode::Validation));
     }
 
-    // F2-lite re-seed 计划（redo 侧，f2-lite 分支 `reseedRun`）：
-    // 首驱前把源 run 幸存的 checkpoint 导入本 run 的日志——只导
-    // `STEP_FINISHED`，且 stepId 不在失效名单里（失败的 step 不导入、按设
-    // 计重跑）。溯源 `meta.imported_from` 的 `index` 以**源 run 的持久化日
-    // 志**为基准（`RUN_STARTED` 不落盘、不占下标，与上游同约定）。导入在
-    // `get_events` 之前完成，折叠出的 lives / log_len / interim-goal 检查
-    // 因此天然包含导入的 checkpoint。
-    let mut imported_events: Vec<WorkflowEvent> = Vec::new();
-    // `reseed_run`：首驱前把源 run 幸存 checkpoint 导入本 run 的日志。
-    if let Some(rf) = opts.reseed_run.as_ref()
-        && is_fresh
-    {
-        if rf.source_run_id == run_id {
-            let e = anyhow::anyhow!(
-                "reseed_run: source run `{}` is the run being started",
-                rf.source_run_id
-            );
-            return Err(error_persisted(&store, run_state, &run_id, &e, RunErrorCode::Validation));
-        }
-        if store.get_run_state(&rf.source_run_id).ok().flatten().is_none() {
-            let e =
-                anyhow::anyhow!("reseed_run: source run `{}` not found", rf.source_run_id);
-            return Err(error_persisted(&store, run_state, &run_id, &e, RunErrorCode::RunLost));
-        }
-        let source_log = match store.get_events(&rf.source_run_id) {
-            Ok(ev) => ev,
-            Err(e) => return Err(err_event(&run_id, e, RunErrorCode::Error)),
-        };
-        let invalidate: std::collections::HashSet<&str> =
-            rf.redo_set.iter().map(|s| s.as_str()).collect();
-        for (i, ev) in source_log.iter().enumerate() {
-            let WorkflowEvent::StepFinished {
-                ts,
-                step_id,
-                result,
-                attempts,
-                ..
-            } = ev
-            else {
-                continue;
-            };
-            if invalidate.contains(step_id.as_str()) {
-                continue;
-            }
-            let imported = WorkflowEvent::StepFinished {
-                ts: *ts,
-                run_id: run_id.clone(),
-                step_id: step_id.clone(),
-                result: result.clone(),
-                attempts: attempts.clone(),
-                meta: Some(crate::event::StepMeta {
-                    imported_from: Some(crate::event::ImportedFrom {
-                        run_id: rf.source_run_id.clone(),
-                        index: i,
-                    }),
-                }),
-            };
-            // 新 run 的日志为空，CAS 下标从 0 顺排（上游 emitAndAppend 的
-            // `imported.length` 同款）。
-            if let Err(e) = store.append_event(&run_id, imported_events.len(), &imported) {
-                return Err(err_event(&run_id, e, RunErrorCode::Error));
-            }
-            imported_events.push(imported);
-        }
-    }
-
     let events = match store.get_events(&run_id) {
         Ok(ev) => ev,
         Err(e) => return Err(err_event(&run_id, e, RunErrorCode::Error)),
@@ -1006,15 +865,6 @@ async fn drive(
     }
     let log_len = events.len();
 
-    let goals_done_at_drive_start = match &opts.interim_goals {
-        Some(goals) if !goals.is_empty() => goals.iter().all(|g| {
-            lives
-                .get(g)
-                .map(|s| s.status == StepStatus::Success)
-                .unwrap_or(false)
-        }),
-        _ => false,
-    };
 
     let state_mirror: Arc<Mutex<serde_json::Value>> = Arc::new(Mutex::new(state.clone()));
 
@@ -1033,9 +883,7 @@ async fn drive(
         gate: Arc::new(Gate::new()),
         log_len: AtomicUsize::new(log_len),
         lives: Mutex::new(lives),
-        interim_goals: opts.interim_goals.clone(),
-        interim_goals_done: Mutex::new(std::collections::HashSet::new()),
-        goals_done_at_drive_start,
+
         publish_tx: Some(publish_tx.clone()),
         now_counter: AtomicUsize::new(0),
         uuid_counter: AtomicUsize::new(0),
@@ -1058,11 +906,6 @@ async fn drive(
         run_id: run_id.clone(),
         thread_id: opts.thread_id.clone(),
     });
-    // 导入的 checkpoint 扇出到事件流（已在上面落盘，这里只 publish——上游
-    // emitAndAppend 让导入事件同样出现在流里，消费端据此看到 provenance）。
-    for ev in &imported_events {
-        inner.publish(ev);
-    }
     eprintln!("[trace] run_started published");
 
     let ctx = crate::define::WorkflowCtx::untyped(inner.clone());
@@ -1990,69 +1833,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interim_goals_park_at_goal() {
-        let store = Arc::new(InMemoryStore::new());
-        let log = Arc::new(Mutex::new(TestLog::default()));
-        let wf = WorkflowDefinition::new("w").handler({
-            let log = log.clone();
-            move |ctx: WorkflowCtx| {
-                let log = log.clone();
-                async move {
-                    for id in ["a", "b", "c"] {
-                        let log = log.clone();
-                        let id = id.to_string();
-                        let id_c = id.clone();
-                        ctx.step(&id, move |_sc: StepCtx| {
-                            let (log, id) = (log.clone(), id_c.clone());
-                            async move {
-                                log.lock().unwrap().note_start(&id);
-                                log.lock().unwrap().note_finish(&id);
-                                Ok(serde_json::Value::Null)
-                            }
-                        })
-                        .await?;
-                    }
-                    Ok(serde_json::Value::Null)
-                }
-            }
-        });
-        // interimGoals = [b]：b checkpoint 后泊车（run → paused，c 缺席即待续）
-        let first = run_workflow(
-            RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
-                .input(serde_json::json!({}))
-                .run_id("interim:1")
-                .interim_goals(vec!["b".into()]),
-        )
-        .outcome().await
-        .unwrap();
-        assert_eq!(first.status, RunStatus::Paused, "泊车 → paused（非终态）");
-        let l = log.lock().unwrap();
-        assert_eq!(l.runs["a"], 1);
-        assert_eq!(l.runs["b"], 1);
-        assert_eq!(
-            l.runs.get("c").copied().unwrap_or(0),
-            0,
-            "downstream never ran"
-        );
-        drop(l);
-
-        // 续驱（不带 interimGoals）：泊车边界解除，c 补齐 → Finished
-        let second = run_workflow(
-            RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
-                .input(serde_json::json!({}))
-                .run_id("interim:1"),
-        )
-        .outcome().await
-        .unwrap();
-        assert_eq!(second.status, RunStatus::Finished);
-
-        let l = log.lock().unwrap();
-        assert_eq!(l.runs["a"], 1, "上游短路：已完成的不重跑");
-        assert_eq!(l.runs["b"], 1);
-        assert_eq!(l.runs["c"], 1, "续驱只补缺席的 c");
-    }
-
-    #[tokio::test]
     async fn handler_output_is_run_output() {
         let store = Arc::new(InMemoryStore::new());
         let wf = WorkflowDefinition::new("w").handler(|ctx: WorkflowCtx| async move {
@@ -2757,72 +2537,6 @@ mod tests {
     //   ③ retry.durable 泊车/续跑
     // ========================================================
 
-    /// ① 临时目标：a → b → c，interimGoals = ["b"]——b checkpoint 后泊车
-    ///    （run → paused，c 缺席即待续）；续驱（不带 interimGoals）→ b 短路、
-    ///    c 补齐 → Finished。宿主扩展边界的语义同此（重驱时带新名单）。
-    #[tokio::test]
-    async fn demo_interim_goals_park_and_continue() {
-        let store = Arc::new(InMemoryStore::new());
-        let log = Arc::new(Mutex::new(TestLog::default()));
-        let wf = WorkflowDefinition::new("w").handler({
-            let log = log.clone();
-            move |ctx: WorkflowCtx| {
-                let log = log.clone();
-                async move {
-                    for id in ["a", "b", "c"] {
-                        let log = log.clone();
-                        let id = id.to_string();
-                        let id_c = id.clone();
-                        ctx.step(&id, move |_sc: StepCtx| {
-                            let (log, id) = (log.clone(), id_c.clone());
-                            async move {
-                                log.lock().unwrap().note_start(&id);
-                                log.lock().unwrap().note_finish(&id);
-                                Ok(serde_json::Value::Null)
-                            }
-                        })
-                        .await?;
-                    }
-                    Ok(serde_json::Value::Null)
-                }
-            }
-        });
-
-        let first = run_workflow(
-            RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
-                .input(serde_json::json!({}))
-                .run_id("demo:goal")
-                .interim_goals(vec!["b".into()]),
-        )
-        .outcome()
-        .await
-        .unwrap();
-        assert_eq!(first.status, RunStatus::Paused, "goal 后泊车（c 缺席）");
-        {
-            let l = log.lock().unwrap();
-            assert_eq!(l.runs["a"], 1);
-            assert_eq!(l.runs["b"], 1);
-            assert_eq!(l.runs.get("c").copied().unwrap_or(0), 0, "c 未执行");
-        }
-
-        // 续驱：不带 interimGoals → 泊车边界解除，缺席的 c 补齐 → Finished
-        let second = run_workflow(
-            RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
-                .input(serde_json::json!({}))
-                .run_id("demo:goal"),
-        )
-        .outcome()
-        .await
-        .unwrap();
-        assert_eq!(second.status, RunStatus::Finished);
-        {
-            let l = log.lock().unwrap();
-            assert_eq!(l.runs["a"], 1, "上游短路：已完成的不重跑");
-            assert_eq!(l.runs["b"], 1);
-            assert_eq!(l.runs["c"], 1, "续驱只补缺席的 c");
-        }
-    }
-
     /// ② 补偿（undo 轴）：三步各登记撤销，c 抛错 → 逆序撤销 [c, b, a]；
     ///    全部撤销成功 run 仍 errored（携带原始错误）——补偿修复外部世界，
     ///    不修改 run 的失败定性。
@@ -2996,156 +2710,7 @@ mod tests {
         })
     }
 
-    /// 上游场景 1：导入幸存 checkpoint、重跑失效子集。a/b 被失效重执行，
-    /// c 短路于导入的 checkpoint（**拿着 a 的旧结果**——封闭性是调用者的
-    /// 不变量）；导入事件带 `meta.imported_from`，新执行不带。
-    #[tokio::test]
-    async fn reseed_run_imports_surviving_checkpoints_and_reruns_invalidated() {
-        let store = Arc::new(InMemoryStore::new());
-        let src_log = Arc::new(Mutex::new(TestLog::default()));
-        let first = run_workflow(
-            RunWorkflowOptions::new(abc_wf(&src_log), store.clone()).input(serde_json::json!({})),
-        )
-        .outcome()
-        .await
-        .unwrap();
-        assert_eq!(first.status, RunStatus::Finished);
-        let source_run_id = first.run_id.clone();
-
-        let rerun_log = Arc::new(Mutex::new(TestLog::default()));
-        let out = run_workflow(
-            RunWorkflowOptions::new(abc_wf(&rerun_log), store.clone())
-                .input(serde_json::json!({}))
-                .run_id("rerun-1")
-                .reseed_run(
-                    ReseedRun::new(source_run_id.clone())
-                        .with_redo_set(vec!["a".into(), "b".into()]),
-                ),
-        )
-        .outcome()
-        .await
-        .unwrap();
-
-        assert_eq!(out.status, RunStatus::Finished);
-        assert_eq!(
-            out.output,
-            Some(serde_json::json!({"a":"a","b":"b","c":"c"}))
-        );
-        {
-            let l = rerun_log.lock().unwrap();
-            assert_eq!(l.runs["a"], 1);
-            assert_eq!(l.runs["b"], 1);
-            assert_eq!(l.runs.get("c").copied().unwrap_or(0), 0, "c 走导入短路");
-        }
-
-        // c 的 STEP_FINISHED 带 imported_from；index 以源 run 持久化日志为基准
-        // （上游测试同款断言：不含未落盘的 RUN_STARTED）
-        let src_events = store.get_events(&source_run_id).unwrap();
-        let src_idx_of_c = src_events
-            .iter()
-            .position(|e| matches!(e, WorkflowEvent::StepFinished { step_id, .. } if step_id == "c"))
-            .unwrap();
-        let rerun_events = store.get_events("rerun-1").unwrap();
-        let imported_c = finished_meta(&rerun_events, "c").unwrap();
-        assert_eq!(
-            imported_c.unwrap().imported_from,
-            Some(crate::event::ImportedFrom {
-                run_id: source_run_id.clone(),
-                index: src_idx_of_c,
-            })
-        );
-
-        // a/b 是新执行——无溯源
-        for id in ["a", "b"] {
-            let meta = finished_meta(&rerun_events, id).unwrap();
-            assert!(meta.is_none(), "{id} 是新执行，不该带 imported_from");
-        }
-    }
-
-    /// 上游场景 2：只给 sourceRunId（名单缺省）→ 全部导入、零重跑。
-    #[tokio::test]
-    async fn reseed_run_imports_everything_without_invalidate_list() {
-        let store = Arc::new(InMemoryStore::new());
-        let src_log = Arc::new(Mutex::new(TestLog::default()));
-        let first = run_workflow(
-            RunWorkflowOptions::new(abc_wf(&src_log), store.clone()).input(serde_json::json!({})),
-        )
-        .outcome()
-        .await
-        .unwrap();
-        let source_run_id = first.run_id.clone();
-
-        let rerun_log = Arc::new(Mutex::new(TestLog::default()));
-        let out = run_workflow(
-            RunWorkflowOptions::new(abc_wf(&rerun_log), store.clone())
-                .input(serde_json::json!({}))
-                .run_id("rerun-all")
-                .reseed_run(ReseedRun::new(source_run_id.clone())),
-        )
-        .outcome()
-        .await
-        .unwrap();
-
-        assert_eq!(out.status, RunStatus::Finished);
-        assert_eq!(
-            out.output,
-            Some(serde_json::json!({"a":"a","b":"b","c":"c"}))
-        );
-        {
-            let l = rerun_log.lock().unwrap();
-            assert!(l.runs.is_empty(), "全部走导入短路，零重跑");
-        }
-        let rerun_events = store.get_events("rerun-all").unwrap();
-        for id in ["a", "b", "c"] {
-            let meta = finished_meta(&rerun_events, id).unwrap();
-            assert_eq!(
-                meta.unwrap().imported_from.unwrap().run_id,
-                source_run_id,
-                "{id} 的 checkpoint 来自导入"
-            );
-        }
-    }
-
-    /// 本仓补充：源 run 不存在 → run_lost（上游 in-memory getEvents 对缺失
-    /// run 返回空数组、静默导入零条；我们显式报错——attach 的同款约定）。
-    #[tokio::test]
-    async fn reseed_run_missing_source_fails_run_lost() {
-        let store = Arc::new(InMemoryStore::new());
-        let log = Arc::new(Mutex::new(TestLog::default()));
-        let out = run_workflow(
-            RunWorkflowOptions::new(abc_wf(&log), store.clone())
-                .input(serde_json::json!({}))
-                .run_id("rerun-lost")
-                .reseed_run(ReseedRun::new("no-such-run")),
-        )
-        .outcome()
-        .await
-        .unwrap();
-        assert_eq!(out.status, RunStatus::Errored);
-        // code 只在 RUN_ERRORED 事件上（error_persisted 写的是 RunState，事件
-        // 走流）——collect 流来断言机器可读的终局原因。
-        let events = run_workflow(
-            RunWorkflowOptions::new(abc_wf(&log), store.clone())
-                .input(serde_json::json!({}))
-                .run_id("rerun-lost-2")
-                .reseed_run(ReseedRun::new("no-such-run")),
-        )
-        .collect()
-        .await;
-        let code = events
-            .iter()
-            .find_map(|e| match e {
-                WorkflowEvent::RunErrored { code, .. } => Some(code.clone()),
-                _ => None,
-            })
-            .expect("源缺失 → 流里有 RUN_ERRORED");
-        assert_eq!(code, RunErrorCode::RunLost);
-    }
-    // ========================================================
-    // resume 两场景 × interimGoals 组合（泊车续驱 / 错误停止的恢复）
-    // ========================================================
-
-    /// a → b → c → d；`fail_at` 指名的 step 失败（其余返回自己的 id）。
+    /// a→b→c→d 链；`fail_at` 指定的 step 抛错。
     fn chain_wf(log: &Arc<Mutex<TestLog>>, fail_at: Option<&'static str>) -> WorkflowDefinition {
         WorkflowDefinition::new("w").handler({
             let log = log.clone();
@@ -3172,58 +2737,6 @@ mod tests {
                 }
             }
         })
-    }
-
-    /// 场景 1 + 临时目标：泊车后续驱**可以换一份新名单**（per-drive 语义）。
-    /// goals ["b"] 泊车 → goals ["c"] 续驱到 c 再泊车 → 无名单补齐 d。
-    #[tokio::test]
-    async fn parked_resume_can_carry_a_new_interim_goals_list() {
-        let store = Arc::new(InMemoryStore::new());
-        let log = Arc::new(Mutex::new(TestLog::default()));
-
-        let first = run_workflow(
-            RunWorkflowOptions::new(chain_wf(&log, None), store.clone())
-                .input(serde_json::json!({}))
-                .run_id("goal:hop")
-                .interim_goals(vec!["b".into()]),
-        )
-        .outcome()
-        .await
-        .unwrap();
-        assert_eq!(first.status, RunStatus::Paused);
-
-        // 续驱带新名单：a/b 短路，c 执行后再泊车（d 缺席即待续）
-        let second = run_workflow(
-            RunWorkflowOptions::new(chain_wf(&log, None), store.clone())
-                .input(serde_json::json!({}))
-                .run_id("goal:hop")
-                .interim_goals(vec!["c".into()]),
-        )
-        .outcome()
-        .await
-        .unwrap();
-        assert_eq!(second.status, RunStatus::Paused, "goal c checkpoint 后再泊车");
-        {
-            let l = log.lock().unwrap();
-            assert_eq!(l.runs["c"], 1);
-            assert_eq!(l.runs.get("d").copied().unwrap_or(0), 0);
-        }
-
-        // 无名单：d 补齐 → Finished
-        let third = run_workflow(
-            RunWorkflowOptions::new(chain_wf(&log, None), store.clone())
-                .input(serde_json::json!({}))
-                .run_id("goal:hop"),
-        )
-        .outcome()
-        .await
-        .unwrap();
-        assert_eq!(third.status, RunStatus::Finished);
-        {
-            let l = log.lock().unwrap();
-            assert_eq!(l.runs["d"], 1);
-            assert_eq!(l.runs["a"], 1, "上游全程短路");
-        }
     }
 
     /// 场景 2（基线）：errored 的 run 直接重驱 = 失败 checkpoint rethrow——
@@ -3258,94 +2771,5 @@ mod tests {
         assert_eq!(l.runs["c"], 1, "c 闭包不重入");
         assert_eq!(l.runs["a"], 1, "a 短路");
         assert_eq!(l.runs.get("d").copied().unwrap_or(0), 0, "下游不推进");
-    }
-
-    /// 场景 2（redo）：因错误停止的 run 的恢复路 = reseedRun——失败的
-    /// checkpoint 不导入（缺席即待续），幸存 a/b 导入短路；修复版 handler
-    /// 里 c 真实重跑 → Finished。
-    #[tokio::test]
-    async fn reseed_run_errored_source_reruns_failed_step() {
-        let store = Arc::new(InMemoryStore::new());
-        let src_log = Arc::new(Mutex::new(TestLog::default()));
-        let first = run_workflow(
-            RunWorkflowOptions::new(chain_wf(&src_log, Some("c")), store.clone())
-                .input(serde_json::json!({}))
-                .run_id("err:src"),
-        )
-        .outcome()
-        .await
-        .unwrap();
-        assert_eq!(first.status, RunStatus::Errored);
-        let source_run_id = first.run_id.clone();
-
-        // 修复版：同形状，c 不再失败；零失效名单（失败 step 本就不导入）
-        let fixed_log = Arc::new(Mutex::new(TestLog::default()));
-        let out = run_workflow(
-            RunWorkflowOptions::new(chain_wf(&fixed_log, None), store.clone())
-                .input(serde_json::json!({}))
-                .run_id("err:fixed")
-                .reseed_run(ReseedRun::new(source_run_id.clone())),
-        )
-        .outcome()
-        .await
-        .unwrap();
-        assert_eq!(out.status, RunStatus::Finished);
-        let l = fixed_log.lock().unwrap();
-        assert_eq!(l.runs.get("a").copied().unwrap_or(0), 0, "a 导入短路");
-        assert_eq!(l.runs.get("b").copied().unwrap_or(0), 0, "b 导入短路");
-        assert_eq!(l.runs["c"], 1, "c（失败未导入）真实重跑");
-        assert_eq!(l.runs["d"], 1, "d 顺次补齐");
-    }
-
-    /// 场景 2 + 临时目标：错误源 redo 可以带 goals——c 重跑 checkpoint 后
-    /// 泊车（d 缺席），续驱补齐。goals_done_at_drive_start 的转移检查以
-    /// **导入后**的 lives 计算：c 起步时缺席 → 不跳过泊车。
-    #[tokio::test]
-    async fn reseed_run_errored_source_with_interim_goals_parks_at_goal() {
-        let store = Arc::new(InMemoryStore::new());
-        let src_log = Arc::new(Mutex::new(TestLog::default()));
-        let first = run_workflow(
-            RunWorkflowOptions::new(chain_wf(&src_log, Some("c")), store.clone())
-                .input(serde_json::json!({}))
-                .run_id("err:goal-src"),
-        )
-        .outcome()
-        .await
-        .unwrap();
-        assert_eq!(first.status, RunStatus::Errored);
-        let source_run_id = first.run_id.clone();
-
-        let fixed_log = Arc::new(Mutex::new(TestLog::default()));
-        let second = run_workflow(
-            RunWorkflowOptions::new(chain_wf(&fixed_log, None), store.clone())
-                .input(serde_json::json!({}))
-                .run_id("err:goal-fixed")
-                .reseed_run(ReseedRun::new(source_run_id.clone()))
-                .interim_goals(vec!["c".into()]),
-        )
-        .outcome()
-        .await
-        .unwrap();
-        assert_eq!(second.status, RunStatus::Paused, "c 重跑后泊车（d 缺席）");
-        {
-            let l = fixed_log.lock().unwrap();
-            assert_eq!(l.runs["c"], 1);
-            assert_eq!(l.runs.get("d").copied().unwrap_or(0), 0);
-        }
-
-        let third = run_workflow(
-            RunWorkflowOptions::new(chain_wf(&fixed_log, None), store.clone())
-                .input(serde_json::json!({}))
-                .run_id("err:goal-fixed"),
-        )
-        .outcome()
-        .await
-        .unwrap();
-        assert_eq!(third.status, RunStatus::Finished);
-        {
-            let l = fixed_log.lock().unwrap();
-            assert_eq!(l.runs["d"], 1);
-            assert_eq!(l.runs["c"], 1, "c 不重跑");
-        }
     }
 }

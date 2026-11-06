@@ -20,8 +20,17 @@
 2. **策略放中间件包**：TS `@wf-demo/workflow-middlewares` 的 `interimGoals` /
    `reseed` / `dagPolicies`；Rust `aa_workflow_middlewares` 的 `interim_goals` /
    `reseed`。
-3. **引擎参数 `interim_goals` / `reseed_run` 计划删除**，前提是中间件实现达到
-   语义等价（TS 已等价；Rust `interim_goals` 已等价、`reseed` 已等价）。
+3. ~~**引擎参数 `interim_goals` / `reseed_run` 计划删除**，前提是中间件实现达到
+   语义等价。~~
+   **已完成（2026-11-06）**：两者都已从 core 与 runtime 删除，能力全部由 step 层
+   （[0016](0016-step-onion.md) 的 `wrap_step`）承担——`reseed` 用
+   `skip_with_meta` 写 `imported_from` 溯源，与删除前的引擎实现等价。详见
+   [0018](0018-remove-engine-strategy-params.md)。
+
+## 后果（补记）
+
+- 引擎侧已无任何策略字段；`RunWorkflowOptions` 只剩 input / run_id / deadline 这类
+  **机制**参数。
 
 ## 被否决的选项
 

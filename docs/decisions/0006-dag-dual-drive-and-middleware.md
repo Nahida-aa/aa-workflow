@@ -32,10 +32,10 @@ core 的 `RunStore` 已具备全部所需方法，core 驱动**没有缺口**。
 
 ### 策略：中间件承载
 
-| 策略 | 中间件 | 对应引擎参数（计划删除） |
+| 策略 | 中间件 | 原引擎参数（**已删除**，见 [0018](0018-remove-engine-strategy-params.md)） |
 | --- | --- | --- |
-| 跑到某节点停 | `interimGoals()` | `interim_goals` |
-| 子图重跑（复用+重跑） | `reseed({ getEvents })` | `reseed_run` |
+| 跑到某节点停 | `interimGoals()` | ~~`interim_goals`~~ |
+| 子图重跑（复用+重跑） | `reseed({ getEvents })` | ~~`reseed_run`~~ |
 | **DAG 调度本身** | `dag(spec)`（中间件接管 handler，用户不写） | — |
 
 三种用法用户自选：

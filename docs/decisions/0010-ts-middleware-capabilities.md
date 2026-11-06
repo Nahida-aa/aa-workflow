@@ -40,5 +40,9 @@
 ## 与引擎参数的关系
 
 `RunWorkflowOptions.interim_goals` 是 **per-drive 参数**（每次 resume 可换目标、
-不落盘）——这是引擎参数相对 input 载体的**独有价值**。两者不是替代关系：
-input 载体适合「目标在 run 生命周期内固定」，引擎参数适合「每次续驱可能换目标」。
+不落盘）——这是参数载体相对 input 载体的**独有价值**。两者不是替代关系：
+input 载体适合「目标在 run 生命周期内固定」，每次传入的参数适合「每次续驱可能换目标」。
+
+> **2026-11-06 补记**：Rust 侧的引擎参数已删除（[0018](0018-remove-engine-strategy-params.md)）。
+> 「per-drive、可每次换」这个价值**没有丢**——它由「每次 drive 都重新装配中间件」
+> 承接（`interim_goals(goals, get_events)` 在构造中间件时拿 goals）。

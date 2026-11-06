@@ -33,10 +33,17 @@ resume 时可以选择：
 - `reseed_run`（F2）能表达失效，但要**开新 run**：新 run id、外部引用断裂、
   input 重喂、审计跨两个 run 拼。为「换目标继续」付这些代价，收益是零——是 hack。
 
-**自然形态**：drive 参数 `invalidate_steps: Option<Vec<String>>`，与
+**自然形态**：~~drive 参数 `invalidate_steps: Option<Vec<String>>`，与
 `interim_goals` 并列（core 的 `RunWorkflowOptions` 与 runtime 的
-`WorkflowRuntimeStartRunArgs` 各加一处，两侧同名同形）。语义与
-`reseed_run.redo_set` 是**同一个 advisory 语义**（引擎**不**校验名单对依赖方向
+`WorkflowRuntimeStartRunArgs` 各加一处，两侧同名同形）~~。
+
+> **2026-11-06 订正**：这个「与 `interim_goals` 并列加参数」的形态**不采纳**。
+> 两个参数已经从 core 与 runtime 删除（[0018](../decisions/0018-remove-engine-strategy-params.md)），
+> 能力移到 step 层（`wrap_step`）。按 [0001](../decisions/0001-strategy-vs-mechanism.md)，
+> 候选形态应是中间件：`reseed` 已有等价实现，未来若要「同一个 run 继续、只失效
+> 部分 step」，落点也在中间件，不在引擎。
+
+语义与 `reseed_run.redo_set` 是**同一个 advisory 语义**（引擎**不**校验名单对依赖方向
 封闭——不封闭**可能**让下游拿到旧 checkpoint，是否可接受由调用者业务判断：
 失效 B 不失效下游 C，C 会拿旧结果短路），只是作用对象是一次 drive 而非新 run 导入。
 
@@ -57,11 +64,16 @@ entry，step 回 `Pending` → 重跑 → 追加新 `StepFinished` → 重放时
 **落地顺序**：f2-lite 先行加 `invalidateSteps` 并写测试 → Rust 镜像 → 回本文件
 更新状态。
 
-## F2. redo：新 run 播种幸存 checkpoint（已实现，已改名 `reseedRun`）
+## F2. redo：新 run 播种幸存 checkpoint（已实现，实现载体已迁移）
 
 `reseed_run(source_run_id, redo_set)`：全新 run 首驱前导入源 run
 幸存的 `STEP_FINISHED`（失败 step 按设计重跑），溯源 `meta.importedFrom`。
 两侧都有（f2-lite `reseedRun` / Rust `057a0c6`、runtime 透传 `91111f3`）。
+
+> **2026-11-06 订正**：Rust 侧的**引擎参数**已删除（[0018](../decisions/0018-remove-engine-strategy-params.md)）。
+> 等价能力在 `aa_workflow_middlewares::reseed`：`skip_with_meta` 写
+> `STEP_FINISHED.meta.imported_from`，与删除前的引擎实现语义一致（有测试锁定）。
+> f2-lite 侧仍是引擎参数，两侧载体不同但语义对齐。
 
 **已改名 `reseedRun`**（原 `reexecuteFrom`）：旧名没体现"落到一个新 run 里"，
 且 `re-` 前缀保留（增量播种 + redo 词族）。0.x 阶段两侧同步、直接换新名、
@@ -74,11 +86,15 @@ entry，step 回 `Pending` → 重跑 → 追加新 `StepFinished` → 重放时
 > 零 store 契约变更，已落地），**保留**；INVALIDATED 持久失效原语才是不做的对象。
 > "redo 不进 core" 若被听成"seed 也不做"是误读——seed 是失败续跑的正确默认路径。
 
-## F3. 临时目标泊车（已实现）
+## F3. 临时目标泊车（已实现，实现载体已迁移）
 
 `interim_goals`：名单内 step 全部 checkpoint 后泊车（保留信号 `__interim-goal`），
 宿主续驱 = 同名信号投递（Rust）或 `recover: true` drive（f2-lite core）。
 per-drive 参数，不落盘。转移检查防重挂。
+
+> **2026-11-06 订正**：Rust 侧的**引擎参数**已删除（[0018](../decisions/0018-remove-engine-strategy-params.md)）。
+> 能力在 `aa_workflow_middlewares::interim_goals`（step 层），「本 drive 已完成」
+> 读 `StepCall::completed` 快照。
 
 ## F4. 信号收件箱（已实现）
 

@@ -28,7 +28,8 @@ Y 时，这条记录在未来就是不可复核的。别的文件（`feature/`�
 | [0014](0014-middleware-takes-array.md) | `.middleware()` 收数组（对齐上游），三处差异 | 已被 0015 取代 |
 | [0015](0015-ext-namespaces.md) | `ctx.ext` 按命名空间存取：使用者不需要定义合并类型 | 已接受 |
 | [0016](0016-step-onion.md) | step 拦截 = tower `Layer` 叠加（取代单值 `set_step_interceptor`） | 已接受 |
-| [0017](0017-meta-typed-keys.md) | 插件的 meta 字段编译期可见：`MetaKey` + 链式注册累积 | **草案** |
+| [0017](0017-meta-typed-keys.md) | meta 字段编译期可见：`MetaKey` + 从 workflow 推断 options 的类型 | 已接受 |
+| [0018](0018-remove-engine-strategy-params.md) | 删除引擎上的策略参数 `interim_goals` / `reseed_run` | 已接受 |
 
 ## 什么时候写新 ADR
 

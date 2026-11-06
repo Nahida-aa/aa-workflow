@@ -8,7 +8,7 @@
 //! 这里测的是**正向路径**：声明了 meta 的 workflow 配上正确的 `MetaBag`，
 //! 运行时值确实到达 `ctx.meta`；以及擦除态不约束 meta。
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use aa_workflow_core::define::{Cons, MetaBag, MetaKey, Nil};
 use aa_workflow_core::middleware::{Middleware, MiddlewareServerFnArgs};

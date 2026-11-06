@@ -30,8 +30,9 @@
 - 上游 `startRun` 的**隐式幂等 redirect**（已存在 runId → 转 attach）在本仓被
   拒绝过一次：本仓没有 `signalDelivery` 标志位区分 start/resume，照抄会把每次
   resume 都变成 attach（见 `run_workflow.rs` 的 `attach` 参数文档）；
-- 「resume 时换目标/换 input」的需求已由 per-drive 参数（`interim_goals`）或
-  reseedRun（显式新 run）覆盖，无需隐式路径。
+- 「resume 时换目标/换 input」的需求已由 per-drive 参数（现为
+  `interim_goals` 中间件；引擎参数已于 [0018](0018-remove-engine-strategy-params.md)
+  删除）或 reseedRun（显式新 run）覆盖，无需隐式路径。
 
 ## 后果
 

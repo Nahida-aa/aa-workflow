@@ -4,7 +4,7 @@
 //! 不在 `redoSet` 里的 step **不执行闭包**，直接用源 run 的结果提交
 //! `STEP_FINISHED`。
 //!
-//! # 与引擎参数 `reseed_run` 的差别
+//! # 与已删除的引擎参数 `reseed_run` 的差别
 //!
 //! | | 引擎 `reseed_run` | 本中间件 |
 //! | --- | --- | --- |

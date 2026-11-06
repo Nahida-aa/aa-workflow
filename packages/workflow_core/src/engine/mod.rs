@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::define::{BoxFuture, RetryPolicy, StepCtx, StepOptions};
+use crate::define::{RetryPolicy, StepCtx, StepOptions};
 #[cfg(test)]
 use crate::define::AnyWorkflowDefinition;
 use crate::error::{RunError, StoreError, WorkflowError};
@@ -22,7 +22,7 @@ use crate::run_store::RunStore;
 mod run_workflow;
 pub mod state_diff;
 pub use run_workflow::{
-    PublisherFn, ReseedRun, RunId, RunOutcome, RunWorkflowOptions, run_workflow,
+    PublisherFn, RunId, RunOutcome, RunWorkflowOptions, run_workflow,
     run_workflow_sync, select_workflow_version,
 };
 pub use state_diff::{Operation, diff_state, snapshot_state};
@@ -278,12 +278,6 @@ pub struct EngineRuntime {
     /// 中间件在 server 里经 `MiddlewareServerFnArgs::next(ext)` 合并进来的 ctx 扩展
     /// （擦除层 Value；驱动收尾反序列化进 handler 的 `TCtxExt`）。
     pub ext_extra: Mutex<serde_json::Value>,
-    /// F2-lite 临时目标（INTERIM_GOAL）：名单内步骤全部 checkpoint 后经保留
-    /// 信号 `__interim-goal` 泊车（run → paused，宿主以 recover 续驱扩展边界）。
-    /// 转移检查防重挂；未到达的 goal 永不触发（best-effort fence）。
-    pub interim_goals: Option<Vec<String>>,
-    interim_goals_done: Mutex<std::collections::HashSet<String>>,
-    goals_done_at_drive_start: bool,
     interim_goal_parks: AtomicUsize,
     /// Per-invocation positional counters for `ctx.now()` / `ctx.uuid()`
     /// (rebuilt on every drive, mirroring TanStack's per-run `engine.counters`);
@@ -561,19 +555,6 @@ impl EngineRuntime {
         }
     }
 
-    fn goal_boundary_reached(&self, step_id: &str) -> bool {
-        let Some(goals) = &self.interim_goals else {
-            return false;
-        };
-        if self.goals_done_at_drive_start {
-            return false;
-        }
-        let mut done = self.interim_goals_done.lock().expect("interim goals lock");
-        if goals.iter().any(|g| g == step_id) {
-            done.insert(step_id.to_string());
-        }
-        goals.iter().all(|g| done.contains(g))
-    }
 }
 
 /// Runs one durable step: replay short-circuit, fresh execution with
@@ -862,23 +843,6 @@ where
                     },
                 );
                 inner.publish(&step_finished_event);
-                // F2-lite interim goal：goal 全 checkpoint 且本 drive 启动时
-                // 尚未全齐 → 经保留信号 __interim-goal 泊车（宿主以 recover
-                // 续驱扩展边界；转移检查防重挂）。
-                if inner.goal_boundary_reached(step_id) {
-                    let goals = inner.interim_goals.clone().unwrap_or_default();
-                    let _ = crate::engine::exec_pause_with(
-                        inner,
-                        step_id,
-                        "__interim-goal",
-                        "interim goal reached",
-                        None,
-                        Some(serde_json::json!({ "goals": goals })),
-                        None,
-                    )
-                    .await;
-                    return Err(WorkflowParked.into());
-                }
                 return Ok(result);
             }
             Err(err) => {

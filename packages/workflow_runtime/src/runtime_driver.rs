@@ -221,17 +221,6 @@ pub struct WorkflowRuntimeStartRunArgs {
     pub workflow_id: WorkflowId,
     pub run_id: RunId,
     pub input: serde_json::Value,
-    /// 临时目标名单（f2-lite 自有，上游未采纳；f2-lite `runtime/types.ts:430`）：名单内 step 全部
-    /// checkpoint 后经保留信号 `__interim-goal` 泊车（`kind: Paused`）。
-    /// **续驱走 `deliver_signal("__interim-goal")`**——重复 `start_run` 对
-    /// 非 Queued 的 run 返回 NotClaimable 不驱动（幂等边界）；续驱不带新
-    /// 名单（上游无 interimGoals 概念，deliverSignal args 自然没有），要扩展泊车边界走 core
-    /// 直驱（名单是 per-drive 的，core 层有专测）。
-    pub interim_goals: Option<Vec<String>>,
-    /// redo 计划（f2-lite 自有，上游未采纳；f2-lite `runtime/types.ts:425`，redo 侧）：全新
-    /// run 首驱前导入源 run 幸存 checkpoint，失效名单重跑。语义见
-    /// [`aa_workflow_core::ReseedRun`]；resume 驱动被 core 忽略（fresh-only）。
-    pub reseed_run: Option<aa_workflow_core::ReseedRun>,
     /// 覆盖时钟（测试用）；缺省取当前时间。
     pub now: Option<i64>,
     pub deadline: Option<i64>,
@@ -545,8 +534,6 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
             workflow_id: &args.workflow_id,
             run_id: &args.run_id,
             input: Some(args.input),
-            interim_goals: args.interim_goals.clone(),
-            reseed_run: args.reseed_run.clone(),
             lease_owner: args.lease_owner.clone(),
             lease_ms: args.lease_ms,
             now,
@@ -612,8 +599,6 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
                         // resume 用**持久化在 run 记录里的 input**（同下游
                         // Delivered 分支的理由）。
                         input: Some(run.input.clone()),
-                        interim_goals: None,
-                        reseed_run: None,
                         lease_owner: args.lease_owner.clone(),
                         lease_ms: args.lease_ms,
                         now,
@@ -697,8 +682,6 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
                         // 给 Null 会让强类型 input（`.input::<T>()`）反序列化失败。
                         // 上游同此：`runtime-driver.ts:481` 传 `claim.run.input`。
                         input: Some(run.input.clone()),
-                        interim_goals: None,
-                        reseed_run: None,
                         lease_owner: args.lease_owner.clone(),
                         lease_ms: args.lease_ms,
                         now,
@@ -814,8 +797,6 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
             workflow_id: &workflow_id,
             run_id: &args.run_id,
             input: Some(input),
-            interim_goals: None,
-            reseed_run: None,
             lease_owner: args.lease_owner.clone(),
             lease_ms: args.lease_ms,
             now,
@@ -886,9 +867,7 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
                     workflow_id: &claim.run.workflow_id,
                     run_id: &claim.run.run_id,
                     input: Some(claim.run.input.clone()),
-                    interim_goals: None,
-                    reseed_run: None,
-                    lease_owner: Some(lease_owner.clone()),
+                            lease_owner: Some(lease_owner.clone()),
                     lease_ms: Some(lease_ms),
                     thread_id: None,
                     publish: None,
@@ -926,9 +905,7 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
                     workflow_id: bucket.workflow_id.clone(),
                     run_id: bucket.run_id.clone(),
                     input: bucket.input.clone().unwrap_or(serde_json::Value::Null),
-                    interim_goals: None,
-                    reseed_run: None,
-                    now: Some(now),
+                            now: Some(now),
                     deadline,
                     max_duration_ms: None,
                     min_yield_remaining_ms: args.min_yield_remaining_ms,
@@ -1125,14 +1102,6 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
         // 所以 threadId 只要在这一处转发就够（上游三个 args 各带一个，
         // runtime-driver.ts:115/182/248 同样都往 driveClaimedRun 传）。
         opts = opts.thread_id(args.thread_id.clone());
-        // startRun 的两个 f2-lite 参数（f2-lite `runtime/types.ts:425/430`）：名单透传给 core，
-        // 语义（fresh-only / 转移检查 / 封闭性归调用者）全部在 core。
-        if let Some(goals) = &args.interim_goals {
-            opts = opts.interim_goals(goals.clone());
-        }
-        if let Some(rf) = &args.reseed_run {
-            opts = opts.reseed_run(rf.clone());
-        }
         opts = opts.publish(Some(publish));
         let drive_result = run_workflow(opts).outcome().await;
 
@@ -1199,12 +1168,6 @@ struct DriveArgs<'a> {
     run_id: &'a RunId,
     /// 全新启动时的 input；resume 时为 `None`（input 已在 store 里）。
     input: Option<serde_json::Value>,
-    /// 临时目标名单——start_run 透传；deliver_* / sweep 恒 `None`（它们的
-    /// 续驱名单走重复 `start_run`，上游无 interimGoals、deliverSignal args 自然不带）。
-    interim_goals: Option<Vec<String>>,
-    /// redo 计划——start_run 透传；其余入口恒 `None`（core 对 resume 驱动
-    /// 本来就忽略 reseed_run，fresh-only）。
-    reseed_run: Option<aa_workflow_core::ReseedRun>,
     /// 租约属主。`None` = 由 [`Self::drive_claimed_run`] 按上游
     /// `runtime:{run_id}` 前缀兜底生成（`runtime-driver.ts:680`）。**只有 sweep
     /// 会预先生成** `sweep:{now}`（上游 `:416`）——那是批次标识，不是 per-run 的。
@@ -1358,7 +1321,7 @@ mod driver_tests {
     use crate::WorkflowRunStoreAdapterStore;
     use crate::in_memory_store::InMemoryExecutionStore;
     use aa_workflow_core::{
-        CreateWorkflowConfig, ReseedRun, RunState, RunStatus, StepCtx, WaitForState,
+        CreateWorkflowConfig, RunState, RunStatus, WaitForState,
         WorkflowCtx, create_workflow,
     };
 
@@ -2468,115 +2431,5 @@ mod driver_tests {
         assert!(sweep.timers.is_empty());
         assert!(!sweep.remaining_may_exist);
         assert!(!sweep.deadline_reached);
-    }
-
-    /// startRun 的两个 f2-lite 参数（f2-lite `runtime/types.ts:425/430`）经 runtime 透传到 core：
-    /// interimGoals 泊车 + 重复 start_run 续驱；reseedRun redo。名单语义
-    /// 本身（fresh-only / 转移检查 / 封闭性归调用者）在 core 有专测，这里只证
-    /// 「runtime 门带得动参数」。
-    #[tokio::test]
-    async fn start_run_passthrough_interim_goals_and_reseed_run() {
-        let log: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let log_for_handler = Arc::clone(&log);
-        let wf = create_workflow(CreateWorkflowConfig::new("w").input::<serde_json::Value>())
-            .handler(move |ctx: WorkflowCtx| {
-                let log = Arc::clone(&log_for_handler);
-                async move {
-                    for id in ["a", "b", "c"] {
-                        let log = Arc::clone(&log);
-                        let id_s = id.to_string();
-                        let id_c = id_s.clone();
-                        ctx.step(&id_s, move |_sc: StepCtx| {
-                            let (log, id) = (Arc::clone(&log), id_c.clone());
-                            async move {
-                                log.lock().unwrap().push(id);
-                                Ok(serde_json::Value::Null)
-                            }
-                        })
-                        .await?;
-                    }
-                    Ok(serde_json::Value::Null)
-                }
-            });
-        let fixture = runtime_with("w", wf);
-
-        // 1) interimGoals 泊车
-        let first = fixture
-            .rt
-            .start_run(WorkflowRuntimeStartRunArgs {
-                workflow_id: "w".into(),
-                run_id: "goal:rt".into(),
-                input: serde_json::json!({}),
-                interim_goals: Some(vec!["b".into()]),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(matches!(first.kind, WorkflowRuntimeRunResultKind::Paused), "goal 后泊车");
-
-        // 2) 续驱：对保留信号 __interim-goal 投递（runtime 原生 recover 路径；
-        //    重复 start_run 对 paused run 只会 NotClaimable）
-        let nudged = fixture
-            .rt
-            .start_run(WorkflowRuntimeStartRunArgs {
-                workflow_id: "w".into(),
-                run_id: "goal:rt".into(),
-                input: serde_json::json!({}),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(
-            matches!(nudged.kind, WorkflowRuntimeRunResultKind::NotClaimable),
-            "start_run 幂等边界：paused run 不重复驱动"
-        );
-        let second = fixture
-            .rt
-            .deliver_signal(WorkflowRuntimeDeliverSignalArgs {
-                run_id: "goal:rt".into(),
-                signal_id: "continue-goal".into(),
-                name: "__interim-goal".into(),
-                payload: serde_json::json!({}),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(matches!(second.kind, WorkflowRuntimeRunResultKind::Completed));
-        assert_eq!(
-            log.lock().unwrap().as_slice(),
-            ["a", "b", "c"],
-            "三步各执行一次"
-        );
-
-        // 3) reseedRun redo：失效 a → a 重跑，b/c 导入短路
-        let redo = fixture
-            .rt
-            .start_run(WorkflowRuntimeStartRunArgs {
-                workflow_id: "w".into(),
-                run_id: "redo:rt".into(),
-                input: serde_json::json!({}),
-                reseed_run: Some(ReseedRun::new("goal:rt").with_redo_set(vec!["a".into()])),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(matches!(redo.kind, WorkflowRuntimeRunResultKind::Completed));
-        let mut counts = std::collections::BTreeMap::new();
-        for id in log.lock().unwrap().iter() {
-            *counts.entry(id.clone()).or_insert(0usize) += 1;
-        }
-        assert_eq!(counts["a"], 2, "a 被失效重跑");
-        assert_eq!(counts["b"], 1, "b 导入短路");
-        assert_eq!(counts["c"], 1, "c 导入短路");
-
-        // 溯源透传：redo run 的流里，导入的 b 带 imported_from
-        let imported_b = redo.events.iter().find_map(|e| match e {
-            WorkflowEvent::StepFinished { step_id, meta, .. } if step_id == "b" => meta.clone(),
-            _ => None,
-        });
-        assert!(
-            imported_b.unwrap().imported_from.is_some(),
-            "b 的 checkpoint 来自导入"
-        );
     }
 }

@@ -22,8 +22,6 @@ pub fn tracing_publish() -> EventSubscriberFn {
 pub struct DriveOpts<'a> {
     /// 复用该 run_id ⇒ resume（成功 step 短路、失败 rethrow）。
     pub run_id: Option<&'a str>,
-    /// 全部 checkpoint 即泊车（interimGoals：缺席即待续，续驱补齐）。
-    pub interim_goals: Option<Vec<String>>,
     /// 事件订阅者；`None` 则不订阅。
     pub publish: Option<EventSubscriberFn>,
 }
@@ -40,9 +38,6 @@ impl DriveOpts<'_> {
         let mut ro = RunWorkflowOptions::new(workflow, store).input(input);
         if let Some(id) = self.run_id {
             ro = ro.run_id(id);
-        }
-        if let Some(goals) = &self.interim_goals {
-            ro = ro.interim_goals(goals.clone());
         }
         ro.publish(self.publish.clone())
     }

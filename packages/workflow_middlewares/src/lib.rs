@@ -47,8 +47,9 @@
 //! # 策略参数走 `RunWorkflowOptions.meta`
 //!
 //! 三个中间件都从 [`ctx.meta`](aa_workflow_core::define::BaseCtx) 读策略参数
-//! （`__interimGoals` / `__dagPlan`），而不是往引擎加字段——`interim_goals` /
-//! `reseed_run` 这类**策略**不该长在引擎上（见 `docs/decisions/0001`）。
+//! （`__interimGoals` / `__dagPlan`），而不是往引擎加字段——引擎上曾经有过
+//! `interim_goals` / `reseed_run` 两个策略参数，已于 2026-11-06 删除
+//! （`docs/decisions/0001`、`0018`），本包就是它们的归宿。
 mod dag;
 mod step_layer;
 mod interim_goals;

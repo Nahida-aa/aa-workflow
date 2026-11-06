@@ -103,7 +103,7 @@ pub fn dag_policies(shape: Arc<DagShape>, get_events: Arc<GetEvents>) -> Middlew
                             .filter_map(|v| v.as_str().map(str::to_string))
                             .collect::<Vec<_>>()
                     });
-                    let reseed_run = shape.reseed_plan(source_run_id, &source_log, from)?;
+                    let reseed_run = shape.reseed_plan(&source_log, from)?;
                     let mut redo: HashSet<String> =
                         reseed_run.redo_set.iter().cloned().collect();
                     if let Some(extra) = obj.get("redo_set").and_then(|v| v.as_array()) {
