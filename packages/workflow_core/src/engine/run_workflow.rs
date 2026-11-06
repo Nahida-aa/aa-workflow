@@ -978,10 +978,9 @@ async fn drive(
             output: output.clone(),
         },
     };
-    if let Err(e) = inner.append(&terminal) {
+    if let Err(e) = inner.emit_and_append(&terminal) {
         return Err(err_event(&run_id, e, RunErrorCode::Error));
     }
-    inner.publish(&terminal);
 
     let mut st = run_state;
     st.status = status;

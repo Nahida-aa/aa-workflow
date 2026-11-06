@@ -164,10 +164,9 @@ pub(crate) async fn run_compensations(
         run_id: run_id.to_string(),
         error: RunError::from_anyhow(original),
     };
-    if let Err(e) = engine.append(&started) {
+    if let Err(e) = engine.emit_and_append(&started) {
         return Err((String::new(), RunError::from_anyhow(&anyhow::anyhow!(e))));
     }
-    engine.publish(&started);
 
     // 跨重启跳过：日志里已有 COMPENSATION_COMPLETED 的补偿不再重复。
     let log = engine
@@ -198,13 +197,12 @@ pub(crate) async fn run_compensations(
                         run_id: run_id.to_string(),
                         compensation_id: comp.id.clone(),
                     };
-                    if let Err(e) = engine.append(&ev) {
+                    if let Err(e) = engine.emit_and_append(&ev) {
                         return Err((
                             comp.id.clone(),
                             RunError::from_anyhow(&anyhow::anyhow!(e)),
                         ));
                     }
-                    engine.publish(&ev);
                     break;
                 }
                 Err(e) => {
@@ -216,13 +214,12 @@ pub(crate) async fn run_compensations(
                             compensation_id: comp.id.clone(),
                             error: err.clone(),
                         };
-                        if let Err(e) = engine.append(&ev) {
+                        if let Err(e) = engine.emit_and_append(&ev) {
                             return Err((
                                 comp.id.clone(),
                                 RunError::from_anyhow(&anyhow::anyhow!(e)),
                             ));
                         }
-                        engine.publish(&ev);
                         return Err((comp.id.clone(), err.clone()));
                     }
                     let delay = comp.retry.backoff.delay_ms(attempts);
@@ -303,7 +300,106 @@ pub struct EngineRuntime {
     pub(crate) default_step_retry: Option<crate::define::RetryPolicy>,
 }
 
+/// 检查点事件 → 它对 `lives` 投影的影响。`None` = 该事件不进投影。
+///
+/// **复用 [`fold_step_states`] 的规则**，不另写一套：重放（整段日志折叠）与
+/// 在线（单条事件投影）必须给出一致的结果，否则「续驱看到的状态」会与
+/// 「本次 drive 看到的状态」不同。做法是把它喂给一份空表——事件对
+/// `entry(step_id).or_default()` 的修改等于从 `Pending` 出发的结果，
+/// 这与 `exec_step` 在真跑前写入的 `Running` 标记相容（`StepFinished` 直接
+/// 覆盖成 `Success`）。
+fn live_projection(ev: &WorkflowEvent) -> Option<(String, crate::event::StepState)> {
+    let step_id = ev.step_id()?.to_string();
+    let folded = crate::event::fold_step_states(std::slice::from_ref(ev));
+    let st = folded.get(&step_id)?.clone();
+    Some((step_id, st))
+}
+
+/// **落盘 → 更新 live 投影 → 广播**。所有「引擎主动记一条事件」的唯一入口。
+///
+/// 参数与上游 `emitAndAppend`（`run-workflow.ts:1693`）**一一对应、同名同序**：
+///
+/// ```ts
+/// async function emitAndAppend(
+///   runStore: RunStore,
+///   runId: string,
+///   index: number,
+///   emit: (event: WorkflowEvent) => void,
+///   event: WorkflowEvent,
+/// ): Promise<void> {
+///   await runStore.appendEvent(runId, index, event)   // 先落盘
+///   emit(event)                                        // 再广播
+/// }
+/// ```
+///
+/// 顺序是硬约束：**日志是唯一真相**，只有确认落盘后才对外可见（否则订阅者
+/// 会看到一个重放时并不存在的事件）。
+///
+/// 三点与上游**必然**不同，原因都不是「实现风格」，而是 Rust 侧多出来的东西：
+///
+/// 1. **`&mut index` 而非 `index`**。上游的 `nextLogIndex` 由调用点
+///    `engine.nextLogIndex++` 自增；这里游标属于 [`EngineRuntime::log_len`]，
+///    CAS 失败时会重定基（另一个写者先到），所以必须能写回。传 `&AtomicUsize`
+///    而不是 `&mut usize`，是因为并行分支可能同时落事件。
+/// 2. **`live` 多一步**。上游的重放短路直接查 `history` 数组，日志就是内存
+///    状态；Rust 另有一份 `lives` 投影做 O(1) 短路与 `completed_steps()` 快照。
+///    内容**由事件形状推导**（见 [`live_projection`]），调用者只说「发生了什么」。
+///    `None`（无 live 表，例如单测）时跳过。
+/// 3. **返回 `Result`**。上游 `appendEvent` 抛异常；这里落盘失败要能被 `?`
+///    接住，且**失败时绝不 emit**——这正是「append-first」的含义。
+///
+/// 不产生 live 的事件（`StateDelta` / `StepProgress` / `Custom` / run 级事件）
+/// 会被自动跳过，所以本函数对任何事件都安全；但它们本就 emit-only，该走
+/// [`EngineRuntime::publish`]，不该进这里（那会往日志里写不该持久化的东西）。
+pub(crate) fn emit_and_append(
+    run_store: &dyn crate::run_store::RunStore,
+    run_id: &str,
+    index: &std::sync::atomic::AtomicUsize,
+    emit: &dyn Fn(&WorkflowEvent),
+    live: Option<&EngineRuntime>,
+    event: &WorkflowEvent,
+) -> Result<(), WorkflowError> {
+    // Append-first：先落盘（带 CAS 重定基），再更新 live，最后广播。
+    loop {
+        let idx = index.load(Ordering::Acquire);
+        match run_store.append_event(run_id, idx, event) {
+            Ok(()) => {
+                index.store(idx + 1, Ordering::Release);
+                break;
+            }
+            Err(crate::error::StoreError::Conflict { actual, .. }) => {
+                index.store(actual, Ordering::Release);
+            }
+            // 落盘失败：**不 emit**。订阅者不该看到日志里没有的事件。
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if let Some(engine) = live
+        && let Some((step_id, st)) = live_projection(event)
+    {
+        engine.set_live(&step_id, st);
+    }
+    emit(event);
+    Ok(())
+}
+
 impl EngineRuntime {
+    /// 本 engine 的 [`emit_and_append`]：把 `store` / `run_id` / `log_len` /
+    /// `publish` / `self` 五个参数一次递过去。
+    ///
+    /// 存在的意义只是别让每个调用点重复传同一组参数——语义完全在自由函数里，
+    /// 上游也没有对应的方法，所以逻辑不放在这。
+    pub(crate) fn emit_and_append(&self, ev: &WorkflowEvent) -> Result<(), WorkflowError> {
+        emit_and_append(
+            self.store.as_ref(),
+            &self.run_id,
+            &self.log_len,
+            &|e| self.publish(e),
+            Some(self),
+            ev,
+        )
+    }
+
     /// Appends a checkpoint with optimistic CAS; on a lost race re-bases the
     /// cursor and retries (the other writer won, its event precedes ours).
     fn append(&self, ev: &WorkflowEvent) -> Result<(), WorkflowError> {
@@ -374,9 +470,7 @@ impl EngineRuntime {
             run_id: self.run_id.clone(),
             compensation_id: compensation_id.to_string(),
         };
-        self.append(&ev)?;
-        self.publish(&ev);
-        Ok(())
+        self.emit_and_append(&ev)
     }
 
     /// Diff [`prev_state_snapshot`](Self::prev_state_snapshot) vs
@@ -527,18 +621,7 @@ let ev = WorkflowEvent::StepFinished {
     }],
     meta,
 };
-engine.append(&ev)?;
-engine.set_live(
-    step_id,
-    StepState {
-        status: StepStatus::Success,
-        result: Some(result.clone()),
-        error: None,
-        started_at: Some(ts),
-        finished_at: Some(ts),
-    },
-);
-engine.publish(&ev);
+engine.emit_and_append(&ev)?;
 Ok(result)
 }
 
@@ -781,8 +864,7 @@ where
                 step_id: step_id.to_string(),
                 attempt,
             };
-            inner.append(&ev)?;
-            inner.publish(&ev);
+            inner.emit_and_append(&ev)?;
         }
         // 保留 `anyhow::Error` 而非提前字符串化，这样 attempt 能记下结构化的
         // `RunError`（attempts 会落进 STEP_FAILED，供重试与审计回看）。
@@ -831,18 +913,7 @@ where
                     attempts: attempts.clone(),
                     meta: None,
                 };
-                inner.append(&step_finished_event)?;
-                inner.set_live(
-                    step_id,
-                    StepState {
-                        status: StepStatus::Success,
-                        result: Some(recorded.clone()),
-                        error: None,
-                        started_at: Some(started_at),
-                        finished_at: Some(finished_at),
-                    },
-                );
-                inner.publish(&step_finished_event);
+                inner.emit_and_append(&step_finished_event)?;
                 return Ok(result);
             }
             Err(err) => {
@@ -881,8 +952,7 @@ where
                         error: run_err.clone(),
                         attempts: attempts.clone(),
                     };
-                    inner.append(&ev)?;
-                    inner.publish(&ev);
+                    inner.emit_and_append(&ev)?;
                     // 泊车（__timer + deadline）：本 drive 结束，驱动循环到期
                     // 重驱（自轮询 25ms 或 sweep）→ exec_step 入口的 pending
                     // 检查以到期后的时间放行 → 该步骤以携带的 attempts 续跑。
@@ -916,18 +986,7 @@ where
                     error: run_err.clone(),
                     attempts,
                 };
-                inner.append(&ev)?;
-                inner.set_live(
-                    step_id,
-                    StepState {
-                        status: StepStatus::Failed,
-                        result: None,
-                        error: Some(run_err.clone()),
-                        started_at: Some(started_at),
-                        finished_at: Some(finished_at),
-                    },
-                );
-                inner.publish(&ev);
+                inner.emit_and_append(&ev)?;
                 // 原样上抛，不加 `step `x` failed:` 前缀：step 身份已经在
                 // `step_id` 字段里（结构化），再包一层会让同一个错误的 message
                 // 在 step 层与 run 层变成两个值。TanStack 也是直接 rethrow
@@ -968,8 +1027,7 @@ pub fn exec_now(inner: &Arc<EngineRuntime>) -> anyhow::Result<i64> {
         step_id,
         value,
     };
-    inner.append(&ev)?;
-    inner.publish(&ev);
+    inner.emit_and_append(&ev)?;
     Ok(value)
 }
 
@@ -995,8 +1053,7 @@ pub fn exec_uuid(inner: &Arc<EngineRuntime>) -> anyhow::Result<String> {
         step_id,
         value: value.clone(),
     };
-    inner.append(&ev)?;
-    inner.publish(&ev);
+    inner.emit_and_append(&ev)?;
     Ok(value)
 }
 
@@ -1152,8 +1209,7 @@ pub async fn exec_pause_with(
                 meta: meta.clone(),
             }
         };
-        inner.append(&ev)?;
-        inner.publish(&ev);
+        inner.emit_and_append(&ev)?;
     }
     // 投影 RunState 信封（fresh 与崩溃后 replay 一致：都展示 Paused + 等待说明）。
     project_run_wait(
