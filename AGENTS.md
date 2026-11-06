@@ -151,7 +151,7 @@ WorkflowRunStoreAdapterStore       本仓 runtime 的存储基础：元数据信
 的入参**。
 
 补充一点容易误读的：state 的写**是自动发 `STATE_DELTA` 的**，不用手动发
-（`define/mod.rs:166-174` 的 `flush_state` → `state.sync()` + `emit_state_delta()`），
+（`define/mod.rs:166-174` 的 `flush_state` → `state.sync()` + `flush_state_delta()`），
 只是攒到耐久边界才 flush（step / wait / approve / sleep_until / yield / drive 收尾）。
 最容易踩的坑是：**首次 drive 的 delta 看着完全正常，resume 时闭包被短路 → 一条 delta
 都不发 → 终态是另一个值，且永远不会被纠正。** 所以判别信号是「**恢复期有没有重新发出

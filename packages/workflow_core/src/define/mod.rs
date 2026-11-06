@@ -189,9 +189,8 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
     where
         TState: serde::Serialize,
     {
-        eprintln!("[trace] flush_state enter");
         self.state.sync();
-        self.engine.emit_state_delta();
+        self.engine.flush_state_delta();
         Ok(())
     }
 
@@ -259,7 +258,7 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
         }
         // 登记落成耐久事件（对齐上游 `COMPENSATION_REGISTERED`）：handler 重放时
         // 这一步不会重复写日志，崩溃后也从日志看得见"登记过什么"。
-        self.engine.append_compensation_registered(&id)?;
+        self.engine.register_compensation(&id)?;
         Ok(())
     }
 

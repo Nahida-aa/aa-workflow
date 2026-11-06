@@ -119,7 +119,7 @@ publish（非耐久 attempt 仍只活在内存里，与上游一致）。
 Rust 原先仅内存登记、靠 handler 重跑确定性重登记——行为等价，但结构不同：日志里
 没有任何痕迹，重放时也无从判断「这个 run 登记过什么」。
 
-现补为 `EngineRuntime::append_compensation_registered(id)`：先查日志里有没有同 id
+现补为 `EngineRuntime::register_compensation(id)`：先查日志里有没有同 id
 的登记，没有才 append + publish。**先查再写**正是上游 `findCheckpoint` 那一步的
 对端——handler 重放时重新执行到同一个 `ctx.compensate` 调用点，不会重复写日志。
 

@@ -438,10 +438,14 @@ impl EngineRuntime {
 
     /// 追加一条补偿登记事件（对齐上游 `COMPENSATION_REGISTERED`）。
     ///
+    /// 登记一条补偿（undo 轴），对应上游 [`registerCompensation`]。
+    ///
     /// **登记是耐久的**：日志里已有同 `compensation_id` 的登记就不再追加——
     /// 这正是重放时handler 重新执行到同一个 `ctx.compensate` 调用点却不重复写
     /// 日志的原因（与上游 `findCheckpoint` 那一步同义）。
-    pub(crate) fn append_compensation_registered(
+    ///
+    /// [registerCompensation]: https://github.com/TanStack/workflow/blob/main/packages/workflow-core/src/engine/run-workflow.ts
+    pub(crate) fn register_compensation(
         &self,
         compensation_id: &str,
     ) -> Result<(), WorkflowError> {
@@ -467,10 +471,13 @@ impl EngineRuntime {
     /// [`state_mirror`](Self::state_mirror)，非空则 **emit-only** 发一条
     /// [`WorkflowEvent::StateDelta`] 并推进快照。
     ///
+    /// 对应上游 `flushStateDelta(engine)`（`run-workflow.ts:1706`）。命名与
+    /// 上游一致——它在上游是自由函数，这里因为要 `Mutex` 锁 `state_mirror`
+    /// 才落成方法；语义、职责、emit-only 的性质都相同。
+    ///
     /// 调用点：耐久边界（`flush_state`）与 drive 收尾（尾段 delta，对齐上游
     /// handler 返回 / catch 处的 `flushStateDelta`）。
-    pub(crate) fn emit_state_delta(&self) {
-        eprintln!("[trace] emit_state_delta enter");
+    pub(crate) fn flush_state_delta(&self) {
         let mirror = self
             .state_mirror
             .lock()
@@ -487,7 +494,6 @@ impl EngineRuntime {
             }
             delta
         };
-        eprintln!("[trace] emit_state_delta delta_len={}", delta.len());
         if !delta.is_empty() {
             self.publish(&WorkflowEvent::StateDelta {
                 ts: now_ms(),
@@ -3510,7 +3516,7 @@ mod tests {
     /// op 语义对齐 RFC 6902；**不落盘**（state 由日志重放推导，持久化 delta
     /// 会在每次 invocation 重放时重复 append）。
     #[tokio::test]
-    async fn state_mutations_emit_state_delta_at_boundaries() {
+    async fn state_mutations_flush_state_delta_at_boundaries() {
         let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = events.clone();

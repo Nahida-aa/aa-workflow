@@ -26,7 +26,7 @@
 //! - mirror（引擎侧 `Value` 视图）在 handle **drop 时**被序列化同步
 //!   （dirty 才写——克隆的旧快照不得回写）。
 //! - `STATE_DELTA` 的发射由引擎在**耐久边界**（`flush_state` →
-//!   `emit_state_delta`）与 **drive 收尾**各做一次：前者上报边界内的变更，
+//!   `flush_state_delta`）与 **drive 收尾**各做一次：前者上报边界内的变更，
 //!   后者补上尾段——与上游在 handler 返回 / catch 处的 `flushStateDelta`
 //!   一致。
 //! - `STATE_DELTA` 是 **emit-only，不落盘**（上游注释原话：state 由日志
@@ -95,11 +95,8 @@ impl<TState> StateHandle<TState> {
 
     /// 把 typed state 序列化进 mirror。
     pub(crate) fn sync(&self) {
-        eprintln!("[trace] sync enter");
         let value = (self.to_value)(&self.st);
-        eprintln!("[trace] sync to_value done");
         *self.mirror.lock().expect("state mirror lock poisoned") = value;
-        eprintln!("[trace] sync mirror written");
     }
 
     /// drop 时只在**本 handle** 被变更过才同步（克隆的旧快照不得回写）。

@@ -906,10 +906,8 @@ async fn drive(
         run_id: run_id.clone(),
         thread_id: opts.thread_id.clone(),
     });
-    eprintln!("[trace] run_started published");
 
     let ctx = crate::define::WorkflowCtx::untyped(inner.clone());
-    eprintln!("[trace] ctx constructed");
     let handler_result = (active.handler)(ctx).await;
     // **清空 step 包装链**：drive 结束即丢弃，与中间件里捕获的策略状态
     // （`done` / `lookup` 等局部变量）同一生命周期。
@@ -924,7 +922,7 @@ async fn drive(
     // 尾段 state delta：ctx 在 handler 内 drop 时已把最终 state 同步进
     // mirror，这里统一 diff 发射（对齐上游 handler 返回 / catch 处的
     // flushStateDelta）。
-    inner.emit_state_delta();
+    inner.flush_state_delta();
 
     // `failure` 是结构化的（`RunState.error`、`RUN_ERRORED`、`RunOutcome.error`
     // 三处同类型）。

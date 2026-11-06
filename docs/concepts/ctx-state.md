@@ -42,7 +42,7 @@
 
 ```rust
 self.state.sync();                 // 句柄的 st → mirror
-self.engine.emit_state_delta();    // mirror 与 prev snapshot 做 diff，非空才 publish
+self.engine.flush_state_delta();    // mirror 与 prev snapshot 做 diff，非空才 publish
 ```
 
 diff 的基准是 `prev_state_snapshot`（`engine/mod.rs:205-212`）—— 也就是**只发变化量**，
