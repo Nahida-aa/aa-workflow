@@ -265,7 +265,26 @@ pub struct EngineRuntime {
     /// 语义不同——冲突时它会被**直接改成** `actual`，那时它就不是任何一次
     /// 写入算出来的长度了。
     next_log_index: AtomicUsize,
-    /// Derived per-step states (replay short-circuit + result cache).
+    /// 日志的**按 step 索引**：`step_id → 当前状态`。上游没有这个东西。
+    ///
+    /// 上游把整份日志放在 `engine.history` 数组里，每次重放短路都线性扫
+    /// （`findCheckpoint`，`run-workflow.ts:1678`）。本仓另存一份哈希索引，
+    /// 换 O(1) 查表：
+    ///
+    /// | 用途 | 上游 | 本仓 |
+    /// | --- | --- | --- |
+    /// | 重放短路 | 扫 `history` 找该 step 的终态事件 | [`Self::live`] |
+    /// | 已完成集合 | `history.some(..)` 逐个判 | [`Self::completed_steps`] |
+    ///
+    /// **代价是它与日志可能不同步**——这是本仓独有的风险，上游只有一份数据
+    /// 所以没有。约束因此只有一条：
+    ///
+    /// > **所有检查点事件都必须经 [`Self::append`] 落盘**，它会在里面同步
+    /// > 本表（`live_projection` 复用 `fold_step_states` 的规则，不另写一套）。
+    ///
+    /// 唯一允许直接写的地方是 [`Self::set_live`] 的 `Running` 标记
+    /// （`exec_step` 里）——`StepStarted` 是 emit-only 事件、不落盘，
+    /// 但状态要反映「正在跑」。
     lives: Mutex<std::collections::HashMap<String, StepState>>,
     /// Phase-1 补偿登记（undo 轴）：handler 内 `ctx.compensate` 按代码确定性
     /// 重登记；失败路径取走并逆序执行（见 `run_compensations`）。
@@ -1144,15 +1163,10 @@ pub async fn exec_pause_with(
         // `run-workflow.ts:1103` 的 `engine.emit(resolved)`——emit 即 append）。
         // 只把 payload 交给 handler 而不写日志的话，重放时 `find_resume` 再也
         // 找不到它，run 会重新泊车。
-        loop {
-            let n = inner.store.get_events(&inner.run_id)?.len();
-            match inner.store.append_event(&inner.run_id, n, &ev) {
-                Ok(()) => break,
-                Err(StoreError::Conflict { .. }) => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        inner.publish(&ev);
+        //
+        // 走 `emit_and_append`（经 [`EngineRuntime::append`]）而不是自己写
+        // CAS 循环：游标管理、索引推进、live 同步都只该有一份实现。
+        inner.append(&ev)?;
         let payload = match ev {
             WorkflowEvent::SignalResolved { payload, .. } => payload,
             // 收件箱只应产出 SignalResolved；别的形状按空处理。
