@@ -884,9 +884,8 @@ async fn drive(
         // 内存日志副本，对应上游 `history: [...history]`（`run-workflow.ts:561`）。
         // 重放短路与「已完成集合」都扫它，没有第二份派生状态。
         history: Mutex::new(events),
-        running: Mutex::new(std::collections::HashSet::new()),
 
-        publish_tx: Some(publish_tx.clone()),
+        emit: publish_tx.clone(),
         now_counter: AtomicUsize::new(0),
         uuid_counter: AtomicUsize::new(0),
         deadline: opts.deadline,

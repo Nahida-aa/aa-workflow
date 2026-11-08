@@ -279,13 +279,6 @@ pub struct EngineRuntime {
     /// `Running` 标记**不在**这里：`StepStarted` 是 emit-only、不落盘，
     /// 所以它单独放 [`Self::running`]。
     history: Mutex<Vec<WorkflowEvent>>,
-    /// 正在执行的 step id（`STEP_STARTED` 已发、终态事件尚未落盘）。
-    ///
-    /// 对应上游把 `STEP_STARTED` 也放进 `history` 的情形——但上游的
-    /// `STEP_STARTED` 同样不落盘（`flushStateDelta` 注释里的 emit-only 约定），
-    /// 重放短路只认 `STEP_FINISHED`/`STEP_FAILED`，所以这个标记不参与
-    /// 重放判定，只是让并发重复 id 能被发现（见 `exec_step` 的 `Running` 分支）。
-    running: Mutex<std::collections::HashSet<String>>,
     /// Phase-1 补偿登记（undo 轴）：handler 内 `ctx.compensate` 按代码确定性
     /// 重登记；失败路径取走并逆序执行（见 `run_compensations`）。
     pub compensations: Mutex<Vec<Compensation>>,
@@ -320,11 +313,18 @@ pub struct EngineRuntime {
     pub yield_resume_at: Option<i64>,
     /// Positional counter for `__yield-{n}` pause keys (per-invocation).
     pub(crate) yield_counter: AtomicUsize,
-    /// 事件扇出通道。**引擎侧只做一次 `send`**（非阻塞），await publisher 的
-    /// 动作在**消费侧**——对齐上游 `runWorkflow` 的 async generator：
-    /// `queue.shift()` 后 `await publish`，而执行在另一个 task 里继续往 queue 推
-    /// （`run-workflow.ts:85-134`）。所以慢 publisher 拖慢消费端，不拖慢引擎。
-    pub(crate) publish_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEvent>>,
+    /// 事件扇出通道，对应上游 `emit`（`run-workflow.ts:157` 的闭包捕获的
+    /// `queue` + `resolveWait`）。
+    ///
+    /// 上游是「`runWorkflow` 里定义闭包 → 传给 `drive` → 装进 engine 字段」；
+    /// 本仓用一个 unbounded channel 顶替那对手写队列/唤醒，语义相同：
+    ///
+    /// - `send` 是非阻塞的 → 慢 publisher 拖慢消费端，不拖慢引擎
+    ///   （上游是 `queue.push` 立即返回，`await publish` 在 generator 里）
+    /// - channel 自带唤醒 → 上游那两行 `resolveWait` 手写握手不需要了
+    ///
+    /// 非 `Option`：只有一个构造点（[`run_workflow`]），且总有一个流在收。
+    pub(crate) emit: tokio::sync::mpsc::UnboundedSender<WorkflowEvent>,
     /// WorkflowDefinition-level fallback retry (TanStack `defaultStepRetry`); steps that
     /// declare their own [`StepOptions::retry`](crate::define::StepOptions::retry)
     /// win.
@@ -445,7 +445,7 @@ impl EngineRuntime {
 
     /// Best-effort fan-out to the host's publisher. **Never propagates**, and
     /// **never blocks the engine** — this only hands the event to the drain task
-    /// (see [`Self::publish_tx`]); awaiting the publisher happens there.
+    /// (see [`Self::emit`]); awaiting the publisher happens there.
     ///
     /// Upstream's shape is an `async function*` whose loop does
     /// `queue.shift()` → `await publish` → `yield`, while execution runs in a
@@ -466,9 +466,7 @@ impl EngineRuntime {
     /// 但它也是**唯一**一次克隆——drain task 拿到所有权后按值交给 publisher，
     /// 引擎侧不再有任何额外拷贝。
     pub(crate) fn publish(&self, ev: &WorkflowEvent) {
-        if let Some(tx) = &self.publish_tx {
-            let _ = tx.send(ev.clone());
-        }
+        let _ = self.emit.send(ev.clone());
     }
 
     /// 追加一条补偿登记事件（对齐上游 `COMPENSATION_REGISTERED`）。
@@ -547,31 +545,17 @@ impl EngineRuntime {
         });
     }
 
-    /// 标记某 step 正在执行（`STEP_STARTED` 已 emit、终态尚未落盘）。
-    fn mark_running(&self, step_id: &str) {
-        if let Ok(mut running) = self.running.lock() {
-            running.insert(step_id.to_string());
-        }
-    }
-
-    /// 某 step 在**内存日志**里的当前状态（等价于上游对该 step 调用
-    /// `findCheckpoint` 再取事件）。
+    /// 某 step 在**内存日志**里的当前状态。
     ///
-    /// 从后往前扫：同一 step id 可能有多次执行（重试、redo），**后者胜**——
-    /// 这与 [`crate::event::fold_step_states`] 的覆盖语义一致。
+    /// 对应上游 `findCheckpoint(engine, pred)` + 取事件：只认终态（成功/失败），
+    /// 同一 id 多次执行时**后者胜**（重试、redo），与
+    /// [`crate::event::fold_step_states`] 的折叠语义一致。
     ///
-    /// 终态优先于 `Running`：`STEP_FINISHED` 落盘后即使标记没清，也该报成功。
+    /// 「正在执行」不在此列：`STEP_STARTED` 是 emit-only、不落盘，上游也
+    /// 不把它当检查点——查不到终态就是「还没跑完」，调用方据此放行。
     fn live(&self, step_id: &str) -> Option<StepState> {
         let history = self.history.lock().ok()?;
-        if let Some(st) = live_of(&history, step_id) {
-            return Some(st);
-        }
-        drop(history);
-        let running = self.running.lock().ok()?;
-        running.contains(step_id).then(|| StepState {
-            status: StepStatus::Running,
-            ..Default::default()
-        })
+        live_of(&history, step_id)
     }
 
     /// 本 drive 内**已成功**的 step 快照（扫内存日志）。
@@ -864,8 +848,6 @@ where
             StepStatus::Running | StepStatus::Pending | StepStatus::Paused => {}
         }
     }
-    inner.mark_running(step_id);
-
     inner.publish(&WorkflowEvent::StepStarted {
         ts: now_ms(),
         run_id: inner.run_id.clone(),
