@@ -892,16 +892,13 @@ async fn drive(
         history: Mutex::new(events),
 
         emit: publish_tx.clone(),
-        now_counter: AtomicUsize::new(0),
-        uuid_counter: AtomicUsize::new(0),
+        counters: crate::engine::Counters::default(),
         deadline: opts.deadline,
         min_yield_remaining_ms: opts
             .min_yield_remaining_ms
             .unwrap_or(DEFAULT_MIN_YIELD_REMAINING_MS),
         yield_resume_at: opts.yield_resume_at,
-        yield_counter: AtomicUsize::new(0),
         compensations: std::sync::Mutex::new(Vec::new()),
-        interim_goal_parks: AtomicUsize::new(0),
         pending_retries: Mutex::new(pending_retries),
         // 收集中间件的 step 边界钩子（注册顺序 = 声明顺序）。
         step_layers: Mutex::new(Vec::new()),

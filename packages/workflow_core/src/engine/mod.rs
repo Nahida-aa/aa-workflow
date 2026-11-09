@@ -307,20 +307,19 @@ pub struct EngineRuntime {
     /// 中间件在 server 里经 `MiddlewareServerFnArgs::next(ext)` 合并进来的 ctx 扩展
     /// （擦除层 Value；驱动收尾反序列化进 handler 的 `TCtxExt`）。
     pub ext_extra: Mutex<serde_json::Value>,
-    interim_goal_parks: AtomicUsize,
-    /// Per-invocation positional counters for `ctx.now()` / `ctx.uuid()`
-    /// (rebuilt on every drive, mirroring TanStack's per-run `engine.counters`);
-    /// used to derive the checkpoint ids `__now-{n}` / `__uuid-{n}`.
-    now_counter: AtomicUsize,
-    uuid_counter: AtomicUsize,
+    /// 每个 primitive 自己的位置计数器，对应上游 `engine.counters`
+    /// （`run-workflow.ts:811`）：没有用户指定 id 的原语靠它派生稳定的
+    /// checkpoint id（`__now-{n}` / `__uuid-{n}` / `__yield-{n}`）。
+    ///
+    /// 每次 drive 重建（`counters: { ... }` 在 `drive` 里初始化），所以同一段
+    /// handler 代码在重放时拿到同一串 id——这是它必须确定的原因。
+    pub(crate) counters: Counters,
     /// Runtime budget (TanStack `deadline`): absolute UTC ms for this drive.
     pub deadline: Option<i64>,
     /// Headroom threshold for `should_yield()` (TanStack `minYieldRemainingMs`).
     pub min_yield_remaining_ms: u64,
     /// Absolute ms at which `ctx.yield_()` re-wakes (TanStack `yieldResumeAt`).
     pub yield_resume_at: Option<i64>,
-    /// Positional counter for `__yield-{n}` pause keys (per-invocation).
-    pub(crate) yield_counter: AtomicUsize,
     /// 事件扇出通道，对应上游 `emit`（`run-workflow.ts:157` 的闭包捕获的
     /// `queue` + `resolveWait`）。
     ///
@@ -333,6 +332,22 @@ pub struct EngineRuntime {
     ///
     /// 非 `Option`：只有一个构造点（[`run_workflow`]），且总有一个流在收。
     pub(crate) emit: tokio::sync::mpsc::UnboundedSender<WorkflowEvent>,
+}
+
+/// 每个 primitive 的位置计数器，对应上游 `EngineRuntime.counters`
+/// （`run-workflow.ts:811`，`counters: { wait, sleep, approve, now, uuid,
+/// yield, goalParks }`）。
+///
+/// 上游是 `number` + `++`（单线程）；这里要跨线程共享，用 `AtomicUsize`——
+/// 同一个 `ctx.now()` 调用点可能被并行分支同时执行。
+///
+/// 只保留**本仓真的会用到的**：上游的 `wait` / `sleep` / `approve` /
+/// `goalParks` 对应的原语在本仓要么由调用方提供 id，要么已移到中间件。
+#[derive(Default)]
+pub(crate) struct Counters {
+    pub(crate) now: AtomicUsize,
+    pub(crate) uuid: AtomicUsize,
+    pub(crate) yield_: AtomicUsize,
 }
 
 /// 某 step 在给定事件序列里的**最后一个**终态（重试 / redo 时后者胜）。
@@ -1044,7 +1059,7 @@ pub const DEFAULT_MIN_YIELD_REMAINING_MS: u64 = 1000;
 /// per-invocation atomic counter (`__now-0`, `__now-1`, …) so concurrent
 /// calls stay unique; replay permutes them to the same ids and reads the cache.
 pub fn exec_now(inner: &Arc<EngineRuntime>) -> anyhow::Result<i64> {
-    let k = inner.now_counter.fetch_add(1, Ordering::SeqCst);
+    let k = inner.counters.now.fetch_add(1, Ordering::SeqCst);
     let step_id = format!("__now-{k}");
     for ev in inner.store.get_events(&inner.run_id)? {
         if let WorkflowEvent::NowRecorded {
@@ -1070,7 +1085,7 @@ pub fn exec_now(inner: &Arc<EngineRuntime>) -> anyhow::Result<i64> {
 /// (TanStack `ctx.uuid`): a generated UUIDv4, recorded as a `UuidRecorded`
 /// checkpoint. On replay the recorded id is served — stable across resumes.
 pub fn exec_uuid(inner: &Arc<EngineRuntime>) -> anyhow::Result<String> {
-    let k = inner.uuid_counter.fetch_add(1, Ordering::SeqCst);
+    let k = inner.counters.uuid.fetch_add(1, Ordering::SeqCst);
     let step_id = format!("__uuid-{k}");
     for ev in inner.store.get_events(&inner.run_id)? {
         if let WorkflowEvent::UuidRecorded {

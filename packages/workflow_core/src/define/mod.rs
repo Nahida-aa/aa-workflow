@@ -459,7 +459,8 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
         self.flush_state()?;
         let k = self
             .engine
-            .yield_counter
+            .counters
+            .yield_
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let step_id = format!("__yield-{k}");
         let target = self
