@@ -21,7 +21,7 @@
 | `store: Arc<dyn RunStore>` | `runStore: RunStore` | |
 | `emit: UnboundedSender<WorkflowEvent>` | `emit: (event) => void` | 上游是闭包捕获 `queue` + `resolveWait`；本仓用 channel 顶替，语义相同 |
 | `history: Mutex<Vec<WorkflowEvent>>` | `history: ReadonlyArray<WorkflowEvent>` | **只含本轮开始前的记录**，是重放查找的来源 |
-| `appended: Mutex<Vec<WorkflowEvent>>` | （无，混在 `history` 里） | 本轮追加的事件；`live` / `completed_steps` 扫它 |
+| `appended: Mutex<Vec<WorkflowEvent>>` | （无，混在 `history` 里） | 本轮追加的事件；`exec_step` 的短路与 `completed_steps` 扫它 |
 | `consumed: Mutex<HashSet<usize>>` | `consumed: Set<number>` | 已消费的 `history` 下标 |
 | `next_log_index: AtomicUsize` | `nextLogIndex: number` | 上游 `++` 自增，本仓 CAS 重定基（并行分支会同时追加） |
 | `counters.now / .uuid / .yield_` | `counters.{now, uuid, yield}` | 上游还有 `wait` / `sleep` / `approve` / `goalParks`，见下节 |
@@ -44,6 +44,34 @@
 | `pluginHooks` / `pluginCtx` | 本仓没有插件系统；钩子能力由中间件承载（[0016](../decisions/0016-step-onion.md)、[0017](../decisions/0017-meta-typed-keys.md)） |
 | `telemetry` | 本仓未接 tracing |
 | `abortController` | 本仓用 store 里的 run 状态做取消判定（`is_cancelled`） |
+
+## 二·五、查找辅助函数
+
+上游只有一个 `findCheckpoint(engine, predicate)`（`run-workflow.ts:1678`），六个原语
+（`step` / `waitForEvent` / `approve` / `now` / `uuid` / `registerCompensation`）都用它。
+
+本仓因为日志分成两份（`history` / `appended`），拆成了两个：
+
+| 本仓 | 上游 | 扫哪份 | 用途 |
+| --- | --- | --- | --- |
+| `find_checkpoint(events, predicate)` | `findCheckpoint` | 调用方给 | 通用查找原语，签名只差「日志由调用方传入」 |
+| `is_terminal_of(step_id)` | `engineStep` 里内联的谓词 | — | `(STEP_FINISHED\|STEP_FAILED) && stepId === id` |
+| `history_value(engine, step_id, extract)` | `findCheckpoint` + 谓词 | 只 `history`，**命中即消费** | `now` / `uuid` 按 id 取已记录值 |
+| `EngineRuntime::completed_steps()` | **无** | 两份都扫 | 本仓扩展：给中间件的 `StepRequest.completed` 快照 |
+
+曾经有过一个 `EngineRuntime::live(step_id) -> Option<StepState>`，已删除——它把
+「查事件」包装成「返回折叠状态」，比上游多一层。现在 `exec_step` 直接
+
+```rust
+let cached = find_checkpoint(&appended, is_terminal_of(step_id)).cloned()
+    .or_else(|| find_checkpoint(&history, is_terminal_of(step_id)).cloned());
+match cached { StepFinished { result, .. } => .., StepFailed { error, .. } => .. }
+```
+
+与上游「查到事件、在调用点 match」同形。
+
+同理，`register_compensation` 原来读 `store.get_events()` 判断「是否已登记」，
+现在扫内存日志（两份都查）。
 
 ## 三、本仓扩展（上游没有）
 

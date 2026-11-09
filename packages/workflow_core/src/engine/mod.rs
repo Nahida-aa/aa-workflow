@@ -370,19 +370,18 @@ pub(crate) struct Counters {
     pub(crate) yield_: AtomicUsize,
 }
 
-/// 在内存日志里找某个 `step_id` 的已记录值，对应上游
-/// `findCheckpoint(engine, (e, i) => ...)`。
+/// 在**上一轮日志**里找某个 `step_id` 的已记录值，命中即标记消费。
 ///
-/// 上游扫的是 `engine.history`（内存数组，`run-workflow.ts:1682`），**不碰
-/// store**。这里同样——每次 `ctx.now()` / `ctx.uuid()` 都读一遍数据库的话，
-/// 一个 n 步的 workflow 就是 n 次额外查询，而这本来只是一次数组扫描。
+/// 对应上游 `findCheckpoint(engine, (e, i) => !consumed.has(i) && <类型> && e.stepId === id)`
+/// ——六个原语（`step` / `waitForEvent` / `approve` / `now` / `uuid` /
+/// `registerCompensation`）用的是同一个查找。
 ///
-/// **命中即标记消费**（`consumed.add(i)`），与上游 `findCheckpoint` 一致：
-/// 调用方显式给了 id 时，同一个 id 调两次必须拿到两条不同的记录——第二次
-/// 跳过已被消费的那条，落到「未命中」分支生成新值。
+/// 只扫 `history`（上一轮的记录），**不扫 `appended`**：本 drive 刚追加的
+/// 记录不该被当成「已存在的 checkpoint」复用——否则 `ctx.now_with("t")`
+/// 调两次会拿到同一个值（见 `consumed` 字段文档）。
 ///
-/// `extract` 返回 `None` 表示该事件不是要找的那一类（按事件变体过滤），
-/// 所以调用方只需要写「从我这类型的事件里取什么」。
+/// 消费（`consumed.add(i)`）发生在命中时：同一 id 第二次调用跳过这条、
+/// 生成新值，与上游一致。
 fn history_value<T>(
     engine: &EngineRuntime,
     step_id: &str,
@@ -390,22 +389,41 @@ fn history_value<T>(
 ) -> Option<T> {
     let mut history = engine.history.lock().ok()?;
     let mut consumed = engine.consumed.lock().ok()?;
-    // 从前往后扫（与上游同向），取第一条未消费的匹配项。
+    // 先按 step_id 找到第一条未消费的候选，再走 `extract` 判类型——
+    // 与上游 `findCheckpoint` 的谓词顺序一致（先 id 后类型，命中即消费）。
     for i in 0..history.len() {
         if consumed.contains(&i) {
             continue;
         }
-        let ev = &history[i];
+        let ev = history[i].clone();
         if ev.step_id() != Some(step_id) {
             continue;
         }
-        if let Some(v) = extract(ev) {
+        if let Some(v) = extract(&ev) {
             consumed.insert(i);
             return Some(v);
         }
     }
     let _ = &mut history;
     None
+}
+
+/// 在「上一轮日志 + 本 drive 追加」里找一个检查点，对应上游
+/// `findCheckpoint(engine, predicate)`（`run-workflow.ts:1678`）。
+///
+/// 上游签名是 `(engine, predicate) -> Option<(event, index)>`；这里拆成
+/// 「扫哪份日志」由调用方给，因为本仓有两份（见 `history` / `appended` 的
+/// 字段文档）：
+///
+/// - **重放短路**（`exec_step`）必须看 `appended`——本 drive 刚跑完的 step
+///   要能被同一次 drive 里的重复 id 立刻看到。
+/// - **按 id 找记录**（`now` / `uuid` / 补偿登记）只看 `history`——本 drive
+///   刚追加的不该被当成「上一轮的记录」复用。
+pub(crate) fn find_checkpoint<'a>(
+    events: &'a [WorkflowEvent],
+    predicate: impl Fn(&WorkflowEvent) -> bool,
+) -> Option<&'a WorkflowEvent> {
+    events.iter().find(|ev| predicate(ev))
 }
 
 /// 累积「已成功」的 step id；失败会把它移除（失败是终态，除非后续又有成功记录）。
@@ -423,20 +441,16 @@ fn collect_finished(events: &[WorkflowEvent], done: &mut std::collections::HashS
     }
 }
 
-/// 某 step 在给定事件序列里的**最后一个**终态（重试 / redo 时后者胜）。
-///
-/// 复用 [`crate::event::fold_step_states`] 的规则：只喂该 step 的事件，
-/// 所以「单 step 查询」与「整段日志折叠」得到同一个状态，不另写一套判定。
-fn live_of(events: &[WorkflowEvent], step_id: &str) -> Option<crate::event::StepState> {
-    let mine: Vec<WorkflowEvent> = events
-        .iter()
-        .filter(|e| e.step_id() == Some(step_id))
-        .cloned()
-        .collect();
-    if mine.is_empty() {
-        return None;
+/// `step_id` 的终态检查点（`StepFinished` / `StepFailed`），供
+/// [`find_checkpoint`] 当谓词用——等价于上游 `engineStep` 里内联的那段
+/// `(e.type==='STEP_FINISHED'||e.type==='STEP_FAILED') && e.stepId === stepId`。
+fn is_terminal_of(step_id: &str) -> impl Fn(&WorkflowEvent) -> bool + '_ {
+    move |ev: &WorkflowEvent| {
+        matches!(
+            ev,
+            WorkflowEvent::StepFinished { .. } | WorkflowEvent::StepFailed { .. }
+        ) && ev.step_id() == Some(step_id)
     }
-    crate::event::fold_step_states(&mine).remove(step_id)
 }
 
 /// **先落盘，再广播**。
@@ -576,14 +590,30 @@ impl EngineRuntime {
         &self,
         compensation_id: &str,
     ) -> Result<(), WorkflowError> {
-        let already = self.store.get_events(&self.run_id)?.iter().any(|ev| {
+        // 对应上游 `findCheckpoint(engine, e => e.type === 'COMPENSATION_REGISTERED'
+        // && e.stepId === id)`（`run-workflow.ts:901`）——扫内存日志，不读 store。
+        //
+        // 两份都查：`history`（上一轮登记过的）+ `appended`（本 drive 刚登记的）。
+        // 后者不能漏——同一个 handler 在一次 drive 里执行到同一个 `ctx.compensate`
+        // 调用点第二次时（循环、并被重放的 step 之后），不该重复写。
+        let registered = |ev: &WorkflowEvent| {
             matches!(
                 ev,
                 WorkflowEvent::CompensationRegistered { compensation_id: id, .. }
                     if id == compensation_id
             )
-        });
-        if already {
+        };
+        let in_appended = self
+            .appended
+            .lock()
+            .map(|a| find_checkpoint(&a, registered).is_some())
+            .unwrap_or(false);
+        let in_history = self
+            .history
+            .lock()
+            .map(|h| find_checkpoint(&h, registered).is_some())
+            .unwrap_or(false);
+        if in_appended || in_history {
             return Ok(());
         }
         let ev = WorkflowEvent::CompensationRegistered {
@@ -639,28 +669,14 @@ impl EngineRuntime {
         });
     }
 
-    /// 某 step 的当前终态（重放短路用）。
-    ///
-    /// 查「上一轮的 `history` + 本次的 `appended`」，后者优先——本 drive 刚完成
-    /// 的 step 必须立即可见，否则并行分支与循环里的重复 id 会重跑。
-    ///
-    /// 只认终态（`StepFinished` / `StepFailed`）：`StepStarted` 是 emit-only、
-    /// 不落盘，查不到终态就算「还没跑完」，调用方放行——与上游只认
-    /// `STEP_FINISHED` / `STEP_FAILED` 一致。
-    fn live(&self, step_id: &str) -> Option<StepState> {
-        if let Ok(appended) = self.appended.lock()
-            && let Some(st) = live_of(&appended, step_id)
-        {
-            return Some(st);
-        }
-        let history = self.history.lock().ok()?;
-        live_of(&history, step_id)
-    }
-
     /// 本 drive 内**已成功**的 step 快照（`history` + `appended`）。
     ///
     /// 给包装层判断「哪些目标已达成」用：策略因此不必自带可变状态，
     /// 并发分支看到的也是同一份事实。
+    ///
+    /// **本仓扩展**：上游没有对应能力（它没有 step 层，也没有需要「已完成集合」
+    /// 的策略）。本仓的 `interim_goals` / `dag` 中间件靠 `StepRequest.completed`
+    /// 拿这份快照，才不需要自己累积可变状态。
     fn completed_steps(&self) -> std::collections::HashSet<String> {
         let mut done = std::collections::HashSet::new();
         if let Ok(history) = self.history.lock() {
@@ -726,7 +742,7 @@ type StepExec = Arc<
 >;
 
 /// 短路时落一条 `STEP_FINISHED`（对齐原来的 `StepAction::Skip`）：
-/// 与正常完成同样记账（事件 + live 状态 + publish），只是没有真实执行。
+/// 与正常完成同样记账（事件 + \`appended\` 索引 + publish），只是没有真实执行。
 ///
 /// 由 [`StepCall::skip`](crate::middleware::StepCall::skip) 调用。
 pub(crate) async fn record_skipped_step(
@@ -912,34 +928,37 @@ where
     // Replay short-circuit: a succeeded checkpoint returns the cached result
     // without re-running `run`. A failed checkpoint rethrows the stored error
     // (failures are terminal; retry via a new run).
-    if let Some(st) = engine.live(step_id) {
-        match st.status {
-            StepStatus::Success => {
-                let raw = st.result.clone().unwrap_or(serde_json::Value::Null);
-                return serde_json::from_value(raw).map_err(|e| {
+    //
+    // 对应上游 `engineStep` 的 `findCheckpoint`（`run-workflow.ts:940`），
+    // 连「从事件里直接取 result / error」的形状也一样。
+    let cached = engine
+        .appended
+        .lock()
+        .ok()
+        .and_then(|appended| find_checkpoint(&appended, is_terminal_of(step_id)).cloned())
+        .or_else(|| {
+            let history = engine.history.lock().ok()?;
+            find_checkpoint(&history, is_terminal_of(step_id)).cloned()
+        });
+    if let Some(ev) = cached {
+        match ev {
+            WorkflowEvent::StepFinished { result, .. } => {
+                let raw = result.unwrap_or(serde_json::Value::Null);
+                return serde_json::from_value(raw.clone()).map_err(|e| {
                     anyhow::anyhow!(
                         "step `{step_id}`: recorded result does not deserialize back into \
-                         `{}` (the log says {}): {e}",
+                         `{}` (the log says {raw}): {e}",
                         std::any::type_name::<T>(),
-                        st.result
-                            .as_ref()
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "null".into()),
                     )
                 });
             }
-            StepStatus::Failed => {
-                let err = st
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| RunError::from_anyhow(&anyhow::anyhow!("failed")));
-                return Err(anyhow::anyhow!("step `{step_id}` previously failed: {err}"));
+            WorkflowEvent::StepFailed { error, .. } => {
+                return Err(anyhow::anyhow!(
+                    "step `{step_id}` previously failed: {error}"
+                ));
             }
-            // Running can only appear from a live concurrent duplicate id —
-            // a user error we surface loudly instead of double-appending.
-            // Paused likewise: it is a projection for an approve/sleep wait
-            // key, and re-using such a key as a step id is a user error.
-            StepStatus::Running | StepStatus::Pending | StepStatus::Paused => {}
+            // `is_terminal_of` 只放行上面两种。
+            _ => unreachable!("find_checkpoint 只返回终态事件"),
         }
     }
     engine.publish(&WorkflowEvent::StepStarted {
@@ -1699,26 +1718,37 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use tokio::try_join;
 
-    /// `live` 走「内存日志 + 线性扫」，同 id 多次执行时**后者胜**。
+    /// 终态查找只认 `StepFinished` / `StepFailed`，且按 step_id 过滤。
     ///
-    /// 这是替换掉按 step 索引的 `lives` 表时唯一需要钉住的行为：
-    /// 重试 / redo 会让同一 step 出现多条终态事件，查询必须取最后一条，
-    /// 与整段日志的 `fold_step_states` 折叠结果一致。
+    /// 对应上游 `engineStep` 的谓词
+    /// `(e.type==='STEP_FINISHED'||e.type==='STEP_FAILED') && e.stepId === stepId`。
     #[test]
-    fn live_takes_the_last_checkpoint_for_a_step() {
-        let ev = |kind: &str| WorkflowEvent::StepFinished {
+    fn find_checkpoint_matches_terminal_events_of_that_step() {
+        let finished = |kind: &str, step: &str| WorkflowEvent::StepFinished {
             ts: 0,
             run_id: "r".into(),
-            step_id: "a".into(),
+            step_id: step.into(),
             result: Some(serde_json::json!(kind)),
             attempts: vec![],
             meta: None,
         };
-        let history = vec![ev("first"), ev("second")];
-        let st = live_of(&history, "a").expect("has checkpoint");
-        assert_eq!(st.status, StepStatus::Success);
-        assert_eq!(st.result, Some(serde_json::json!("second")), "后者胜");
-        assert!(live_of(&history, "missing").is_none());
+        let history = vec![finished("a1", "a"), finished("b1", "b")];
+
+        let hit = find_checkpoint(&history, is_terminal_of("a")).expect("a 有终态");
+        assert!(
+            matches!(hit, WorkflowEvent::StepFinished { result: Some(v), .. } if v == "a1")
+        );
+        assert!(
+            find_checkpoint(&history, is_terminal_of("c")).is_none(),
+            "没有终态的 step 不命中"
+        );
+        // StepStarted 不是检查点（emit-only、不落盘）。
+        let with_started = vec![WorkflowEvent::StepStarted {
+            ts: 0,
+            run_id: "r".into(),
+            step_id: "a".into(),
+        }];
+        assert!(find_checkpoint(&with_started, is_terminal_of("a")).is_none());
     }
 
     /// 一个具名 step 产物。`step<T>` 泛型化后 handler 侧拿到的是这个类型，
