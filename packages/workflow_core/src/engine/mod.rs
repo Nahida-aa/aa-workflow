@@ -273,20 +273,40 @@ pub struct EngineRuntime {
     /// 语义不同——冲突时它会被**直接改成** `actual`，那时它就不是任何一次
     /// 写入算出来的长度了。
     next_log_index: AtomicUsize,
-    /// 本次 drive 的**内存日志副本**，对应上游 `engine.history`
+    /// 本次 drive 的**已加载日志**，对应上游 `engine.history`
     /// （`run-workflow.ts:561` 的 `history: [...history]`）。
     ///
-    /// 每次 append 成功后追加一条，与落盘的日志保持同序同内容。重放短路
-    /// 和「已完成集合」都扫它——**没有第二份状态**，所以不存在「缓存与日志
-    /// 不同步」这一类 bug（本仓曾有一份按 step 索引的 `lives` 表，就是为了
-    /// 这个风险删掉的）。
+    /// **只含本次 drive 开始前已有的记录**——与上游一致：它的 `emitAndAppend`
+    /// 不会往 `history` 里追加（唯一例外是 `waitForEvent` 收到 signal 时那处
+    /// 显式 `engine.history = [...history, resolved]`，`:1297`）。
     ///
-    /// 为什么可以直接扫而不像上游那样顾虑 O(n²)：`history` 是内存数组，
-    /// n 个 step 各自扫一遍是几百次数组访问（n 通常 < 100）。上游也是这么做的。
-    ///
-    /// `StepStarted` 不在这里：它是 emit-only、不落盘。查不到终态就算「还没
-    /// 跑完」，调用方放行——与上游只认 `STEP_FINISHED` / `STEP_FAILED` 一致。
+    /// 本次 drive 追加的事件在 [`Self::appended`]，两者合起来才是「当前日志」。
+    /// 拆开的理由见 `appended` 的文档。
     history: Mutex<Vec<WorkflowEvent>>,
+    /// 本次 drive 追加的事件，按追加顺序。
+    ///
+    /// 与 `history` 分开存，因为**两者用途不同**：
+    ///
+    /// - `history` 是**重放来源**：`ctx.now_with("t")` 这类「按 id 找 checkpoint」
+    ///   的查找只应命中上一轮 drive 留下的记录——否则同一次 drive 里第二次
+    ///   调用会命中第一次刚写的值，变成读缓存。
+    /// - `appended` 是**本次进度**：`live()`（重放短路）与 `completed_steps()`
+    ///   （并行分支的目标达成判定）必须看得到本 drive 刚完成的 step。
+    ///
+    /// 上游把两者混在一个 `history` 里，代价是每次查找都要 `!consumed.has(i)`
+    /// 过滤掉已被消费的项；这里分表之后，`history` 天然只有「上一轮的」。
+    appended: Mutex<Vec<WorkflowEvent>>,
+    /// `history` 里已被本次 drive 的某个原语消费掉的下标。对应上游
+    /// `engine.consumed: Set<number>`（`run-workflow.ts:563`）。
+    ///
+    /// 为什么需要：`ctx.now_with("t")` / `ctx.uuid_with("t")` 让用户按**语义名**
+    /// 指定 checkpoint id，同一个 id 可以被调用两次。第一次命中 `history` 里
+    /// 那条记录后标记消费，第二次就跳过它、生成新值——这样「同 id 两次调用」
+    /// 与上游语义一致（各取各的，不是读缓存）。
+    ///
+    /// 仅对**用户显式给 id** 的原语有意义：`ctx.now()` 不给 id 时 id 由
+    /// `counters` 派生，恒不重复，不会走到「同一 index 被消费两次」。
+    consumed: Mutex<std::collections::HashSet<usize>>,
     /// Phase-1 补偿登记（undo 轴）：handler 内 `ctx.compensate` 按代码确定性
     /// 重登记；失败路径取走并逆序执行（见 `run_compensations`）。
     pub compensations: Mutex<Vec<Compensation>>,
@@ -351,26 +371,56 @@ pub(crate) struct Counters {
 }
 
 /// 在内存日志里找某个 `step_id` 的已记录值，对应上游
-/// `findCheckpoint(engine, (e, i) => ... && e.stepId === stepId)`。
+/// `findCheckpoint(engine, (e, i) => ...)`。
 ///
 /// 上游扫的是 `engine.history`（内存数组，`run-workflow.ts:1682`），**不碰
 /// store**。这里同样——每次 `ctx.now()` / `ctx.uuid()` 都读一遍数据库的话，
 /// 一个 n 步的 workflow 就是 n 次额外查询，而这本来只是一次数组扫描。
 ///
+/// **命中即标记消费**（`consumed.add(i)`），与上游 `findCheckpoint` 一致：
+/// 调用方显式给了 id 时，同一个 id 调两次必须拿到两条不同的记录——第二次
+/// 跳过已被消费的那条，落到「未命中」分支生成新值。
+///
 /// `extract` 返回 `None` 表示该事件不是要找的那一类（按事件变体过滤），
 /// 所以调用方只需要写「从我这类型的事件里取什么」。
 fn history_value<T>(
-    history: &Mutex<Vec<WorkflowEvent>>,
+    engine: &EngineRuntime,
     step_id: &str,
     extract: impl Fn(&WorkflowEvent) -> Option<T>,
 ) -> Option<T> {
-    let history = history.lock().ok()?;
-    history.iter().rev().find_map(|ev| {
-        if ev.step_id() != Some(step_id) {
-            return None;
+    let mut history = engine.history.lock().ok()?;
+    let mut consumed = engine.consumed.lock().ok()?;
+    // 从前往后扫（与上游同向），取第一条未消费的匹配项。
+    for i in 0..history.len() {
+        if consumed.contains(&i) {
+            continue;
         }
-        extract(ev)
-    })
+        let ev = &history[i];
+        if ev.step_id() != Some(step_id) {
+            continue;
+        }
+        if let Some(v) = extract(ev) {
+            consumed.insert(i);
+            return Some(v);
+        }
+    }
+    let _ = &mut history;
+    None
+}
+
+/// 累积「已成功」的 step id；失败会把它移除（失败是终态，除非后续又有成功记录）。
+fn collect_finished(events: &[WorkflowEvent], done: &mut std::collections::HashSet<String>) {
+    for ev in events {
+        match ev {
+            WorkflowEvent::StepFinished { step_id, .. } => {
+                done.insert(step_id.clone());
+            }
+            WorkflowEvent::StepFailed { step_id, .. } => {
+                done.remove(step_id);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// 某 step 在给定事件序列里的**最后一个**终态（重试 / redo 时后者胜）。
@@ -479,8 +529,10 @@ impl EngineRuntime {
                 }
             }
         }
-        if let Ok(mut history) = self.history.lock() {
-            history.push(ev.clone());
+        // 记进「本次进度」，不进 `history`（`history` 只存上一轮的记录，
+        // 是重放查找的来源）——见两个字段的文档。
+        if let Ok(mut appended) = self.appended.lock() {
+            appended.push(ev.clone());
         }
         Ok(())
     }
@@ -587,35 +639,35 @@ impl EngineRuntime {
         });
     }
 
-    /// 某 step 在**内存日志**里的当前状态。
+    /// 某 step 的当前终态（重放短路用）。
     ///
-    /// 对应上游 `findCheckpoint(engine, pred)` + 取事件：只认终态（成功/失败），
-    /// 同一 id 多次执行时**后者胜**（重试、redo），与
-    /// [`crate::event::fold_step_states`] 的折叠语义一致。
+    /// 查「上一轮的 `history` + 本次的 `appended`」，后者优先——本 drive 刚完成
+    /// 的 step 必须立即可见，否则并行分支与循环里的重复 id 会重跑。
     ///
-    /// 「正在执行」不在此列：`STEP_STARTED` 是 emit-only、不落盘，上游也
-    /// 不把它当检查点——查不到终态就是「还没跑完」，调用方据此放行。
+    /// 只认终态（`StepFinished` / `StepFailed`）：`StepStarted` 是 emit-only、
+    /// 不落盘，查不到终态就算「还没跑完」，调用方放行——与上游只认
+    /// `STEP_FINISHED` / `STEP_FAILED` 一致。
     fn live(&self, step_id: &str) -> Option<StepState> {
+        if let Ok(appended) = self.appended.lock()
+            && let Some(st) = live_of(&appended, step_id)
+        {
+            return Some(st);
+        }
         let history = self.history.lock().ok()?;
         live_of(&history, step_id)
     }
 
-    /// 本 drive 内**已成功**的 step 快照（扫内存日志）。
+    /// 本 drive 内**已成功**的 step 快照（`history` + `appended`）。
     ///
     /// 给包装层判断「哪些目标已达成」用：策略因此不必自带可变状态，
     /// 并发分支看到的也是同一份事实。
     fn completed_steps(&self) -> std::collections::HashSet<String> {
-        let Ok(history) = self.history.lock() else {
-            return Default::default();
-        };
         let mut done = std::collections::HashSet::new();
-        for ev in history.iter() {
-            if let WorkflowEvent::StepFinished { step_id, .. } = ev {
-                done.insert(step_id.clone());
-            } else if let WorkflowEvent::StepFailed { step_id, .. } = ev {
-                // 失败是终态：后续同 id 的 StepFinished 会重新插入。
-                done.remove(step_id);
-            }
+        if let Ok(history) = self.history.lock() {
+            collect_finished(&history, &mut done);
+        }
+        if let Ok(appended) = self.appended.lock() {
+            collect_finished(&appended, &mut done);
         }
         done
     }
@@ -1081,12 +1133,15 @@ pub const DEFAULT_MIN_YIELD_REMAINING_MS: u64 = 1000;
 /// sees the **same** clock across resumes. The checkpoint id uses a
 /// per-invocation atomic counter (`__now-0`, `__now-1`, …) so concurrent
 /// calls stay unique; replay permutes them to the same ids and reads the cache.
-pub fn exec_now(engine: &Arc<EngineRuntime>) -> anyhow::Result<i64> {
-    let k = engine.counters.now.fetch_add(1, Ordering::SeqCst);
-    let step_id = format!("__now-{k}");
+pub fn exec_now(engine: &Arc<EngineRuntime>, id: Option<&str>) -> anyhow::Result<i64> {
+    // 上游：`options?.id ?? `__now-${engine.counters.now++}``
+    let step_id = match id {
+        Some(id) => id.to_string(),
+        None => format!("__now-{}", engine.counters.now.fetch_add(1, Ordering::SeqCst)),
+    };
     // 扫内存日志，对应上游 `findCheckpoint(engine, ...)`（`run-workflow.ts:1682`
     // 扫的是 `engine.history` 数组，不碰 store）。
-    if let Some(value) = history_value(&engine.history, &step_id, |ev| match ev {
+    if let Some(value) = history_value(engine, &step_id, |ev| match ev {
         WorkflowEvent::NowRecorded { value, .. } => Some(*value),
         _ => None,
     }) {
@@ -1106,10 +1161,15 @@ pub fn exec_now(engine: &Arc<EngineRuntime>) -> anyhow::Result<i64> {
 /// Deterministic id behind [`WorkflowCtx::uuid`](crate::define::WorkflowCtx::uuid)
 /// (TanStack `ctx.uuid`): a generated UUIDv4, recorded as a `UuidRecorded`
 /// checkpoint. On replay the recorded id is served — stable across resumes.
-pub fn exec_uuid(engine: &Arc<EngineRuntime>) -> anyhow::Result<String> {
-    let k = engine.counters.uuid.fetch_add(1, Ordering::SeqCst);
-    let step_id = format!("__uuid-{k}");
-    if let Some(value) = history_value(&engine.history, &step_id, |ev| match ev {
+pub fn exec_uuid(engine: &Arc<EngineRuntime>, id: Option<&str>) -> anyhow::Result<String> {
+    let step_id = match id {
+        Some(id) => id.to_string(),
+        None => format!(
+            "__uuid-{}",
+            engine.counters.uuid.fetch_add(1, Ordering::SeqCst)
+        ),
+    };
+    if let Some(value) = history_value(engine, &step_id, |ev| match ev {
         WorkflowEvent::UuidRecorded { value, .. } => Some(value.clone()),
         _ => None,
     }) {
@@ -3096,6 +3156,85 @@ mod tests {
             !ids.iter()
                 .any(|a| ids.iter().filter(|b| b == &a).count() > 1),
             "ids 唯一: {ids:?}"
+        );
+    }
+
+    /// 显式 id（`ctx.now_with` / `ctx.uuid_with`）的两条语义，对应上游
+    /// `options.id` + `engine.consumed`：
+    ///
+    /// 1. **同 id 调两次各取各的**：第一次命中 `history` 里那条记录并标记消费，
+    ///    第二次跳过它、生成新值追加。不是「读缓存」。
+    /// 2. **重放稳定**：再次 drive 时两次调用依次消费两条记录，值的对应关系不变。
+    #[tokio::test]
+    async fn now_with_same_id_takes_fresh_value_per_call_and_replays() {
+        let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
+        let wf = WorkflowDefinition::new("named").handler(|ctx: WorkflowCtx| async move {
+            // 同一个语义名调两次 → 两条独立记录。
+            let t1 = ctx.now_with("t")?;
+            let t2 = ctx.now_with("t")?;
+            ctx.approve("gate", "go").await?; // 制造 replay 边界
+            let t3 = ctx.now_with("t")?;
+            Ok(serde_json::json!({ "t1": t1, "t2": t2, "t3": t3 }))
+        });
+
+        let out = run_workflow(
+            RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
+                .input(serde_json::json!({}))
+                .run_id("named1"),
+        )
+        .outcome()
+        .await
+        .unwrap();
+        assert_eq!(out.status, RunStatus::Paused);
+
+        signal_approval(store.as_ref(), "named1", "gate", true, None).unwrap();
+        let out = run_workflow(
+            RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
+                .input(serde_json::json!({}))
+                .run_id("named1"),
+        )
+        .outcome()
+        .await
+        .unwrap();
+        assert_eq!(out.status, RunStatus::Finished);
+        let first = out.output.clone().unwrap();
+
+        // 三次调用各自一条记录（同 id，三条事件）——不是一次。
+        assert_eq!(
+            count_events(&store, "named1", |e| matches!(
+                e,
+                WorkflowEvent::NowRecorded { .. }
+            )),
+            3,
+            "同 id 三次调用落三条记录（consumed 让第二次不复用第一条）"
+        );
+        assert!(
+            store
+                .get_events("named1")
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e, WorkflowEvent::NowRecorded { .. }))
+                .all(|e| e.step_id() == Some("t")),
+            "三条记录都用显式 id `t`，不掺 counters 派生的 __now-N"
+        );
+
+        // 重放：三次调用依次消费三条记录，输出与首跑一致。
+        let replay = run_workflow(
+            RunWorkflowOptions::new(Arc::new(wf), store.clone())
+                .input(serde_json::json!({}))
+                .run_id("named1"),
+        )
+        .outcome()
+        .await
+        .unwrap();
+        assert_eq!(replay.output.clone().unwrap(), first, "重放后逐字节一致");
+        assert_eq!(
+            count_events(&store, "named1", |e| matches!(
+                e,
+                WorkflowEvent::NowRecorded { .. }
+            )),
+            3,
+            "重放不重复 append"
         );
     }
 

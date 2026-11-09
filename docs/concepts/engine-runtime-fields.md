@@ -20,7 +20,9 @@
 | `workflow: AnyWorkflowDefinition` | `workflow: AnyWorkflowDefinition` | **必须是 `select_workflow_version` 选中的那一版**，不是 `opts.workflow` |
 | `store: Arc<dyn RunStore>` | `runStore: RunStore` | |
 | `emit: UnboundedSender<WorkflowEvent>` | `emit: (event) => void` | 上游是闭包捕获 `queue` + `resolveWait`；本仓用 channel 顶替，语义相同 |
-| `history: Mutex<Vec<WorkflowEvent>>` | `history: ReadonlyArray<WorkflowEvent>` | 内存日志副本，重放短路与「已完成集合」都扫它 |
+| `history: Mutex<Vec<WorkflowEvent>>` | `history: ReadonlyArray<WorkflowEvent>` | **只含本轮开始前的记录**，是重放查找的来源 |
+| `appended: Mutex<Vec<WorkflowEvent>>` | （无，混在 `history` 里） | 本轮追加的事件；`live` / `completed_steps` 扫它 |
+| `consumed: Mutex<HashSet<usize>>` | `consumed: Set<number>` | 已消费的 `history` 下标 |
 | `next_log_index: AtomicUsize` | `nextLogIndex: number` | 上游 `++` 自增，本仓 CAS 重定基（并行分支会同时追加） |
 | `counters.now / .uuid / .yield_` | `counters.{now, uuid, yield}` | 上游还有 `wait` / `sleep` / `approve` / `goalParks`，见下节 |
 | `deadline: Option<i64>` | `deadline?: number` | |
@@ -34,7 +36,6 @@
 
 | 上游 | 为什么不在这里 |
 | --- | --- |
-| `consumed: Set<number>` | 上游的 `findCheckpoint` 靠它做「一次调用只消费一条同种 checkpoint」；本仓的 `ctx.step` 用 `live(step_id)` 按 id 查，不存在顺序匹配问题 |
 | `paused: boolean` | 上游用它让外层 catch 知道别再写终局事件；本仓用 `Err(WorkflowParked)` 这个错误类型表达 |
 | `applicationStepIds: Set<string>` | 用于拒绝 `__compensation:` 前缀；本仓在 `register_compensation` 里校验 |
 | `compensationError` / `compensating` | 本仓的补偿执行在 `run_compensations` 里用局部变量推进 |

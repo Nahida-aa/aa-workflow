@@ -404,14 +404,33 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
     /// timestamp as a checkpoint; replay serves the recorded value, so a run
     /// sees the same clock across resumes. Returns `Err` only on store failure.
     pub fn now(&self) -> anyhow::Result<i64> {
-        crate::engine::exec_now(&self.engine)
+        crate::engine::exec_now(&self.engine, None)
     }
 
     /// Deterministic id (TanStack `ctx.uuid`): records a generated UUIDv4 as a
     /// checkpoint; replay serves the recorded id, so the same value is seen
     /// across resumes. Returns `Err` only on store failure.
     pub fn uuid(&self) -> anyhow::Result<String> {
-        crate::engine::exec_uuid(&self.engine)
+        crate::engine::exec_uuid(&self.engine, None)
+    }
+
+    /// [`now`](Self::now) with an **explicit checkpoint id**（上游
+    /// `ctx.now({ id })`）。
+    ///
+    /// 与不带 id 的版本的区别是定位方式：`ctx.now()` 的 id 由调用顺序派生
+    /// （`__now-0`、`__now-1`…），改动前面任何一处 `now()` 都会让后面的 id
+    /// 整体错位；给定 id 则按**语义名**定位，与调用顺序无关。
+    ///
+    /// 同一个 id 调用两次会各取各的时间（第一次消费掉日志里那条记录，第二次
+    /// 生成新值并追加），与上游 `consumed` 语义一致。
+    pub fn now_with(&self, id: &str) -> anyhow::Result<i64> {
+        crate::engine::exec_now(&self.engine, Some(id))
+    }
+
+    /// [`uuid`](Self::uuid) with an explicit checkpoint id. 定位与二次调用的
+    /// 语义同 [`now_with`](Self::now_with)。
+    pub fn uuid_with(&self, id: &str) -> anyhow::Result<String> {
+        crate::engine::exec_uuid(&self.engine, Some(id))
     }
 
     /// Whether this run was cancelled via [`cancel_run`](crate::engine::cancel_run).
