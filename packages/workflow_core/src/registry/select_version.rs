@@ -23,7 +23,6 @@
 //! 唯一的例外是情况 2：老 run 本来就没记版本，它跑的就是「无版本代码」，
 //! 回退是语义正确的、不是违规。
 
-use crate::define::WorkflowDefinition;
 
 /// 在 `[current] + current.previous_versions` 中按持久化版本选定义。
 ///
@@ -60,6 +59,7 @@ pub fn select_workflow_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::define::WorkflowDefinition;
 
     /// 测试里把具体定义转成擦除态——公开签名收的是 `AnyWorkflowDefinition`，
     /// 与 `run_workflow` 传进来的形态一致。

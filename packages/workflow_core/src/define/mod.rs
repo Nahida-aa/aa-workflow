@@ -46,7 +46,7 @@ pub type WorkflowHandler =
 /// `signal` exposed as a cooperative [`is_cancelled`](Self::is_cancelled) poll.
 #[derive(Clone)]
 pub struct StepCtx {
-    pub(crate) inner: Arc<EngineRuntime>,
+    pub(crate) engine: Arc<EngineRuntime>,
     /// Deterministic step ID. Stable across retries *and* replays of the same
     /// run — the idempotency-key candidate for external systems (`id`).
     pub id: String,
@@ -56,22 +56,22 @@ pub struct StepCtx {
 
 impl StepCtx {
     pub fn run_id(&self) -> &str {
-        &self.inner.run_id
+        &self.engine.run_id
     }
     pub fn input(&self) -> &serde_json::Value {
-        &self.inner.input
+        &self.engine.input
     }
     pub fn progress(&self, value: f64) {
-        self.inner.publish_progress(&self.id, value);
+        self.engine.publish_progress(&self.id, value);
     }
     /// Whether this run was cancelled via [`cancel_run`](crate::engine::cancel_run).
     /// Cooperative poll counterpart to TanStack's per-attempt `signal` — Rust
     /// cannot interrupt an in-flight future, so long steps must self-check on
     /// their own cadence (same granularity as `BaseCtx::is_cancelled`).
     pub fn is_cancelled(&self) -> bool {
-        self.inner
+        self.engine
             .store
-            .get_run_state(&self.inner.run_id)
+            .get_run_state(&self.engine.run_id)
             .ok()
             .flatten()
             .map(|st| st.status == crate::event::RunStatus::Aborted)
@@ -80,11 +80,11 @@ impl StepCtx {
     /// Absolute UTC ms runtime budget for this drive (TanStack
     /// `runtime.deadline`); `None` when unbudgeted.
     pub fn deadline(&self) -> Option<i64> {
-        self.inner.deadline
+        self.engine.deadline
     }
     /// Ms of runtime budget left (`u64::MAX` when no deadline).
     pub fn time_remaining(&self) -> u64 {
-        match self.inner.deadline {
+        match self.engine.deadline {
             Some(d) => i64::saturating_sub(d, crate::engine::now_ms()).max(0) as u64,
             None => u64::MAX,
         }
@@ -93,7 +93,7 @@ impl StepCtx {
     /// min_yield_remaining_ms`); the step should `?` fast or orchestrate
     /// yielding via `WorkflowCtx::yield_`.
     pub fn should_yield(&self) -> bool {
-        self.time_remaining() < self.inner.min_yield_remaining_ms
+        self.time_remaining() < self.engine.min_yield_remaining_ms
     }
 }
 

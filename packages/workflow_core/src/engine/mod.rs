@@ -186,7 +186,7 @@ pub(crate) async fn run_compensations(
         let mut attempts = 1usize;
         loop {
             let step_ctx = StepCtx {
-                inner: Arc::clone(engine),
+                engine: Arc::clone(engine),
                 id: format!("{run_id}:__compensation:{}", comp.id),
                 attempt: attempts,
             };
@@ -348,6 +348,29 @@ pub(crate) struct Counters {
     pub(crate) now: AtomicUsize,
     pub(crate) uuid: AtomicUsize,
     pub(crate) yield_: AtomicUsize,
+}
+
+/// 在内存日志里找某个 `step_id` 的已记录值，对应上游
+/// `findCheckpoint(engine, (e, i) => ... && e.stepId === stepId)`。
+///
+/// 上游扫的是 `engine.history`（内存数组，`run-workflow.ts:1682`），**不碰
+/// store**。这里同样——每次 `ctx.now()` / `ctx.uuid()` 都读一遍数据库的话，
+/// 一个 n 步的 workflow 就是 n 次额外查询，而这本来只是一次数组扫描。
+///
+/// `extract` 返回 `None` 表示该事件不是要找的那一类（按事件变体过滤），
+/// 所以调用方只需要写「从我这类型的事件里取什么」。
+fn history_value<T>(
+    history: &Mutex<Vec<WorkflowEvent>>,
+    step_id: &str,
+    extract: impl Fn(&WorkflowEvent) -> Option<T>,
+) -> Option<T> {
+    let history = history.lock().ok()?;
+    history.iter().rev().find_map(|ev| {
+        if ev.step_id() != Some(step_id) {
+            return None;
+        }
+        extract(ev)
+    })
 }
 
 /// 某 step 在给定事件序列里的**最后一个**终态（重试 / redo 时后者胜）。
@@ -711,7 +734,7 @@ impl EngineRuntime {
 /// The log stays `serde_json::Value` regardless of `T` — durability is defined
 /// by the event schema, not by the handler's types.
 pub(crate) async fn exec_step<T, F, Fut>(
-    inner: &Arc<EngineRuntime>,
+    engine: &Arc<EngineRuntime>,
     step_id: &str,
     opts: &StepOptions,
     run: F,
@@ -722,7 +745,7 @@ where
     Fut: Future<Output = anyhow::Result<T>> + Send + 'static,
 {
     // Cancelled run → stop driving at this boundary.
-    if is_cancelled(&inner.store, &inner.run_id) {
+    if is_cancelled(&engine.store, &engine.run_id) {
         return Err(WorkflowCancelled.into());
     }
     // **Step 中间件层**（本仓有意扩展：TS 靠覆盖 ctx.step 达到同样能力）。
@@ -730,7 +753,7 @@ where
     //
     // 每次调用现建叶子（持有当次闭包）+ 现组合层链——与 axum 的
     // 「注册 handler，然后 call(request)」同构。
-    let has_layers = !inner
+    let has_layers = !engine
         .step_layers
         .lock()
         .expect("step layers lock")
@@ -740,12 +763,12 @@ where
         // 放进 `Mutex` 既满足要求，也保证只执行一次。
         let run_slot: Arc<Mutex<Option<F>>> = Arc::new(Mutex::new(Some(run)));
         let exec: StepExec = {
-            let inner = inner.clone();
+            let engine = engine.clone();
             let step_id = step_id.to_string();
             let opts = opts.clone();
             let run_slot = run_slot.clone();
             Arc::new(move || {
-                let inner = inner.clone();
+                let engine = engine.clone();
                 let step_id = step_id.clone();
                 let opts = opts.clone();
                 let run_slot = run_slot.clone();
@@ -755,22 +778,22 @@ where
                         .expect("step run slot")
                         .take()
                         .ok_or_else(|| anyhow::anyhow!("step run executed more than once"))?;
-                    exec_step_unwrapped(&inner, &step_id, &opts, run)
+                    exec_step_unwrapped(&engine, &step_id, &opts, run)
                         .await
                         .and_then(|v| serde_json::to_value(v).map_err(anyhow::Error::from))
                         .map_err(Into::into)
                 })
             })
         };
-        let mut chain = inner.build_step_chain(exec);
+        let mut chain = engine.build_step_chain(exec);
         let req = crate::middleware::StepRequest {
             step_id: step_id.to_string(),
-            run_id: inner.run_id.clone(),
-            run_meta: inner.meta.clone(),
+            run_id: engine.run_id.clone(),
+            run_meta: engine.meta.clone(),
             // 已完成的 step：**进入链时取一次快照**。上一个 step 的
             // `STEP_FINISHED` 在它自己的链返回前已落盘，所以这里准确。
-            completed: Arc::new(inner.completed_steps()),
-            engine: inner.clone(),
+            completed: Arc::new(engine.completed_steps()),
+            engine: engine.clone(),
         };
         // tower 惯例：先 ready 再 call。
         let raw = {
@@ -789,7 +812,7 @@ where
         });
     }
 
-    exec_step_unwrapped(inner, step_id, opts, run).await
+    exec_step_unwrapped(engine, step_id, opts, run).await
 }
 
 /// 真正跑闭包、落 `STEP_FINISHED` 的那段（洋葱最内层）。
@@ -797,7 +820,7 @@ where
 /// 包装链见 [`EngineRuntime::compose_step_wrappers`]；无包装层时 `exec_step`
 /// 直接走这里。
 async fn exec_step_unwrapped<T, F, Fut>(
-    inner: &Arc<EngineRuntime>,
+    engine: &Arc<EngineRuntime>,
     step_id: &str,
     opts: &StepOptions,
     run: F,
@@ -810,7 +833,7 @@ where
     // 重试续跑（F2-lite：deadline 到期后由自轮询驱动循环重驱），到期则以
     // 携带的 attempts 续跑。跨重启等价：pending 状态从日志折叠（StepRetryScheduled），
     // 驱动启动时重建（见 run_workflow 的 pending_retries 折叠）。
-    let pending_retry = inner
+    let pending_retry = engine
         .pending_retries
         .lock()
         .expect("pending retries lock")
@@ -819,7 +842,7 @@ where
     if let Some(pr) = &pending_retry {
         if now_ms() < pr.next_attempt_at {
             let park = crate::engine::exec_pause_with(
-                inner,
+                engine,
                 step_id,
                 "__timer",
                 "durable retry backoff",
@@ -837,7 +860,7 @@ where
     // Replay short-circuit: a succeeded checkpoint returns the cached result
     // without re-running `run`. A failed checkpoint rethrows the stored error
     // (failures are terminal; retry via a new run).
-    if let Some(st) = inner.live(step_id) {
+    if let Some(st) = engine.live(step_id) {
         match st.status {
             StepStatus::Success => {
                 let raw = st.result.clone().unwrap_or(serde_json::Value::Null);
@@ -867,26 +890,26 @@ where
             StepStatus::Running | StepStatus::Pending | StepStatus::Paused => {}
         }
     }
-    inner.publish(&WorkflowEvent::StepStarted {
+    engine.publish(&WorkflowEvent::StepStarted {
         ts: now_ms(),
-        run_id: inner.run_id.clone(),
+        run_id: engine.run_id.clone(),
         step_id: step_id.to_string(),
     });
 
     // Resource gate: same key ⇒ serialized (capacity-1 async semaphore).
     let _gate = match &opts.resource {
-        Some(key) => Some(inner.gate.acquire(key).await),
+        Some(key) => Some(engine.gate.acquire(key).await),
         None => None,
     };
 
     // Effective retry: per-step policy wins, else the workflow's
     // `default_step_retry` (TanStack `defaultStepRetry`), else none.
-    // 读 `inner.workflow`——上游同样是 `options?.retry ??
+    // 读 `engine.workflow`——上游同样是 `options?.retry ??
     // engine.workflow.defaultStepRetry`（`run-workflow.ts:998`）。
     let retry = opts
         .retry
         .clone()
-        .or_else(|| inner.workflow.default_step_retry.clone());
+        .or_else(|| engine.workflow.default_step_retry.clone());
 
     let max_attempts = retry.as_ref().map(|p| p.max_attempts).unwrap_or(1);
     // 耐久重试续跑：attempts 从上一版携带（STEP_RETRY_SCHEDULED.attempts），
@@ -900,7 +923,7 @@ where
 
     for attempt in (carried.1 + 1)..=max_attempts {
         let step_ctx = StepCtx {
-            inner: inner.clone(),
+            engine: engine.clone(),
             id: step_id.to_string(),
             attempt,
         };
@@ -910,11 +933,11 @@ where
         if retry.as_ref().map(|p| p.durable).unwrap_or(false) {
             let ev = WorkflowEvent::StepAttemptStarted {
                 ts: started_at,
-                run_id: inner.run_id.clone(),
+                run_id: engine.run_id.clone(),
                 step_id: step_id.to_string(),
                 attempt,
             };
-            inner.append(&ev)?;
+            engine.append(&ev)?;
         }
         // 保留 `anyhow::Error` 而非提前字符串化，这样 attempt 能记下结构化的
         // `RunError`（attempts 会落进 STEP_FAILED，供重试与审计回看）。
@@ -957,13 +980,13 @@ where
                 });
                 let step_finished_event = WorkflowEvent::StepFinished {
                     ts: now_ms(),
-                    run_id: inner.run_id.clone(),
+                    run_id: engine.run_id.clone(),
                     step_id: step_id.to_string(),
                     result: Some(recorded.clone()),
                     attempts: attempts.clone(),
                     meta: None,
                 };
-                inner.append(&step_finished_event)?;
+                engine.append(&step_finished_event)?;
                 return Ok(result);
             }
             Err(err) => {
@@ -985,7 +1008,7 @@ where
                 let retrying = retry.is_some() && attempt < max_attempts;
                 let durable = retry.as_ref().map(|p| p.durable).unwrap_or(false);
                 if retrying && durable {
-                    if is_cancelled(&inner.store, &inner.run_id) {
+                    if is_cancelled(&engine.store, &engine.run_id) {
                         return Err(WorkflowCancelled.into());
                     }
                     let delay = retry
@@ -995,19 +1018,19 @@ where
                     let next_attempt_at = now_ms() + (delay as i64).max(1);
                     let ev = WorkflowEvent::StepRetryScheduled {
                         ts: now_ms(),
-                        run_id: inner.run_id.clone(),
+                        run_id: engine.run_id.clone(),
                         step_id: step_id.to_string(),
                         attempt,
                         next_attempt_at,
                         error: run_err.clone(),
                         attempts: attempts.clone(),
                     };
-                    inner.append(&ev)?;
+                    engine.append(&ev)?;
                     // 泊车（__timer + deadline）：本 drive 结束，驱动循环到期
                     // 重驱（自轮询 25ms 或 sweep）→ exec_step 入口的 pending
                     // 检查以到期后的时间放行 → 该步骤以携带的 attempts 续跑。
                     let _ = crate::engine::exec_pause_with(
-                        inner,
+                        engine,
                         step_id,
                         "__timer",
                         "durable retry backoff",
@@ -1019,7 +1042,7 @@ where
                     return Err(WorkflowParked.into());
                 }
                 if retrying {
-                    if is_cancelled(&inner.store, &inner.run_id) {
+                    if is_cancelled(&engine.store, &engine.run_id) {
                         return Err(WorkflowCancelled.into());
                     }
                     let delay = retry
@@ -1031,12 +1054,12 @@ where
                 }
                 let ev = WorkflowEvent::StepFailed {
                     ts: now_ms(),
-                    run_id: inner.run_id.clone(),
+                    run_id: engine.run_id.clone(),
                     step_id: step_id.to_string(),
                     error: run_err.clone(),
                     attempts,
                 };
-                inner.append(&ev)?;
+                engine.append(&ev)?;
                 // 原样上抛，不加 `step `x` failed:` 前缀：step 身份已经在
                 // `step_id` 字段里（结构化），再包一层会让同一个错误的 message
                 // 在 step 层与 run 层变成两个值。TanStack 也是直接 rethrow
@@ -1058,52 +1081,48 @@ pub const DEFAULT_MIN_YIELD_REMAINING_MS: u64 = 1000;
 /// sees the **same** clock across resumes. The checkpoint id uses a
 /// per-invocation atomic counter (`__now-0`, `__now-1`, …) so concurrent
 /// calls stay unique; replay permutes them to the same ids and reads the cache.
-pub fn exec_now(inner: &Arc<EngineRuntime>) -> anyhow::Result<i64> {
-    let k = inner.counters.now.fetch_add(1, Ordering::SeqCst);
+pub fn exec_now(engine: &Arc<EngineRuntime>) -> anyhow::Result<i64> {
+    let k = engine.counters.now.fetch_add(1, Ordering::SeqCst);
     let step_id = format!("__now-{k}");
-    for ev in inner.store.get_events(&inner.run_id)? {
-        if let WorkflowEvent::NowRecorded {
-            step_id: id, value, ..
-        } = &ev
-            && id == &step_id
-        {
-            return Ok(*value);
-        }
+    // 扫内存日志，对应上游 `findCheckpoint(engine, ...)`（`run-workflow.ts:1682`
+    // 扫的是 `engine.history` 数组，不碰 store）。
+    if let Some(value) = history_value(&engine.history, &step_id, |ev| match ev {
+        WorkflowEvent::NowRecorded { value, .. } => Some(*value),
+        _ => None,
+    }) {
+        return Ok(value);
     }
     let value = now_ms();
     let ev = WorkflowEvent::NowRecorded {
         ts: value,
-        run_id: inner.run_id.clone(),
+        run_id: engine.run_id.clone(),
         step_id,
         value,
     };
-    inner.append(&ev)?;
+    engine.append(&ev)?;
     Ok(value)
 }
 
 /// Deterministic id behind [`WorkflowCtx::uuid`](crate::define::WorkflowCtx::uuid)
 /// (TanStack `ctx.uuid`): a generated UUIDv4, recorded as a `UuidRecorded`
 /// checkpoint. On replay the recorded id is served — stable across resumes.
-pub fn exec_uuid(inner: &Arc<EngineRuntime>) -> anyhow::Result<String> {
-    let k = inner.counters.uuid.fetch_add(1, Ordering::SeqCst);
+pub fn exec_uuid(engine: &Arc<EngineRuntime>) -> anyhow::Result<String> {
+    let k = engine.counters.uuid.fetch_add(1, Ordering::SeqCst);
     let step_id = format!("__uuid-{k}");
-    for ev in inner.store.get_events(&inner.run_id)? {
-        if let WorkflowEvent::UuidRecorded {
-            step_id: id, value, ..
-        } = &ev
-            && id == &step_id
-        {
-            return Ok(value.clone());
-        }
+    if let Some(value) = history_value(&engine.history, &step_id, |ev| match ev {
+        WorkflowEvent::UuidRecorded { value, .. } => Some(value.clone()),
+        _ => None,
+    }) {
+        return Ok(value);
     }
     let value = uuid::Uuid::new_v4().to_string();
     let ev = WorkflowEvent::UuidRecorded {
         ts: now_ms(),
-        run_id: inner.run_id.clone(),
+        run_id: engine.run_id.clone(),
         step_id,
         value: value.clone(),
     };
-    inner.append(&ev)?;
+    engine.append(&ev)?;
     Ok(value)
 }
 
@@ -1128,14 +1147,14 @@ pub fn exec_uuid(inner: &Arc<EngineRuntime>) -> anyhow::Result<String> {
 /// Mirrors TanStack, where the awaited primitive throws `WorkflowPaused` and
 /// the drive returns (`run-workflow.ts:970` / `:529`).
 pub async fn exec_pause(
-    inner: &Arc<EngineRuntime>,
+    engine: &Arc<EngineRuntime>,
     step_id: &str,
     signal_name: &str,
     reason: &str,
     deadline: Option<i64>,
 ) -> anyhow::Result<serde_json::Value> {
     exec_pause_with(
-        inner,
+        engine,
         step_id,
         signal_name,
         reason,
@@ -1156,7 +1175,7 @@ pub async fn exec_pause(
 /// `validator` **不落盘** —— 它是代码而非数据，replay 时同一个
 /// `wait_for_event_with(..)` 调用点会重新装上同一个校验器。
 pub async fn exec_pause_with(
-    inner: &Arc<EngineRuntime>,
+    engine: &Arc<EngineRuntime>,
     step_id: &str,
     signal_name: &str,
     reason: &str,
@@ -1170,9 +1189,9 @@ pub async fn exec_pause_with(
     let buffered = if signal_name == "__timer" {
         None
     } else {
-        inner
+        engine
             .store
-            .consume_buffered_signal(&inner.run_id, step_id, signal_name)
+            .consume_buffered_signal(&engine.run_id, step_id, signal_name)
             .ok()
             .flatten()
     };
@@ -1184,7 +1203,7 @@ pub async fn exec_pause_with(
         //
         // 走 `emit_and_append`（经 [`EngineRuntime::append`]）而不是自己写
         // CAS 循环：游标管理、索引推进、live 同步都只该有一份实现。
-        inner.append(&ev)?;
+        engine.append(&ev)?;
         let payload = match ev {
             WorkflowEvent::SignalResolved { payload, .. } => payload,
             // 收件箱只应产出 SignalResolved；别的形状按空处理。
@@ -1202,7 +1221,7 @@ pub async fn exec_pause_with(
         }
         return Ok(payload);
     }
-    if let Some(payload) = find_resume(&inner.store, &inner.run_id, step_id) {
+    if let Some(payload) = find_resume(&engine.store, &engine.run_id, step_id) {
         // 恢复路径：投递进来的 payload 先过声明的 schema 再交给 workflow。
         // 校验失败 = run 报错（不是 park），因为数据已经在这了、run 不会
         // 重新等待。
@@ -1217,12 +1236,12 @@ pub async fn exec_pause_with(
     }
     // 被取消的 run 不该再挂起——直接以 Aborted 展开（原来由轮询循环里的检查
     // 负责，轮询删掉后移到这里：挂起是最后一个还能观察 flag 的边界）。
-    if is_cancelled(&inner.store, &inner.run_id) {
+    if is_cancelled(&engine.store, &engine.run_id) {
         return Err(WorkflowCancelled.into());
     }
 
     let already_paused = {
-        let events = inner.store.get_events(&inner.run_id)?;
+        let events = engine.store.get_events(&engine.run_id)?;
         events.iter().any(
             |ev| match ev {
                 WorkflowEvent::SignalAwaited { step_id: id, .. }
@@ -1237,7 +1256,7 @@ pub async fn exec_pause_with(
         let ev = if signal_name == "__approval" {
             WorkflowEvent::ApprovalRequested {
                 ts: now_ms(),
-                run_id: inner.run_id.clone(),
+                run_id: engine.run_id.clone(),
                 step_id: step_id.to_string(),
                 approval_id: step_id.to_string(),
                 title: reason.to_string(),
@@ -1247,19 +1266,19 @@ pub async fn exec_pause_with(
         } else {
             WorkflowEvent::SignalAwaited {
                 ts: now_ms(),
-                run_id: inner.run_id.clone(),
+                run_id: engine.run_id.clone(),
                 step_id: step_id.to_string(),
                 name: signal_name.to_string(),
                 deadline,
                 meta: meta.clone(),
             }
         };
-        inner.append(&ev)?;
+        engine.append(&ev)?;
     }
     // 投影 RunState 信封（fresh 与崩溃后 replay 一致：都展示 Paused + 等待说明）。
     project_run_wait(
-        &inner.store,
-        &inner.run_id,
+        &engine.store,
+        &engine.run_id,
         if signal_name == "__approval" {
             WaitKind::Approval {
                 step_id: step_id.to_string(),
