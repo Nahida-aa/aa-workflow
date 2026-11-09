@@ -4,6 +4,11 @@
 [TanStack Workflow](https://tanstack.com/workflow) 的对照结论，包括我们采纳了什么、
 拒绝了什么、以及为什么。任何复读这几轮的讨论都可以回到这里。
 
+> **引擎内部字段的逐项对照见
+> [`concepts/engine-runtime-fields.md`](concepts/engine-runtime-fields.md)**——
+> 那里列了 `EngineRuntime` 哪些字段与上游同名同义、哪些上游有而我们没有、
+> 哪些是本仓扩展，以及动它之前的四条判断规则。
+
 ## 结论速览
 
 第一轮（`118fcbe`）：命名对齐，执行模型保留显式 `needs` DAG + 调度器。

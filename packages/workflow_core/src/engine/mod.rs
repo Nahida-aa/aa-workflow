@@ -284,8 +284,8 @@ pub struct EngineRuntime {
     /// 为什么可以直接扫而不像上游那样顾虑 O(n²)：`history` 是内存数组，
     /// n 个 step 各自扫一遍是几百次数组访问（n 通常 < 100）。上游也是这么做的。
     ///
-    /// `Running` 标记**不在**这里：`StepStarted` 是 emit-only、不落盘，
-    /// 所以它单独放 [`Self::running`]。
+    /// `StepStarted` 不在这里：它是 emit-only、不落盘。查不到终态就算「还没
+    /// 跑完」，调用方放行——与上游只认 `STEP_FINISHED` / `STEP_FAILED` 一致。
     history: Mutex<Vec<WorkflowEvent>>,
     /// Phase-1 补偿登记（undo 轴）：handler 内 `ctx.compensate` 按代码确定性
     /// 重登记；失败路径取走并逆序执行（见 `run_compensations`）。
