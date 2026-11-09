@@ -717,7 +717,11 @@ async fn drive(
     opts: RunWorkflowOptions,
     publish_tx: tokio::sync::mpsc::UnboundedSender<WorkflowEvent>,
 ) -> Result<(), WorkflowEvent> {
-    let workflow: &WorkflowDefinition = &opts.workflow;
+    // `opts.workflow` 是构造时 `Into<AnyWorkflowDefinition>` 转好的擦除态；
+    // 保留那份 `AnyWorkflowDefinition`（`Arc`），版本路由命中当前版本时
+    // 直接复用，不用 deep-copy 整个定义。
+    let workflow_any: &AnyWorkflowDefinition = &opts.workflow;
+    let workflow: &WorkflowDefinition = workflow_any;
     let store = Arc::clone(&opts.run_store);
 
     let run_id = opts.run_id.clone().unwrap_or_else(|| format!("run_{}", now_ms()));
@@ -793,7 +797,7 @@ async fn drive(
         .workflow_version
         .as_deref()
         .or(workflow.version.as_deref());
-    let Some(active) = select_workflow_version(workflow, persisted_version) else {
+    let Some(active) = select_workflow_version(workflow_any, persisted_version) else {
         let e = anyhow::anyhow!(
             "run `{run_id}` was started under version {persisted_version:?}, \
              which is not the current version nor in `previous_versions`"
@@ -874,6 +878,8 @@ async fn drive(
     // 一次非阻塞 `send`。
     let inner = Arc::new(EngineRuntime {
         run_id: run_id.clone(),
+        // 选中的那一版（可能是 previous_versions 里的旧版本）。
+        workflow: active.clone(),
         input: opts.input.clone(),
         meta: Some(opts.meta.as_value().clone()),
         state_mirror,
@@ -894,7 +900,6 @@ async fn drive(
             .unwrap_or(DEFAULT_MIN_YIELD_REMAINING_MS),
         yield_resume_at: opts.yield_resume_at,
         yield_counter: AtomicUsize::new(0),
-        default_step_retry: active.default_step_retry.clone(),
         compensations: std::sync::Mutex::new(Vec::new()),
         interim_goal_parks: AtomicUsize::new(0),
         pending_retries: Mutex::new(pending_retries),

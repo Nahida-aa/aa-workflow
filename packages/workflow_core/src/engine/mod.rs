@@ -235,6 +235,14 @@ pub(crate) async fn run_compensations(
 pub struct EngineRuntime {
     pub run_id: String,
     pub input: serde_json::Value,
+    /// 本次 run 使用的 workflow 定义，对应上游 `engine.workflow`
+    /// （`run-workflow.ts:788` 的 `workflow: AnyWorkflowDefinition`）。
+    ///
+    /// **必须是 `select_workflow_version` 选中的那一版**，不是
+    /// `RunWorkflowOptions.workflow` 本身：resume 时 run 可能跑在
+    /// `previous_versions` 里的旧版本上，那时两者的字段（尤其
+    /// `default_step_retry`）本来就不同。
+    pub workflow: crate::define::AnyWorkflowDefinition,
     /// Per-invocation state, rebuilt from `initialize(input)` on every start
     /// and resume (see `define::WorkflowDefinition::initialize`). Guarded by a
     /// `std::sync::RwLock`; it is the live image that `BaseCtx::state` (the
@@ -325,10 +333,6 @@ pub struct EngineRuntime {
     ///
     /// 非 `Option`：只有一个构造点（[`run_workflow`]），且总有一个流在收。
     pub(crate) emit: tokio::sync::mpsc::UnboundedSender<WorkflowEvent>,
-    /// WorkflowDefinition-level fallback retry (TanStack `defaultStepRetry`); steps that
-    /// declare their own [`StepOptions::retry`](crate::define::StepOptions::retry)
-    /// win.
-    pub(crate) default_step_retry: Option<crate::define::RetryPolicy>,
 }
 
 /// 某 step 在给定事件序列里的**最后一个**终态（重试 / redo 时后者胜）。
@@ -862,10 +866,12 @@ where
 
     // Effective retry: per-step policy wins, else the workflow's
     // `default_step_retry` (TanStack `defaultStepRetry`), else none.
+    // 读 `inner.workflow`——上游同样是 `options?.retry ??
+    // engine.workflow.defaultStepRetry`（`run-workflow.ts:998`）。
     let retry = opts
         .retry
         .clone()
-        .or_else(|| inner.default_step_retry.clone());
+        .or_else(|| inner.workflow.default_step_retry.clone());
 
     let max_attempts = retry.as_ref().map(|p| p.max_attempts).unwrap_or(1);
     // 耐久重试续跑：attempts 从上一版携带（STEP_RETRY_SCHEDULED.attempts），

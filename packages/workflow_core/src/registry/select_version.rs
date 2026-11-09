@@ -28,24 +28,32 @@ use crate::define::WorkflowDefinition;
 /// 在 `[current] + current.previous_versions` 中按持久化版本选定义。
 ///
 /// 返回 `None` = 版本化 run 在候选里找不到对应定义（由调用方报错）。
-pub fn select_workflow_version<'a>(
-    workflow: &'a WorkflowDefinition,
+///
+/// 收 `&AnyWorkflowDefinition` 而不是 `&WorkflowDefinition`：命中**当前版本**
+/// 时直接 clone 传进来的 `Arc`（引用计数 +1）；只有命中 `previous_versions`
+/// 里的旧版本才 clone 那一项（同样是 `Arc` 计数）。两种情况都不复制
+/// middleware / previous_versions 这两个 `Vec`。
+///
+/// 返回持有所有权的定义，是为了让调用方把它装进 `EngineRuntime.workflow`
+/// ——与上游把选中的版本塞进 `engine.workflow` 同形。
+pub fn select_workflow_version(
+    workflow: &crate::define::AnyWorkflowDefinition,
     persisted: Option<&str>,
-) -> Option<&'a WorkflowDefinition> {
+) -> Option<crate::define::AnyWorkflowDefinition> {
     match persisted {
         // 情况 1：精确匹配（当前版本自身也在候选里）。
         Some(v) => {
             if workflow.version.as_deref() == Some(v) {
-                return Some(workflow);
+                return Some(workflow.clone());
             }
             workflow
                 .previous_versions
                 .iter()
-                .map(|w| &**w)
                 .find(|w| w.version.as_deref() == Some(v))
+                .cloned()
         }
         // 情况 2：无持久化版本（老 run）→ 当前定义。
-        None => Some(workflow),
+        None => Some(workflow.clone()),
     }
 }
 
@@ -53,12 +61,19 @@ pub fn select_workflow_version<'a>(
 mod tests {
     use super::*;
 
+    /// 测试里把具体定义转成擦除态——公开签名收的是 `AnyWorkflowDefinition`，
+    /// 与 `run_workflow` 传进来的形态一致。
+    fn any(w: WorkflowDefinition) -> crate::define::AnyWorkflowDefinition {
+        w.into()
+    }
+
     #[test]
     fn exact_match_in_current_and_previous() {
-        let v1 = WorkflowDefinition::new("wf").version("v1");
+        let v1 = any(WorkflowDefinition::new("wf").version("v1"));
         let v2 = WorkflowDefinition::new("wf")
             .version("v2")
             .previous_versions(vec![v1]);
+        let v2 = any(v2);
 
         assert_eq!(
             select_workflow_version(&v2, Some("v1")).map(|w| w.version.clone()),
@@ -75,10 +90,12 @@ mod tests {
     /// 版本化 run 匹配不上 → `None`（**不回退**，对齐上游的确定性要求）。
     #[test]
     fn versioned_run_without_match_returns_none() {
-        let v1 = WorkflowDefinition::new("wf").version("v1");
-        let v2 = WorkflowDefinition::new("wf")
-            .version("v2")
-            .previous_versions(vec![v1]);
+        let v1 = any(WorkflowDefinition::new("wf").version("v1"));
+        let v2 = any(
+            WorkflowDefinition::new("wf")
+                .version("v2")
+                .previous_versions(vec![v1]),
+        );
         assert!(
             select_workflow_version(&v2, Some("v9")).is_none(),
             "未知版本不得静默回退到当前版本（确定性违规）"
@@ -88,7 +105,7 @@ mod tests {
     /// 无持久化版本（老 run）→ 当前定义。
     #[test]
     fn unversioned_run_falls_back_to_current() {
-        let v2 = WorkflowDefinition::new("wf").version("v2");
+        let v2 = any(WorkflowDefinition::new("wf").version("v2"));
         assert_eq!(
             select_workflow_version(&v2, None).map(|w| w.version.clone()),
             Some(Some("v2".into()))
