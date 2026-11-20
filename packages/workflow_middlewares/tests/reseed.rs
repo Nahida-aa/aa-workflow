@@ -4,14 +4,19 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use aa_workflow_core::define::StepCtx;
+use aa_workflow_core::define::{MetaBag, StepCtx};
 use aa_workflow_core::event::WorkflowEvent;
 use aa_workflow_core::{
     create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunStore,
     RunWorkflowOptions, WorkflowCtx,
 };
 
-use aa_workflow_middlewares::{reseed, ReseedPlan, SourceStep};
+use aa_workflow_middlewares::{ReseedKey, ReseedPlan, SourceStep, reseed};
+
+/// redo 的 plan 走 run 级参数（`RunWorkflowOptions.meta`），不在中间件构造处。
+fn reseed_meta(plan: ReseedPlan) -> MetaBag {
+    MetaBag::new().with::<ReseedKey>(plan)
+}
 
 /// 源 run 的结果提取器：把日志里的 STEP_FINISHED 收成 map（带日志下标，
 /// 供 `STEP_FINISHED.meta.imported_from.index` 使用）。
@@ -94,17 +99,15 @@ async fn redo_reuses_steps_outside_redo_set() {
     exec.lock().unwrap().clear();
     let wf2 = make_wf(
         exec.clone(),
-        Some(reseed(
-            ReseedPlan {
-                source_run_id: "rev1".into(),
-                redo_set: vec!["c".into()],
-            },
-            loader(store.clone()),
-        )),
+        Some(reseed(loader(store.clone()))),
     )();
     let out = run_workflow(
         RunWorkflowOptions::new(Arc::new(wf2), store.clone())
             .input(serde_json::json!({}))
+            .meta(reseed_meta(ReseedPlan {
+                source_run_id: "rev1".into(),
+                redo_set: vec!["c".into()],
+            }))
             .run_id("rev2"),
     )
     .outcome()
@@ -182,17 +185,15 @@ async fn redo_with_empty_redo_set_reuses_everything() {
     exec.lock().unwrap().clear();
     let wf2 = make_wf(
         exec.clone(),
-        Some(reseed(
-            ReseedPlan {
-                source_run_id: "s1".into(),
-                redo_set: vec![],
-            },
-            loader(store.clone()),
-        )),
+        Some(reseed(loader(store.clone()))),
     )();
     let out = run_workflow(
         RunWorkflowOptions::new(Arc::new(wf2), store.clone())
             .input(serde_json::json!({}))
+            .meta(reseed_meta(ReseedPlan {
+                source_run_id: "s1".into(),
+                redo_set: vec![],
+            }))
             .run_id("s2"),
     )
     .outcome()
@@ -215,13 +216,7 @@ async fn redo_with_missing_source_runs_everything() {
     let ran_in = ran.clone();
 
     let wf = create_workflow(CreateWorkflowConfig::new("redo2").input::<serde_json::Value>())
-        .middleware([reseed(
-            ReseedPlan {
-                source_run_id: "ghost".into(),
-                redo_set: vec![],
-            },
-            loader(store.clone()),
-        )])
+        .middleware([reseed(loader(store.clone()))])
         .handler(move |ctx: WorkflowCtx| {
             let ran = ran_in.clone();
             async move {
@@ -240,6 +235,10 @@ async fn redo_with_missing_source_runs_everything() {
     let out = run_workflow(
         RunWorkflowOptions::new(Arc::new(wf), store.clone())
             .input(serde_json::json!({}))
+            .meta(reseed_meta(ReseedPlan {
+                source_run_id: "ghost".into(),
+                redo_set: vec![],
+            }))
             .run_id("m1"),
     )
     .outcome()

@@ -14,6 +14,12 @@
 //! | 读源时机 | 首次 drive（`startRun` 里） | 首次 drive（首个真实 step 入口） |
 //! | 源在首驱前没了 | 导入 0 条 → 真跑 | 查不到 → 真跑（**相同**） |
 //!
+//! # 计划走 `RunWorkflowOptions.meta`
+//!
+//! 中间件是**提前配置**的（挂一次、跑很多次），而「从哪个源 run 播种、重跑哪些
+//! step」每次 run 都可能不同。所以 plan 走 `ctx.meta` 的 [`ReseedKey`]，
+//! 构造时不接收——与 `interim_goals` 同一条规则（见 `lib.rs` 的模块文档）。
+//!
 //! # 为什么是 step 包装层
 //!
 //! 要对「即将执行的 step」在**执行之前**介入；TS 版靠覆盖 `ctx.step` 表达
@@ -28,13 +34,30 @@ use aa_workflow_core::middleware::{Middleware, MiddlewareServerFnArgs};
 use crate::step_layer::{step_layer, Decision};
 
 /// 一次 redo 的计划：从哪里播种、哪些 step 重跑。
-#[derive(Debug, Clone)]
+///
+/// 作为 [`RunWorkflowOptions.meta`](aa_workflow_core::engine::RunWorkflowOptions::meta)
+/// 里的 [`ReseedKey`] 传入——**不是**中间件的构造参数。理由同
+/// `interim_goals`：中间件是提前配置的（挂一次、跑很多次），而「从哪个源 run
+/// 播种、重跑哪些 step」每次 run 都可能不同。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReseedPlan {
     /// 源 run id。
     pub source_run_id: String,
     /// 强制重跑的 stepId 名单（**不**复用它们的旧结果）。
     pub redo_set: Vec<String>,
 }
+
+/// `ctx.meta` 里的 redo 计划。
+///
+/// 构造：`MetaBag::new().with::<ReseedKey>(ReseedPlan { .. })`。
+pub struct ReseedKey;
+
+impl aa_workflow_core::define::MetaKey for ReseedKey {
+    const KEY: &'static str = "__reseedPlan";
+    type Value = ReseedPlan;
+}
+
+aa_workflow_core::impl_meta_accessors!(ReseedKey => ReseedAccess, reseed_plan, try_reseed_plan);
 
 /// 从源 run 读「step_id → 结果」。
 ///
@@ -56,34 +79,37 @@ pub struct SourceStep {
     pub index: usize,
 }
 
-/// 按 plan 复用源 run 的 step 结果。
+/// 按 `ctx.meta` 里的 [`ReseedKey`] 复用源 run 的 step 结果。
 ///
-/// `plan` 在**构造时**给出（Rust 的中间件是 `Arc<dyn Fn>`，没有「运行时读 input」
-/// 的默认行为；需要从 input 读，就自己在 server 闭包里读 `ctx.input` 再决定
-/// 是否装拦截器——见 `dag_policies`）。
-///
-/// # 例
+/// 计划本身**不在这里给**——它属于 run 级参数，调用方每次 drive 通过
+/// `RunWorkflowOptions.meta` 传：
 ///
 /// ```ignore
-/// let mw = reseed(
-///     ReseedPlan { source_run_id: "rev1".into(), redo_set: vec!["translate".into()] },
-///     |run_id| { /* 从 store 读 STEP_FINISHED → HashMap<step_id, result> */ Ok(Default::default()) },
-/// );
+/// .middleware([reseed(load_results)])            // 挂一次
+/// RunWorkflowOptions::new(wf, store)
+///     .meta(MetaBag::new().with::<ReseedKey>(ReseedPlan {
+///         source_run_id: "rev1".into(),
+///         redo_set: vec!["translate".into()],
+///     }))
 /// ```
-pub fn reseed<F>(plan: ReseedPlan, load_results: F) -> Middleware
+///
+/// 没传 `ReseedKey` 时不装层（= 本次 run 不做播种，全部真跑）。
+pub fn reseed<F>(load_results: F) -> Middleware
 where
     F: Fn(&str) -> anyhow::Result<HashMap<String, SourceStep>> + Send + Sync + 'static,
 {
-    let redo: std::collections::HashSet<String> = plan.redo_set.iter().cloned().collect();
-    let plan = Arc::new(plan);
     let load_results = Arc::new(load_results);
 
     Middleware::new().server(move |mut sc: MiddlewareServerFnArgs| {
-        let plan = plan.clone();
         let load_results = load_results.clone();
-        let redo = redo.clone();
 
         Box::pin(async move {
+            // 计划只在 meta 里；缺失 = 本次 run 不做播种。
+            let Some(plan) = sc.ctx.meta.try_get::<ReseedKey>() else {
+                return sc.next(None).await;
+            };
+            let redo: std::collections::HashSet<String> = plan.redo_set.iter().cloned().collect();
+
             // 本 run 就是源 run？不做任何事（禁止自我播种）。
             if plan.source_run_id != sc.ctx.run_id {
                 // **drive 开始时加载一次**，而不是在包装层里懒加载 + 缓存：

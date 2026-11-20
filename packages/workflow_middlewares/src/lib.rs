@@ -36,12 +36,14 @@
 //! ```rust,ignore
 //! // 中间件：挂一次，不含 run 级参数
 //! .middleware([interim_goals(get_events)])
-//! .middleware([reseed(plan, load_results)])
-//! .middleware([dag_policies(shape, get_events)])
+//! .middleware([reseed(load_results)])
+//! .middleware([dag_policies(shape, get_events)])   // shape 是静态图，不是 run 级参数
 //!
 //! // run 级参数：每次 drive 各自给
 //! RunWorkflowOptions::new(wf, store)
-//!     .meta(MetaBag::new().with::<InterimGoalsKey>(vec!["b".into()]))
+//!     .meta(MetaBag::new()
+//!         .with::<InterimGoalsKey>(vec!["b".into()])
+//!         .with::<ReseedKey>(ReseedPlan { .. }))
 //! ```
 //!
 //! **给中间件作者的建议**：如果你的中间件不写 `ctx.ext`，函数返回值就写成
@@ -52,9 +54,13 @@
 //! # 策略参数走 `RunWorkflowOptions.meta`
 //!
 //! 三个中间件都从 [`ctx.meta`](aa_workflow_core::define::BaseCtx) 读策略参数
-//! （`__interimGoals` / `__dagPlan`），而不是往引擎加字段——引擎上曾经有过
-//! `interim_goals` / `reseed_run` 两个策略参数，已于 2026-11-06 删除
-//! （`docs/decisions/0001`、`0018`），本包就是它们的归宿。
+//! （`__interimGoals` / `__reseedPlan` / `__dagPlan`），而不是往引擎加字段——
+//! 引擎上曾经有过 `interim_goals` / `reseed_run` 两个策略参数，已于 2026-11-06
+//! 删除（`docs/decisions/0001`、`0018`），本包就是它们的归宿。
+//!
+//! **中间件的构造参数只放静态配置**（`get_events` / `load_results` / `shape`），
+//! 不放「每次 run 可能不同」的东西——那些都走 `ctx.meta` 的类型化 key
+//! （`InterimGoalsKey` / `ReseedKey` / `DagPlan`）。
 mod dag;
 mod step_layer;
 mod interim_goals;
@@ -62,7 +68,7 @@ mod reseed;
 
 pub use dag::{DAG_PLAN_FIELD, GetEvents, INTERIM_GOAL_SIGNAL, dag_policies};
 pub use interim_goals::{InterimGoalsAccess, InterimGoalsKey, interim_goals};
-pub use reseed::{LoadResults, ReseedPlan, SourceStep, reseed};
+pub use reseed::{LoadResults, ReseedAccess, ReseedKey, ReseedPlan, SourceStep, reseed};
 
 /// 供文档链接用：把常用名字提上来，避免调用方再导一遍 core。
 ///
