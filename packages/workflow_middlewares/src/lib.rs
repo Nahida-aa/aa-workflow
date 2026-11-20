@@ -64,12 +64,19 @@
 //! **中间件的构造参数只放静态配置**（`get_events` / `load_results` / `shape`），
 //! 不放「每次 run 可能不同」的东西——那些都走 `ctx.meta` 的类型化 key
 //! （`InterimGoalsKey` / `ReseedKey` / `DagPlan`）。
+mod dag;
 mod dag_policies;
 mod dag_scheduler;
 mod step_layer;
 mod interim_goals;
 mod reseed;
 
+// DAG 核心（名单 + 调度）从 aa_workflow_dag 复制而来，在此 re-export，
+// 让本包自包含；调用方无需再依赖 aa_workflow_dag。
+pub use dag::core::{
+    DagNode, DagRunFn, DagShape, DagSpec, RedoPlan, ShapeError, dag_to_handler, define_dag,
+    run_dag,
+};
 pub use dag_policies::{
     DagPlan, DagPlanAccess, DagPlanKey, GetEvents, INTERIM_GOAL_SIGNAL, dag_policies,
 };

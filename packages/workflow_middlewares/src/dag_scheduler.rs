@@ -5,11 +5,11 @@
 //! 的最后一个（最内层），否则策略的 `wrap_step` 还没注册就已经被调度调用
 //! （ADR 0007 实测的静默失效）。
 //!
-//! 调度核心在 `aa_workflow_dag::declare::run_dag`，与 `dag_to_handler` 共用。
+//! 调度核心在本包 `dag::core::run_dag`，与 `dag_to_handler` 共用。
 use std::sync::Arc;
 
 use aa_workflow_core::middleware::Middleware;
-use aa_workflow_dag::{DagSpec, run_dag};
+use crate::dag::core::{DagSpec, run_dag};
 
 /// 接管式 DAG 调度中间件。run output = `{ "results": { 节点 id → 结果 } }`。
 ///

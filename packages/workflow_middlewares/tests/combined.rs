@@ -13,8 +13,8 @@ use aa_workflow_core::{
     create_workflow, run_workflow,
 };
 use aa_workflow_middlewares::{
-    DagPlan, DagPlanKey, INTERIM_GOAL_SIGNAL, InterimGoalsKey, ReseedKey, ReseedPlan, SourceStep,
-    dag_policies, interim_goals, reseed,
+    DagPlan, DagPlanKey, DagShape, INTERIM_GOAL_SIGNAL, InterimGoalsKey, ReseedKey, ReseedPlan,
+    SourceStep, dag_policies, interim_goals, reseed,
 };
 
 /// 把源 run 的 STEP_FINISHED 收成 map（带日志下标）。
@@ -227,11 +227,11 @@ async fn outer_interim_goals_parks_before_reseed_short_circuits() {
 ///
 /// 两者都用 `InterimGoalSignal` 停下来，但 park 时带的 `meta` 不同——
 /// 一个带 `{__interimGoals: ..}`、一个带 `{goals: ..}`，正好能看出来是谁触发。
-fn linear_shape() -> Arc<aa_workflow_dag::DagShape> {
+fn linear_shape() -> Arc<DagShape> {
     let none: &[&str] = &[];
     let a: &[&str] = &["a"];
     let ab: &[&str] = &["a", "b"];
-    Arc::new(aa_workflow_dag::DagShape::build(&[("a", none), ("b", a), ("c", ab)]).unwrap())
+    Arc::new(DagShape::build(&[("a", none), ("b", a), ("c", ab)]).unwrap())
 }
 
 /// 读出泊车事件的 meta（`None` = 没泊车）。

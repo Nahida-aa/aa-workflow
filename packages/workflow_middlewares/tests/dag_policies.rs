@@ -9,9 +9,9 @@ use aa_workflow_core::{
     create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunStatus, RunStore,
     RunWorkflowOptions, WorkflowCtx,
 };
-use aa_workflow_dag::{DagShape, DagSpec, define_dag};
 use aa_workflow_middlewares::{
-    DagPlan, DagPlanKey, INTERIM_GOAL_SIGNAL, dag_policies, dag_scheduler,
+    DagPlan, DagPlanKey, DagShape, DagSpec, INTERIM_GOAL_SIGNAL, dag_policies, dag_scheduler,
+    define_dag,
 };
 use serde_json::json;
 

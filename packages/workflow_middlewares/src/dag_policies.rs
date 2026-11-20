@@ -42,8 +42,7 @@ use std::sync::Arc;
 use aa_workflow_core::middleware::{
     Middleware, MiddlewareServerFnArgs, StepRequest,
 };
-use aa_workflow_dag::DagShape;
-
+use crate::dag::core::DagShape;
 use crate::step_layer::{step_layer, Decision};
 
 /// 保留信号名（与 `__timer` 同族）。

@@ -6,8 +6,7 @@ use aa_workflow_core::{
     create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunStatus,
     RunWorkflowOptions, WorkflowCtx,
 };
-use aa_workflow_dag::{DagSpec, define_dag};
-use aa_workflow_middlewares::dag_scheduler;
+use aa_workflow_middlewares::{DagSpec, dag_scheduler, define_dag};
 use serde_json::{Value, json};
 
 /// a → b，b 消费 a 的结果。两个测试共用这份声明。
