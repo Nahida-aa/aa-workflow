@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use aa_workflow_core::define::StepCtx;
 use aa_workflow_core::event::WorkflowEvent;
 use aa_workflow_core::{
-    CreateWorkflowConfig, DeliveryOutcome, InMemoryStore, RunStore, RunWorkflowOptions,
-    SignalDelivery, WorkflowCtx, create_workflow, deliver_signal, run_workflow,
+    CreateWorkflowConfig, InMemoryStore, RunStore, RunWorkflowOptions, SignalDelivery, WorkflowCtx,
+    create_workflow, run_workflow,
 };
 
 use aa_workflow_core::define::MetaBag;

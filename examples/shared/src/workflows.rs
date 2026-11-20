@@ -13,7 +13,7 @@
 //! - [`fulfillment`]（id `fulfillment`）— 对齐官方 `fulfillmentWorkflow` / wf-demo：
 //!   `reserve-inventory` → `readyAt` 定时闸门（sleep）→ `payment-received` 事件等待 → `ship-order`。
 //! - [`approval_review`] — 人工审批：`ctx.approve` 持久化一个等待点，
-//!   外部用 [`aa_workflow_core::deliver_signal`] 交付决定后继续（signals 语义载体）。
+//!   外部用 [`RunWorkflowOptions::signal_delivery`](../engine/struct.RunWorkflowOptions.html) 交付决定后继续（signals 语义载体）。
 //! - [`approval_order`]（id `approval-order`）— 对齐 wf-demo：金额阈值决定是否人工
 //!   审批，拒绝分支；`email_digest` 是 resume 的行为载体。
 //! - [`invoice`]（id `invoice`）— 对齐 wf-demo：连续两个 `sleep`（双定时器，引擎自动唤醒）。
@@ -27,7 +27,10 @@
 //!   （与 TanStack 0.0.4 一致）。
 
 use std::time::Duration;
-use aa_workflow_core::{AnyWorkflowDefinition, ApprovalDecision, Backoff, BaseCtx, CreateWorkflowConfig, RetryPolicy, SignalDelivery, StepCtx, StepOptions, WorkflowCtx, WorkflowDefinition, create_workflow};
+use aa_workflow_core::{
+    Backoff, BaseCtx, CreateWorkflowConfig, RetryPolicy, StepCtx, StepOptions, WorkflowCtx,
+    WorkflowDefinition, create_workflow,
+};
 
 // ========================================================================
 // 输入类型 = workflow 的「schema」（Rust 版 zod `inputSchema`）：serde
@@ -673,7 +676,10 @@ mod tests {
     use super::*;
     use std::sync::{Arc, LazyLock};
     use std::time::Duration;
-    use aa_workflow_core::{InMemoryStore, RunStatus, RunStore, RunWorkflowOptions, WorkflowDefinition, WorkflowEvent, run_workflow, deliver_approval, deliver_signal};
+    use aa_workflow_core::{
+        AnyWorkflowDefinition, ApprovalDecision, InMemoryStore, RunStatus, RunStore,
+        RunWorkflowOptions, SignalDelivery, WorkflowEvent, WorkflowDefinition, run_workflow,
+    };
 
     /// 序列化共享全局网关状态的测试（tokio 各 test 默认并行跑）。
     static GATEWAY_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =

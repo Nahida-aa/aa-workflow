@@ -12,9 +12,9 @@ use aa_workflow_core::middleware::{
     Middleware, MiddlewareServerFnArgs, StepRequest, StepService, StepServiceError, StepFuture,
 };
 use tower::{Layer, Service};
-use aa_workflow_core::{SignalDelivery, 
-    create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunWorkflowOptions,
-    WorkflowCtx,
+use aa_workflow_core::{
+    CreateWorkflowConfig, InMemoryStore, RunWorkflowOptions, WorkflowCtx, create_workflow,
+    run_workflow,
 };
 
 /// 记录每次进入某个 step 时「已完成 step」的快照。
@@ -189,9 +189,8 @@ async fn completed_snapshot_never_contains_self() {
 /// 泊车。这条锁定「策略无状态」改造后与改造前一致的行为。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn completed_accumulates_across_drives() {
-    use aa_workflow_core::{deliver_signal, RunStore};
+    use aa_workflow_core::RunStore;
     use aa_workflow_core::define::MetaBag;
-    use aa_workflow_core::DeliveryOutcome;
     use aa_workflow_middlewares::{interim_goals, InterimGoalsKey, INTERIM_GOAL_SIGNAL};
 
     let store = Arc::new(InMemoryStore::new());

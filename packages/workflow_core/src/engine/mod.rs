@@ -17,7 +17,7 @@ use crate::define::AnyWorkflowDefinition;
 use crate::error::{RunError, StoreError, WorkflowError};
 use crate::event::{RunStatus, StepAttempt, WorkflowEvent};
 use crate::resource::Gate;
-use crate::run_store::{ApprovalDecision, DeliveryOutcome, RunStore, SignalDelivery};
+use crate::run_store::RunStore;
 
 mod run_workflow;
 pub mod state_diff;
@@ -1520,133 +1520,6 @@ fn project_run_wait(store: &Arc<dyn RunStore>, run_id: &str, kind: WaitKind) {
     }
 }
 
-/// 投递一个信号：定位泊车点 → 去重 → 把 `SignalResolved` 追加进日志。
-///
-/// **本仓独有，不是上游 API**。上游的 `deliverSignal` 在 `workflow-runtime` 的
-/// `WorkflowExecutionStore` 上（`types.ts:340`），`workflow-core` 的 `RunStore`
-/// 只有 `appendEvent` / `getEvents`——core 根本不知道「信号」为何物。
-///
-/// ## 什么时候用它，什么时候别用
-///
-/// **首选** [`RunWorkflowOptions::signal_delivery`]：载荷随 drive 一起给，
-/// 引擎在 `append_seed` 里定位等待点、去重、落事件。那是上游的形状
-/// （`runWorkflow({ signalDelivery })`），也是 runtime 的
-/// `deliver_signal` 内部的走法。
-///
-/// 本函数只在两种场景需要：
-///
-/// 1. **run 已经 spawn 出去、正挂在等待点上**——此时没有「下一次 drive」可以
-///    挂载荷，只能从外部把事件写进日志把它唤醒（见 `restart_survives` 的
-///    跨进程测试）。
-/// 2. **要检查四态返回值本身**（`NotWaiting` / `NotFound`）。
-///    走 `signal_delivery` 时「没在等」会变成 `RUN_ERRORED`——那是引擎该有的
-///    反应，但测不到返回值。
-///
-/// 也就是说：它是**直接写日志的工具**，不是投递的主路径。
-///
-/// 一个函数覆盖上游那种定位方式的两种取值：
-///
-/// | [`SignalDelivery::step_id`] | 行为 |
-/// | --- | --- |
-/// | `Some(id)` | 投给该 step；`name` 从日志取，调用方不必知道 |
-/// | `None` | 投给当前泊在 `name` 这个信号上的 step |
-///
-/// **返回四态而非 `Err`**：「没人在等」是正常结果
-/// （[`DeliveryOutcome::NotWaiting`]），不是异常。只有 store 本身出错
-/// （IO / 冲突）才是 `Err`。
-pub fn deliver_signal(
-    store: &dyn RunStore,
-    run_id: &str,
-    delivery: SignalDelivery,
-) -> Result<DeliveryOutcome, WorkflowError> {
-    let events = store.get_events(run_id)?;
-    // run 不存在 = 从没有过事件（store 不区分「空日志」与「无此 run」）。
-    // NotFound 与 NotWaiting 分开报，调用方才能区分「打错 run_id」与「投早了」。
-    if events.is_empty() && store.get_run_state(run_id)?.is_none() {
-        return Ok(DeliveryOutcome::NotFound);
-    }
-
-    // 幂等：同一 signal_id 已投递过就不重复写。
-    if let Some(sid) = &delivery.signal_id
-        && events.iter().any(|ev| {
-            matches!(ev, WorkflowEvent::SignalResolved { signal_id: Some(x), .. } if x == sid)
-        })
-    {
-        return Ok(DeliveryOutcome::Duplicate);
-    }
-
-    // 定位目标 step：显式给了 step_id 就按它，否则按等待的 name 找。
-    let target = match &delivery.step_id {
-        Some(step_id) => events.iter().rev().find_map(|ev| match ev {
-            WorkflowEvent::SignalAwaited { step_id: id, name, .. } if id == step_id => {
-                Some((id.clone(), name.clone()))
-            }
-            _ => None,
-        }),
-        None => events.iter().rev().find_map(|ev| match ev {
-            WorkflowEvent::SignalAwaited { step_id, name: n, .. } if n == &delivery.name => {
-                Some((step_id.clone(), n.clone()))
-            }
-            _ => None,
-        }),
-    };
-    let Some((step_id, name)) = target else {
-        return Ok(DeliveryOutcome::NotWaiting);
-    };
-
-    let ev = WorkflowEvent::SignalResolved {
-        ts: now_ms(),
-        run_id: run_id.to_string(),
-        step_id,
-        name,
-        signal_id: delivery.signal_id,
-        payload: delivery.payload,
-        meta: delivery.meta,
-    };
-    append_with_cas(store, run_id, ev)?;
-    Ok(DeliveryOutcome::Delivered)
-}
-
-/// 投递一个审批决定。
-///
-/// 同 [`deliver_signal`]：本仓独有（上游在 runtime 层的 `deliverApproval`），
-/// 且**同样不是主路径**——首选 [`RunWorkflowOptions::approval`]。只有
-/// 「run 已 spawn 出去、正挂在审批上」时才需要从外部写日志唤醒它。
-///
-/// 审批是**结构化决定**（`approved` + `feedback`），没有 payload——事件形状
-/// 逐字对齐上游 `APPROVAL_RESOLVED`。
-pub fn deliver_approval(
-    store: &dyn RunStore,
-    run_id: &str,
-    approval_id: &str,
-    approved: bool,
-    feedback: Option<&str>,
-) -> Result<DeliveryOutcome, WorkflowError> {
-    let events = store.get_events(run_id)?;
-    if events.is_empty() && store.get_run_state(run_id)?.is_none() {
-        return Ok(DeliveryOutcome::NotFound);
-    }
-    let parked = events.iter().rev().any(|ev| {
-        matches!(
-            ev,
-            WorkflowEvent::ApprovalRequested { approval_id: id, .. } if id == approval_id
-        )
-    });
-    if !parked {
-        return Ok(DeliveryOutcome::NotWaiting);
-    }
-    let ev = WorkflowEvent::ApprovalResolved {
-        ts: now_ms(),
-        run_id: run_id.to_string(),
-        step_id: approval_id.to_string(),
-        approval_id: approval_id.to_string(),
-        approved,
-        feedback: feedback.map(str::to_string),
-        meta: None,
-    };
-    append_with_cas(store, run_id, ev)?;
-    Ok(DeliveryOutcome::Delivered)
-}
 
 /// 追加一条事件，索引冲突时重定基重试。
 ///
@@ -1708,7 +1581,7 @@ mod tests {
     use super::*;
     use crate::define::{Backoff, BaseCtx, CreateWorkflowConfig, RetryPolicy, WorkflowDefinition, WorkflowCtx, create_workflow};
     use crate::engine::testkit::{TestLog, idx};
-    use crate::run_store::{InMemoryStore, RunState};
+    use crate::run_store::{ApprovalDecision, InMemoryStore, RunState, SignalDelivery};
     use serde::{Deserialize, Serialize};
     use std::sync::atomic::AtomicBool;
     use tokio::try_join;
@@ -2558,47 +2431,6 @@ mod tests {
         )));
     }
 
-    /// 投递**过闸**（对齐上游默认 `not-waiting`）：没泊在信号上就拒绝，
-    /// 不静默写日志。早到信号由 runtime 的可选收件箱承接
-    /// （`buffer_signal` + `buffer_signals`），不是靠 core 无条件 append。
-    ///
-    /// 这里直接调 `deliver_signal` 而不是走 `run_workflow` 的 `signal_delivery`：
-    /// 后者会把「没在等」变成 `RUN_ERRORED`（引擎该有的反应），而本测试要的是
-    /// 四态里的 `NotWaiting` 这个**返回值**。
-    #[test]
-    fn deliver_signal_reports_not_waiting_when_nothing_is_parked() {
-        let store = InMemoryStore::new();
-        // 需要一个存在的 run，否则下面验证的就是 NotFound 而不是 NotWaiting。
-        store
-            .set_run_state(
-                "r1",
-                &RunState {
-                    run_id: "r1".into(),
-                    workflow_id: "wf".into(),
-                    workflow_version: None,
-                    status: crate::event::RunStatus::Running,
-                    input: serde_json::Value::Null,
-                    output: None,
-                    error: None,
-                    waiting_for: None,
-                    pending_approval: None,
-                    awaiting: vec![],
-                    created_at: 0,
-                    updated_at: 0,
-                },
-            )
-            .unwrap();
-        let outcome = deliver_signal(&store, "r1", SignalDelivery { signal_id: None, step_id: Some("gate".to_string()), name: String::new(), payload: serde_json::json!({ "ok": true }), meta: None })
-            .unwrap();
-        assert_eq!(
-            outcome, DeliveryOutcome::NotWaiting,
-            "没在等应报 NotWaiting（上游四态，不是异常）"
-        );
-        assert!(
-            store.get_events("r1").unwrap().is_empty(),
-            "被拒的投递不得在日志里留任何东西"
-        );
-    }
 
     /// 日志里**先于** pause 存在的 `SignalResolved`，仍会被等待点的
     /// `find_resume` 短路拾取（机械性质：恢复事件与位置无关）。core 自己不再
@@ -2696,24 +2528,18 @@ mod tests {
         t1.abort();
         let _ = t1.await;
 
-        // Run 2 (same run_id): succeeded checkpoint short-circuits, the pause
-        // re-waits but must NOT append a second SignalAwaited.
-        let store3 = store.clone();
-        let wf3 = wf.clone();
-        let t2 = tokio::spawn(async move {
-            run_workflow(
-                RunWorkflowOptions::new(Arc::new(wf3.clone()), store3)
-                    .input(serde_json::json!({}))
+        // Run 2 (same run_id)：succeeded checkpoint 短路，pause 重新挂起但
+        // **不得**再 append 一条 SignalAwaited。顺序 drive 就够——Run 1 被 abort
+        // 时同样没写终态，Paused 也是。
+        let out = run_workflow(
+            RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
+                .input(serde_json::json!({}))
                 .run_id("r2"),
-            )
-            .outcome().await
-        });
-        wait_until(
-            &store,
-            "r2",
-            |e| matches!(e, WorkflowEvent::SignalAwaited { step_id, .. } | WorkflowEvent::ApprovalRequested { step_id, .. } if step_id == "release"),
         )
-        .await;
+        .outcome()
+        .await
+        .unwrap();
+        assert_eq!(out.status, RunStatus::Paused);
         assert_eq!(
             count_events(&store, "r2", |e| matches!(
                 e,
@@ -2723,11 +2549,20 @@ mod tests {
             "replay must not re-append the pause checkpoint"
         );
 
-        // **两步是必需的**：`t2` 的 drive 已 spawn 出去、正挂在审批等待点上，
-        // 只能从外部投递唤醒它。一步写法（`opts.approval(..)`）要求载荷在
-        // drive 开始前给出，与本测试要验的「进程 B 挂起 → 外部决定」时序不符。
-        deliver_approval(store.as_ref(), "r2", "release", true, None).unwrap();
-        let out = t2.await.unwrap().unwrap();
+        // Run 3：审批载荷随这一次 drive 给（上游 `approval` 选项的形状）。
+        let out = run_workflow(
+            RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
+                .input(serde_json::json!({}))
+                .approval(ApprovalDecision {
+                    approval_id: "release".to_string(),
+                    approved: true,
+                    feedback: None,
+                })
+                .run_id("r2"),
+        )
+        .outcome()
+        .await
+        .unwrap();
         assert_eq!(out.status, RunStatus::Finished);
         assert_eq!(
             out.output,
@@ -3233,17 +3068,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn signal_to_unknown_run_reports_not_found() {
-        // run 不存在与「没人在等」是两种结果（上游四态里的 not-found / not-waiting）。
-        let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
-        let outcome = deliver_signal(store.as_ref(), "nowhere", SignalDelivery { signal_id: None, step_id: None, name: "ghost".to_string(), payload: serde_json::Value::Null, meta: None }).unwrap();
-        assert_eq!(outcome, DeliveryOutcome::NotFound);
-        assert!(
-            store.get_events("nowhere").unwrap().is_empty(),
-            "失败时不 append SignalResolved"
-        );
-    }
 
     #[tokio::test]
     async fn now_and_uuid_deterministic_across_resume() {

@@ -91,16 +91,22 @@ async function deliverSignal(config, telemetry, args)
 
 | 本仓 | 上游对应 | 说明 |
 | --- | --- | --- |
-| `RunWorkflowOptions::signal_delivery` / `approval` | `signalDelivery` / `approval` | **主路径** |
+| `RunWorkflowOptions::signal_delivery` / `approval` | `signalDelivery` / `approval` | 唯一入口 |
 | `run_workflow` 里的 `append_seed` | `appendSeed` | 重放 handler **之前**落事件 |
-| `engine::deliver_signal` / `deliver_approval` | **无** | 本仓扩展，仅两种场景 |
 
-那两个自由函数**不是主路径**，只在：
+**core 一度有过 `engine::deliver_signal` / `deliver_approval` 两个自由函数，
+已删除。** 当时的保留理由是「run 已 spawn 出去、正挂在等待点上，只能从外部写
+日志唤醒」和「要检查四态返回值」——两条都站不住：
 
-1. run 已经 spawn 出去、正挂在等待点上 —— 没有「下一次 drive」可挂载荷，
-   只能从外部写日志唤醒（`restart_survives` 的跨进程测试）；
-2. 要检查四态返回值本身（`NotWaiting` / `NotFound`）—— 走 `signal_delivery`
-   时「没在等」会变成 `RUN_ERRORED`，测不到返回值。
+- 前者是本仓测试写法造成的。上游根本没有「唤醒一个已 spawn 的 drive」这条
+  路径：drive 跑到挂起就结束，投递就是**下一次 drive**。测试里把
+  `spawn + abort + 外部投递` 改成 `drive → Paused → 带载荷再 drive` 后，
+  语义完全等价（abort 和 Paused 都不写终态）。
+- 后者测的是 core 本不该有的 API。四态里的 `NotWaiting` 在
+  `signal_delivery` 路径上表现为 `RUN_ERRORED`（引擎该有的反应），
+  已由 `signal_delivery_to_a_non_waiting_run_errors` 覆盖。
+
+现在 `workflow_core` 里 grep `deliver_signal` 只剩注释。
 
 ---
 

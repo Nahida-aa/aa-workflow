@@ -159,7 +159,7 @@ pub enum WorkflowError {
     /// No `RunState` exists for the requested run id.
     RunNotFound(String),
     /// A delivered signal could not be matched to a parked wait point (from
-    /// [`crate::engine::deliver_signal`]: nothing was paused on that event name).
+    /// [`RunWorkflowOptions::signal_delivery`](crate::engine::RunWorkflowOptions::signal_delivery): nothing was paused on that event name).
     SignalLost(String),
     /// An internal invariant was violated (deadlock guard, channel closed).
     Internal(String),

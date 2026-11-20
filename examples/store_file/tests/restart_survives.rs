@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aa_workflow_core::{SignalDelivery, RunStore, RunStatus, WorkflowEvent, deliver_signal};
+use aa_workflow_core::{ApprovalDecision, RunStatus, RunStore, SignalDelivery, WorkflowEvent};
 use aa_workflow_runtime::run_store_adapter::{
     WorkflowExecutionStore, create_run_store_adapter,
 };
@@ -137,32 +137,21 @@ fn base_dir(tag: &str) -> PathBuf {
         t1.abort();
         let _ = t1.await;
 
-        // 进程 B：全新 FileExecutionStore 打开同一 base 续跑 → 不重复挂起等待点
+        // 进程 B：全新 FileExecutionStore 打开同一 base 续跑 → 不重复挂起等待点。
+        // 顺序 drive 就够——进程 A 被 abort 时同样没写终态，Paused 也是。
         let store2 = core_store(&base);
-        let store2_spawn = store2.clone();
-        let wf2 = wf.clone();
-        let t2 = tokio::spawn(async move {
-            drive(
-                &wf2,
-                store2_spawn.clone(),
-                serde_json::json!({}),
-                DriveOpts {
-                    run_id: Some("approve:r"),
-                    ..DriveOpts::default()
-                },
-            )
-            .await
-            .map(|out| (out, store2_spawn))
-        });
-        for _ in 0..2000 {
-            let evs = store2.get_events("approve:r").unwrap();
-            if evs.iter().any(
-                |e| matches!(e, WorkflowEvent::SignalAwaited { step_id, .. } | WorkflowEvent::ApprovalRequested { step_id, .. } if step_id == "review"),
-            ) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let out = drive(
+            &wf,
+            store2.clone(),
+            serde_json::json!({}),
+            DriveOpts {
+                run_id: Some("approve:r"),
+                ..DriveOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.status, RunStatus::Paused);
         assert_eq!(
             store2
                 .get_events("approve:r")
@@ -176,17 +165,24 @@ fn base_dir(tag: &str) -> PathBuf {
             "进程 B 不能重复 append SignalAwaited"
         );
 
-        // **两步是必需的**：t2 的 drive 已经 spawn 出去了、正挂在审批等待点上；
-        // 这里必须从外部投递才能唤醒它。一步写法（`opts.approval(...)`）要求
-        // 载荷在 drive **开始前**就给出，而这个测试刻意验证「进程 B 挂起 →
-        // 外部决定」的时序，所以保持两步。
-        //
-        // 用 core 的 `checkpoint` + `append` 语义：投递即追加一条
-        // ApprovalResolved，下一次 drive 重放时读到它。
-        aa_workflow_core::deliver_approval(store2.as_ref(), "approve:r", "review", true, None)
-            .map(|_| ())
-            .unwrap();
-        let (out, store2b) = t2.await.unwrap().unwrap();
+        // 进程 B 的第二次 drive：审批载荷随它一起给。
+        let store2b = store2.clone();
+        let out = drive(
+            &wf,
+            store2,
+            serde_json::json!({}),
+            DriveOpts {
+                run_id: Some("approve:r"),
+                approval: Some(ApprovalDecision {
+                    approval_id: "review".to_string(),
+                    approved: true,
+                    feedback: None,
+                }),
+                ..DriveOpts::default()
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(out.status, RunStatus::Finished);
         assert_eq!(
             out.output,
