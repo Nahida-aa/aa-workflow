@@ -43,60 +43,60 @@ fn loader(store: Arc<InMemoryStore>) -> Arc<aa_workflow_middlewares::GetEvents> 
 #[tokio::test]
 async fn redo_reuse_and_goal_park_via_dag_plan() {
     let store = Arc::new(InMemoryStore::new());
-    let exec: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let debug_exec_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
     // **一个 definition 跑多次 run**——plan 走 meta，中间件不含它。
     // 调度按图自动进行：dag_to_handler 生成 handler 函数体，用户不写 handler。
     // 常规流式写法：每个节点直接把闭包写进 .node()，无需 recording_node 之类的工厂。
-    // 闭包是 `Fn`（重试会多次调用），所以 exec 在闭包体内 clone 一份交给 async move。
+    // 闭包是 `Fn`（重试会多次调用），所以 debug_exec_log 在闭包体内 clone 一份交给 async move。
     let spec = define_dag(
         DagSpec::new("dag-pol")
             .node("load", Vec::<&str>::new(), {
-                let exec = exec.clone();
+                let debug_exec_log = debug_exec_log.clone();
                 move |_deps, _input| {
-                    let exec = exec.clone();
+                    let debug_exec_log = debug_exec_log.clone();
                     async move {
-                        exec.lock().unwrap().push("load".to_string());
+                        debug_exec_log.lock().unwrap().push("load".to_string());
                         Ok(json!({ "id": "load" }))
                     }
                 }
             })
             .node("enrich", ["load"], {
-                let exec = exec.clone();
+                let debug_exec_log = debug_exec_log.clone();
                 move |_deps, _input| {
-                    let exec = exec.clone();
+                    let debug_exec_log = debug_exec_log.clone();
                     async move {
-                        exec.lock().unwrap().push("enrich".to_string());
+                        debug_exec_log.lock().unwrap().push("enrich".to_string());
                         Ok(json!({ "id": "enrich" }))
                     }
                 }
             })
             .node("translate", ["load"], {
-                let exec = exec.clone();
+                let debug_exec_log = debug_exec_log.clone();
                 move |_deps, _input| {
-                    let exec = exec.clone();
+                    let debug_exec_log = debug_exec_log.clone();
                     async move {
-                        exec.lock().unwrap().push("translate".to_string());
+                        debug_exec_log.lock().unwrap().push("translate".to_string());
                         Ok(json!({ "id": "translate" }))
                     }
                 }
             })
             .node("merge", ["enrich", "translate"], {
-                let exec = exec.clone();
+                let debug_exec_log = debug_exec_log.clone();
                 move |_deps, _input| {
-                    let exec = exec.clone();
+                    let debug_exec_log = debug_exec_log.clone();
                     async move {
-                        exec.lock().unwrap().push("merge".to_string());
+                        debug_exec_log.lock().unwrap().push("merge".to_string());
                         Ok(json!({ "id": "merge" }))
                     }
                 }
             })
             .node("publish", ["merge"], {
-                let exec = exec.clone();
+                let debug_exec_log = debug_exec_log.clone();
                 move |_deps, _input| {
-                    let exec = exec.clone();
+                    let debug_exec_log = debug_exec_log.clone();
                     async move {
-                        exec.lock().unwrap().push("publish".to_string());
+                        debug_exec_log.lock().unwrap().push("publish".to_string());
                         Ok(json!({ "id": "publish" }))
                     }
                 }
@@ -120,7 +120,7 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
     .await
     .unwrap();
     // enrich / translate 是 fan-out，彼此先后不定；排序后比集合。
-    let mut got = exec.lock().unwrap().clone();
+    let mut got = debug_exec_log.lock().unwrap().clone();
     got.sort();
     assert_eq!(
         got,
@@ -130,7 +130,7 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
     // rev2：from=translate（重跑 translate/merge/publish），goals=[merge]
     // 期望：load/enrich 复用（不执行），translate/merge 真跑，merge 达成后泊车
     //（publish 不执行）。
-    exec.lock().unwrap().clear();
+    debug_exec_log.lock().unwrap().clear();
     let out = run_workflow(
         RunWorkflowOptions::new(wf.clone(), store.clone())
             .input(serde_json::json!({}))
@@ -149,7 +149,7 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
     .unwrap();
 
     assert_eq!(
-        exec.lock().unwrap().clone(),
+        debug_exec_log.lock().unwrap().clone(),
         vec!["translate".to_string(), "merge".to_string()],
         "load/enrich 复用、merge 达成即停、publish 不跑"
     );
@@ -185,7 +185,7 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
     );
 
     // 续驱：publish 补跑（load/enrich/translate/merge 短路）
-    exec.lock().unwrap().clear();
+    debug_exec_log.lock().unwrap().clear();
     let out3 = run_workflow(
         RunWorkflowOptions::new(wf, store.clone())
             .input(serde_json::json!({}))
@@ -196,7 +196,7 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
     .unwrap();
     assert_eq!(format!("{:?}", out3.status), "Finished");
     assert_eq!(
-        exec.lock().unwrap().clone(),
+        debug_exec_log.lock().unwrap().clone(),
         vec!["publish".to_string()],
         "续驱只补跑 publish"
     );
@@ -205,17 +205,17 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
 #[tokio::test]
 async fn no_plan_means_no_behavior() {
     let store = Arc::new(InMemoryStore::new());
-    let exec: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let debug_exec_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
     let wf = create_workflow(CreateWorkflowConfig::new("no-plan").input::<serde_json::Value>())
         .middleware([dag_policies(shape(), loader(store.clone()))])
         .handler({
-            let exec = exec.clone();
+            let debug_exec_log = debug_exec_log.clone();
             move |ctx: WorkflowCtx| {
-                let exec = exec.clone();
+                let debug_exec_log = debug_exec_log.clone();
                 async move {
                     ctx.step("a", move |_sc: StepCtx| async move {
-                        exec.lock().unwrap().push("a".to_string());
+                        debug_exec_log.lock().unwrap().push("a".to_string());
                         Ok(serde_json::json!(1))
                     })
                     .await?;
@@ -233,5 +233,5 @@ async fn no_plan_means_no_behavior() {
     .await
     .unwrap();
     assert_eq!(format!("{:?}", out.status), "Finished", "无 plan = 无行为");
-    assert_eq!(exec.lock().unwrap().len(), 1);
+    assert_eq!(debug_exec_log.lock().unwrap().len(), 1);
 }
