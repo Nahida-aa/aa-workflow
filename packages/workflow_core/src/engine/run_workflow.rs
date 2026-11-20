@@ -768,11 +768,11 @@ fn append_seed(
     let events = store.get_events(run_id)?;
 
     if let Some(d) = signal_delivery {
-        let waiting_ok = waiting.is_some_and(|w| {
-            w.signal_name == d.name
-                && d.step_id
-                    .as_ref()
-                    .is_none_or(|sid| w.step_id.as_deref() == Some(sid.as_str()))
+        // 给了 step_id 就按它认——那时 name 无关（`signal_run` 的调用方不知道
+        // 信号名，由下面的日志扫描取）。没给才按 name 比。
+        let waiting_ok = waiting.is_some_and(|w| match &d.step_id {
+            Some(sid) => w.step_id.as_deref() == Some(sid.as_str()),
+            None => w.signal_name == d.name,
         });
         if !waiting_ok {
             return Ok(DeliveryOutcome::NotWaiting);

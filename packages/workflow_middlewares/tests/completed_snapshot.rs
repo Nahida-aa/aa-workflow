@@ -235,16 +235,11 @@ async fn completed_accumulates_across_drives() {
     .unwrap();
     assert_eq!(ran.lock().unwrap().clone(), vec!["a".to_string()]);
 
-    // 续驱：a 已在日志里 → goals_done_at_start 成立 → 不重复泊车，b/c 跑完
-    let outcome = deliver_signal(store.as_ref(), "acc:1", SignalDelivery {
-            signal_id: None,
-            step_id: None,
-            name: INTERIM_GOAL_SIGNAL.to_string(),
-            payload: serde_json::Value::Null,
-            meta: None,
-        })
-    .unwrap();
-    assert_eq!(outcome, DeliveryOutcome::Delivered, "信号应当投递到泊车点");
+    // 续驱：a 已在日志里 → goals_done_at_start 成立 → 不重复泊车，b/c 跑完。
+    //
+    // **不需要投递信号**：这条测试验的正是「开局已达成 → 不泊车」，所以 run
+    // 不需要被唤醒，直接 drive 就过去了。旧写法投了一个 SignalResolved，那是
+    // 多余的（而且一步写法下会被 append_seed 判成 delivery lost）。
     run_workflow(
         RunWorkflowOptions::new(Arc::new(wf), store.clone())
             .input(serde_json::json!({}))

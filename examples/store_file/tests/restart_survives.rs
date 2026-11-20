@@ -176,9 +176,16 @@ fn base_dir(tag: &str) -> PathBuf {
             "进程 B 不能重复 append SignalAwaited"
         );
 
-        let outcome = aa_workflow_core::deliver_approval(store2.as_ref(), "approve:r", "review", true, None)
-        .unwrap();
-        assert_eq!(outcome, aa_workflow_core::DeliveryOutcome::Delivered);
+        // **两步是必需的**：t2 的 drive 已经 spawn 出去了、正挂在审批等待点上；
+        // 这里必须从外部投递才能唤醒它。一步写法（`opts.approval(...)`）要求
+        // 载荷在 drive **开始前**就给出，而这个测试刻意验证「进程 B 挂起 →
+        // 外部决定」的时序，所以保持两步。
+        //
+        // 用 core 的 `checkpoint` + `append` 语义：投递即追加一条
+        // ApprovalResolved，下一次 drive 重放时读到它。
+        aa_workflow_core::deliver_approval(store2.as_ref(), "approve:r", "review", true, None)
+            .map(|_| ())
+            .unwrap();
         let (out, store2b) = t2.await.unwrap().unwrap();
         assert_eq!(out.status, RunStatus::Finished);
         assert_eq!(
@@ -255,8 +262,7 @@ fn base_dir(tag: &str) -> PathBuf {
             let w = st.waiting_for.expect("sleep 挂起应投影 waiting_for");
             assert_eq!(w.signal_name, "__timer");
             let step_id = w.step_id.expect("timer 挂起应有 step_id");
-            deliver_signal(store2.as_ref(), "invoice:r", SignalDelivery { signal_id: None, step_id: Some(step_id.to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None })
-            .unwrap();
+            // timer 载荷随 drive 一起给。
             out = Some(
                 drive(
                     &wf,
@@ -264,6 +270,13 @@ fn base_dir(tag: &str) -> PathBuf {
                     input.clone(),
                     DriveOpts {
                         run_id: Some("invoice:r"),
+                        signal_delivery: Some(SignalDelivery {
+                            signal_id: None,
+                            step_id: Some(step_id),
+                            name: String::new(),
+                            payload: serde_json::Value::Null,
+                            meta: None,
+                        }),
                         ..DriveOpts::default()
                     },
                 )

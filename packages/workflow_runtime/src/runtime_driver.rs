@@ -542,6 +542,8 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
             yield_resume_at: Some(now + 1),
             include_events: args.include_events,
             max_events: args.max_events,
+            signal_delivery: None,
+            approval: None,
         })
         .await
     }
@@ -607,6 +609,13 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
                         yield_resume_at: Some(now + 1),
                         include_events: args.include_events,
                         max_events: args.max_events,
+                        // **不带 signal_delivery**：这个信号已经进收件箱，
+                        // 由等待点的 `consume_buffered_signal` 取走并落事件。
+                        // 若这里再传，core 的 `append_seed` 会多写一条重复的
+                        // `SignalResolved`（测试 `early_signal_is_buffered_...`
+                        // 就是这样抓到两条 `first` 的）。
+                        signal_delivery: None,
+                        approval: None,
                     })
                     .await;
             }
@@ -655,19 +664,9 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
             now,
         })?;
 
-        // 桥给 core：deliver_signal 按 pause 点的 name 追加 SignalResolved，
-        // 并把投递的 signal_id 一并记进事件（上游幂等令牌）。
-        let run_store = create_run_store_adapter(Arc::clone(&self.config.store));
         match &delivered {
             DeliverSignalResult::Delivered { run } => {
                 let workflow_id = run.workflow_id.clone();
-                aa_workflow_core::deliver_signal(run_store.as_ref(), &args.run_id, aa_workflow_core::SignalDelivery {
-                        signal_id: Some(args.signal_id.clone()),
-                        step_id: None,
-                        name: args.name.clone(),
-                        payload: args.payload.clone(),
-                        meta: args.meta.clone(),
-                    })?;
                 let workflow = self.load_workflow(&workflow_id)?;
                 return self
                     .drive_claimed_run(DriveArgs {
@@ -689,6 +688,15 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
                         yield_resume_at: Some(now + 1),
                         include_events: args.include_events,
                         max_events: args.max_events,
+                        // 载荷随 drive 给，core 在 appendSeed 里落事件。
+                        signal_delivery: Some(aa_workflow_core::SignalDelivery {
+                            signal_id: Some(args.signal_id.clone()),
+                            step_id: args.step_id.clone(),
+                            name: args.name.clone(),
+                            payload: args.payload.clone(),
+                            meta: args.meta.clone(),
+                        }),
+                        approval: None,
                     })
                     .await;
             }
@@ -769,11 +777,8 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
             }
         };
 
-        let run_store = create_run_store_adapter(Arc::clone(&self.config.store));
-        // 我们的 core：approve 的 pause key 即 approval_id。产出
-        // `ApprovalResolved`（对齐上游 `APPROVAL_RESOLVED`，无 payload）。
-        aa_workflow_core::deliver_approval(run_store.as_ref(), &args.run_id, &args.approval.approval_id, args.approval.approved, args.approval.feedback.as_deref())?;
-
+        // 载荷随 drive 给（上游 `driveClaimedRun({ approval })`）：
+        // core 的 `append_seed` 会落 `APPROVAL_RESOLVED`（无 payload，对齐上游）。
         let workflow = self.load_workflow(&workflow_id)?;
         // 同 `deliver_signal`：resume 必须带持久化的 input。
         let input = self
@@ -797,6 +802,12 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
             yield_resume_at: Some(now + 1),
             include_events: args.include_events,
             max_events: args.max_events,
+            signal_delivery: None,
+            approval: Some(aa_workflow_core::ApprovalDecision {
+                approval_id: args.approval.approval_id.clone(),
+                approved: args.approval.approved,
+                feedback: args.approval.feedback.clone(),
+            }),
         })
         .await
     }
@@ -869,6 +880,8 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
                     yield_resume_at: Some(now + 1),
                     include_events: args.include_events,
                     max_events: args.max_events,
+                    signal_delivery: None,
+                    approval: None,
                 })
                 .await?,
             );
@@ -1094,6 +1107,15 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
         // 所以 threadId 只要在这一处转发就够（上游三个 args 各带一个，
         // runtime-driver.ts:115/182/248 同样都往 driveClaimedRun 传）。
         opts = opts.thread_id(args.thread_id.clone());
+        // 投递载荷随 drive 一起给——上游 `driveClaimedRun({ signalDelivery })`
+        // → `runWorkflow({ signalDelivery })` → `appendSeed`。core 在重放
+        // handler 之前把它落成 `SIGNAL_RESOLVED`，runtime 不再自己写日志。
+        if let Some(d) = args.signal_delivery.clone() {
+            opts = opts.signal_delivery(d);
+        }
+        if let Some(a) = args.approval.clone() {
+            opts = opts.approval(a);
+        }
         opts = opts.publish(Some(publish));
         let drive_result = run_workflow(opts).outcome().await;
 
@@ -1185,6 +1207,13 @@ struct DriveArgs<'a> {
     yield_resume_at: Option<i64>,
     include_events: Option<bool>,
     max_events: Option<usize>,
+    /// 随本次 drive 投递的信号（上游 `driveClaimedRun` 的 `signalDelivery`）。
+    ///
+    /// 不在这里直接写日志：交给 core 的 `run_workflow`——它知道
+    /// `SIGNAL_AWAITED` 与 `SIGNAL_RESOLVED` 的配对规则（上游 `appendSeed`）。
+    signal_delivery: Option<aa_workflow_core::SignalDelivery>,
+    /// 随本次 drive 投递的审批决定。
+    approval: Option<aa_workflow_core::ApprovalDecision>,
 }
 
 /// 每次调用建一个新 adapter（轻量 struct + Arc，与上游每次 drive 建一次一致）。

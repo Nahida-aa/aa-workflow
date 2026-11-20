@@ -24,6 +24,10 @@ pub struct DriveOpts<'a> {
     pub run_id: Option<&'a str>,
     /// 事件订阅者；`None` 则不订阅。
     pub publish: Option<EventSubscriberFn>,
+    /// 随本次 drive 投递的信号载荷（`RunWorkflowOptions::signal_delivery`）。
+    pub signal_delivery: Option<aa_workflow_core::SignalDelivery>,
+    /// 随本次 drive 投递的审批决定。
+    pub approval: Option<aa_workflow_core::ApprovalDecision>,
 }
 
 impl DriveOpts<'_> {
@@ -38,6 +42,12 @@ impl DriveOpts<'_> {
         let mut ro = RunWorkflowOptions::new(workflow, store).input(input);
         if let Some(id) = self.run_id {
             ro = ro.run_id(id);
+        }
+        if let Some(d) = self.signal_delivery.clone() {
+            ro = ro.signal_delivery(d);
+        }
+        if let Some(a) = self.approval.clone() {
+            ro = ro.approval(a);
         }
         ro.publish(self.publish.clone())
     }

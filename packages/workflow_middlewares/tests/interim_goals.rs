@@ -82,23 +82,11 @@ async fn parks_at_the_goal_step_and_does_not_run_later_steps() {
     });
     assert!(has_await, "应有 __interim-goal 的 SignalAwaited");
 
-    // 续驱 → 跑完 c，且 a/b 不重跑
+    // 续驱 → 跑完 c，且 a/b 不重跑。
     //
-    // 断言投递结果是 Delivered 而不是只看 unwrap：unwrap 只证明「没报错」，
-    // 而 NotWaiting 也是 Ok——那说明根本没投出去，后面就该停在 Paused。
-    let outcome = deliver_signal(
-        store.as_ref(),
-        "g:1",
-        SignalDelivery {
-            signal_id: None,
-            step_id: None,
-            name: INTERIM_GOAL_SIGNAL.to_string(),
-            payload: serde_json::Value::Null,
-            meta: None,
-        },
-    )
-    .unwrap();
-    assert_eq!(outcome, DeliveryOutcome::Delivered, "信号应当投递到泊车点");
+    // **不需要投递信号**：目标 `b` 已在日志里 → `goals_done_at_start` 成立 →
+    // 本 drive 不再泊车，直接跑到结束。旧写法投的那条 SignalResolved 是多余的
+    // （一步写法下 `append_seed` 会判它 delivery lost）。
     let out2 = run_workflow(
         RunWorkflowOptions::new(Arc::new(wf), store.clone())
             .input(serde_json::json!({}))
