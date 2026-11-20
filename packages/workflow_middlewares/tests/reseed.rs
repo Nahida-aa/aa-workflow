@@ -39,40 +39,37 @@ fn loader(
     }
 }
 
+/// 造一个挂了 `reseed` 的 workflow。**同一个定义跑多次 run**——
+/// plan 由每次 run 的 `meta` 决定，不给就不播种。
 fn make_wf(
     exec: Arc<Mutex<Vec<String>>>,
-    mw: Option<aa_workflow_core::middleware::Middleware>,
-) -> impl Fn() -> aa_workflow_core::define::WorkflowDefinition<serde_json::Value, serde_json::Value, serde_json::Value>
-+ Clone {
-    move || {
-        let exec = exec.clone();
-        let mut builder =
-            create_workflow(CreateWorkflowConfig::new("redo").input::<serde_json::Value>());
-        if let Some(m) = mw.clone() {
-            builder = builder.middleware([m]);
-        }
-        builder.handler(
-            move |ctx: WorkflowCtx| {
-                let exec = exec.clone();
-                async move {
-                    for id in ["a", "b", "c"] {
+    mw: aa_workflow_core::middleware::Middleware,
+) -> aa_workflow_core::define::WorkflowDefinition<
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+> {
+    create_workflow(CreateWorkflowConfig::new("redo").input::<serde_json::Value>())
+        .middleware([mw])
+        .handler(move |ctx: WorkflowCtx| {
+            let exec = exec.clone();
+            async move {
+                for id in ["a", "b", "c"] {
+                    let exec = exec.clone();
+                    let sid = id.to_string();
+                    ctx.step(id, move |_sc: StepCtx| {
                         let exec = exec.clone();
-                        let sid = id.to_string();
-                        ctx.step(id, move |_sc: StepCtx| {
-                            let exec = exec.clone();
-                            let sid = sid.clone();
-                            async move {
-                                exec.lock().unwrap().push(sid.clone());
-                                Ok(serde_json::json!({ "id": sid }))
-                            }
-                        })
-                        .await?;
-                    }
-                    Ok(serde_json::json!({ "ok": true }))
+                        let sid = sid.clone();
+                        async move {
+                            exec.lock().unwrap().push(sid.clone());
+                            Ok(serde_json::json!({ "id": sid }))
+                        }
+                    })
+                    .await?;
                 }
-            },
-        )
-    }
+                Ok(serde_json::json!({ "ok": true }))
+            }
+        })
 }
 
 #[tokio::test]
@@ -80,10 +77,13 @@ async fn redo_reuses_steps_outside_redo_set() {
     let store = Arc::new(InMemoryStore::new());
     let exec = Arc::new(Mutex::new(Vec::new()));
 
-    // rev1：全跑
-    let wf1 = make_wf(exec.clone(), None)();
+    // **一个 workflow 定义跑两次 run**——这才是 redo 的真实形态。
+    // 中间件挂在上面（挂一次），plan 走 meta（每次 run 各自给）。
+    let wf = Arc::new(make_wf(exec.clone(), reseed(loader(store.clone()))));
+
+    // rev1：不给 plan → 中间件不装层 → 全跑
     run_workflow(
-        RunWorkflowOptions::new(Arc::new(wf1), store.clone())
+        RunWorkflowOptions::new(wf.clone(), store.clone())
             .input(serde_json::json!({}))
             .run_id("rev1"),
     )
@@ -95,14 +95,10 @@ async fn redo_reuses_steps_outside_redo_set() {
         vec!["a".to_string(), "b".to_string(), "c".to_string()]
     );
 
-    // rev2：只重跑 c，a/b 复用
+    // rev2：给 plan → 只重跑 c，a/b 复用
     exec.lock().unwrap().clear();
-    let wf2 = make_wf(
-        exec.clone(),
-        Some(reseed(loader(store.clone()))),
-    )();
     let out = run_workflow(
-        RunWorkflowOptions::new(Arc::new(wf2), store.clone())
+        RunWorkflowOptions::new(wf, store.clone())
             .input(serde_json::json!({}))
             .meta(reseed_meta(ReseedPlan {
                 source_run_id: "rev1".into(),
@@ -172,9 +168,12 @@ async fn redo_with_empty_redo_set_reuses_everything() {
     let store = Arc::new(InMemoryStore::new());
     let exec = Arc::new(Mutex::new(Vec::new()));
 
-    let wf1 = make_wf(exec.clone(), None)();
+    // 一个 workflow 定义跑两次 run（同上一个测试）。
+    let wf = Arc::new(make_wf(exec.clone(), reseed(loader(store.clone()))));
+
+    // s1：不给 plan → 全跑
     run_workflow(
-        RunWorkflowOptions::new(Arc::new(wf1), store.clone())
+        RunWorkflowOptions::new(wf.clone(), store.clone())
             .input(serde_json::json!({}))
             .run_id("s1"),
     )
@@ -182,13 +181,10 @@ async fn redo_with_empty_redo_set_reuses_everything() {
     .await
     .unwrap();
 
+    // s2：空 redoSet → 全部复用
     exec.lock().unwrap().clear();
-    let wf2 = make_wf(
-        exec.clone(),
-        Some(reseed(loader(store.clone()))),
-    )();
     let out = run_workflow(
-        RunWorkflowOptions::new(Arc::new(wf2), store.clone())
+        RunWorkflowOptions::new(wf, store.clone())
             .input(serde_json::json!({}))
             .meta(reseed_meta(ReseedPlan {
                 source_run_id: "s1".into(),
