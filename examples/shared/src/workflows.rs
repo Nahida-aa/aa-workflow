@@ -27,7 +27,7 @@
 //!   （与 TanStack 0.0.4 一致）。
 
 use std::time::Duration;
-use aa_workflow_core::{AnyWorkflowDefinition, Backoff, BaseCtx, CreateWorkflowConfig, RetryPolicy, SignalDelivery, StepCtx, StepOptions, WorkflowCtx, WorkflowDefinition, create_workflow};
+use aa_workflow_core::{AnyWorkflowDefinition, ApprovalDecision, Backoff, BaseCtx, CreateWorkflowConfig, RetryPolicy, SignalDelivery, StepCtx, StepOptions, WorkflowCtx, WorkflowDefinition, create_workflow};
 
 // ========================================================================
 // 输入类型 = workflow 的「schema」（Rust 版 zod `inputSchema`）：serde
@@ -726,12 +726,14 @@ mod tests {
             .run_id
             .clone()
             .expect("测试应显式指定 run_id");
-        // 按挂起类型分派：审批走 deliver_approval（结构化决定，无 payload），
-        // 信号走 deliver_signal。两条路都过闸——没泊在该 step 上就报错。
+        // 按挂起类型分派：审批是结构化决定（无 payload），信号有 payload。
+        // 载荷**随 drive 一起给**（`approval` / `signal_delivery`），引擎在重放
+        // handler 之前把它落成事件——与 runtime 的投递路径同形。
         let is_approval = store.get_events(&run_id).unwrap().iter().any(|e| {
             matches!(e, WorkflowEvent::ApprovalRequested { step_id: id, .. } if id == step_id)
         });
-        if is_approval {
+        let options = opts(wf.clone().into(), store.clone());
+        let options = if is_approval {
             // 测试 payload 用 \`ok\` 表示批准与否；也认对齐后的 \`approved\`。
             let approved = payload
                 .get("approved")
@@ -742,14 +744,27 @@ mod tests {
                 .get("feedback")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
-            deliver_approval(store.as_ref(), &run_id, step_id, approved, feedback.as_deref())
-            .unwrap();
+            options.approval(ApprovalDecision {
+                approval_id: step_id.to_string(),
+                approved,
+                feedback,
+            })
         } else {
-            deliver_signal(store.as_ref(), &run_id, SignalDelivery { signal_id: None, step_id: Some(step_id.to_string()), name: String::new(), payload: payload, meta: None }).unwrap();
-        }
-        run_workflow(opts(wf.clone().into(), store.clone()))
-            .outcome().await
-            .unwrap()
+            options.signal_delivery(SignalDelivery {
+                signal_id: None,
+                step_id: Some(step_id.to_string()),
+                name: String::new(),
+                payload,
+                meta: None,
+            })
+        };
+        run_workflow(options).outcome().await.unwrap()
+    }
+
+    /// 一次投递载荷：信号或审批。`drive_through_timers` 的首次 drive 用。
+    enum FirstDelivery {
+        Signal(SignalDelivery),
+        Approval(ApprovalDecision),
     }
 
     /// 反复 drive，替**计时器**投递（睡到 `deadline` 再投），直到 run 不再挂在
@@ -757,19 +772,30 @@ mod tests {
     /// 是为了让示例测试不必手写「等 sleep → 投递 → 再 drive」的循环。
     ///
     /// 非 timer 的挂起（approve / wait_for_event）原样返回，由调用方投递。
+    ///
+    /// `first` 是**第一次 drive** 要带的载荷（调用方手里那个非 timer 的等待点）。
+    /// 之后的轮次只投 `__timer`——载荷逐轮换，不能一直带同一个（run 已经在等
+    /// 别的，会被判 delivery lost）。
     async fn drive_through_timers<TInput, TOutput, TState>(
         store: &Arc<dyn RunStore>,
         wf: &WorkflowDefinition<TInput, TOutput, TState>,
         opts: impl Fn(AnyWorkflowDefinition, Arc<dyn RunStore>) -> RunWorkflowOptions,
+        first: Option<FirstDelivery>,
     ) -> aa_workflow_core::RunOutcome {
+        let mut pending = first;
         loop {
             let run_id = opts(wf.clone().into(), store.clone())
                 .run_id
                 .clone()
                 .expect("测试应显式指定 run_id");
-            let out = run_workflow(opts(wf.clone().into(), store.clone()))
-                .outcome().await
-                .unwrap();
+            // 上一轮 timer 到点时攒下的载荷在这里交给 drive。
+            let mut options = opts(wf.clone().into(), store.clone());
+            match pending.take() {
+                Some(FirstDelivery::Signal(d)) => options = options.signal_delivery(d),
+                Some(FirstDelivery::Approval(a)) => options = options.approval(a),
+                None => {}
+            }
+            let out = run_workflow(options).outcome().await.unwrap();
             if out.status != RunStatus::Paused {
                 return out;
             }
@@ -788,8 +814,20 @@ mod tests {
             {
                 tokio::time::sleep(Duration::from_millis((due - now_ms()) as u64)).await;
             }
-            deliver_signal(store.as_ref(), &run_id, SignalDelivery { signal_id: None, step_id: Some(w.step_id.as_deref().expect("timer 挂起应有 step_id").to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None })
-            .unwrap();
+            // timer 到点：攒进 pending，下一轮 drive 带上（引擎落成
+            // SignalResolved，停在 `__timer` 上的等待点就放行）。
+            pending = Some(FirstDelivery::Signal(SignalDelivery {
+                signal_id: None,
+                step_id: Some(
+                    w.step_id
+                        .as_deref()
+                        .expect("timer 挂起应有 step_id")
+                        .to_string(),
+                ),
+                name: String::new(),
+                payload: serde_json::Value::Null,
+                meta: None,
+            }));
         }
     }
 
@@ -893,7 +931,7 @@ mod tests {
                 .run_id("fulfill:p")
         };
 
-        let out = drive_through_timers(&store, &wf, opts).await;
+        let out = drive_through_timers(&store, &wf, opts, None).await;
         assert_eq!(out.status, RunStatus::Paused, "应停在 payment 等审批");
         let out = drive_after_signal(
             &store,
@@ -985,10 +1023,16 @@ mod tests {
     async fn invoice_double_sleep_resumes_per_delivery() {
         let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
         let wf = invoice();
-        let out = drive_through_timers(&store, &wf, |wf: AnyWorkflowDefinition, store: Arc<dyn RunStore>| {
-            RunWorkflowOptions::new(wf, store).input(serde_json::json!({ "orderId": "i-1", "t1": 10, "t2": 25 }))
-                .run_id("invoice:r")
-        })
+        let out = drive_through_timers(
+            &store,
+            &wf,
+            |wf: AnyWorkflowDefinition, store: Arc<dyn RunStore>| {
+                RunWorkflowOptions::new(wf, store)
+                    .input(serde_json::json!({ "orderId": "i-1", "t1": 10, "t2": 25 }))
+                    .run_id("invoice:r")
+            },
+            None,
+        )
         .await;
         assert_eq!(out.status, RunStatus::Finished);
         assert_eq!(out.output.unwrap()["settled"], true);
@@ -1115,10 +1159,20 @@ mod tests {
         // 此刻泊在 `refund-wait`（sleep）上——审批还没轮到，**不能提前投**
         // （core 的 deliver_approval 过闸：没泊在该审批上就报错）。先把 timer
         // 驱动到泊上 `refund-policy`。
-        let out = drive_through_timers(&store, &wf, opts).await;
+        let out = drive_through_timers(&store, &wf, opts, None).await;
         assert_eq!(out.status, RunStatus::Paused, "timer 后应泊在 refund-policy");
-        deliver_approval(store.as_ref(), "refund:q", "refund-policy", true, None).unwrap();
-        let out = drive_through_timers(&store, &wf, opts).await;
+        // 审批载荷随这一次 drive 给。
+        let out = drive_through_timers(
+            &store,
+            &wf,
+            opts,
+            Some(FirstDelivery::Approval(ApprovalDecision {
+                approval_id: "refund-policy".to_string(),
+                approved: true,
+                feedback: None,
+            })),
+        )
+        .await;
         assert_eq!(out.status, RunStatus::Finished);
         assert_eq!(out.output.clone().unwrap()["status"], "refunded");
 
@@ -1436,10 +1490,14 @@ mod tests {
 
         // 进程 B：同 run_id 重跑 → state 从 initialize 重建为 5，`bump-inside`
         // 已被 checkpoint 记录 → 闭包跳过（+1 丢失），只剩闭包之外的 mutation。
-        deliver_approval(store.as_ref(), "state:edge", "gate", true, None).unwrap();
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({ "amount": 5 }))
+                .approval(ApprovalDecision {
+                    approval_id: "gate".to_string(),
+                    approved: true,
+                    feedback: None,
+                })
                 .run_id("state:edge"),
         )
         .outcome().await
@@ -1491,10 +1549,21 @@ mod tests {
         assert_eq!(w.signal_name, "price-settled");
         assert!(st.pending_approval.is_none());
 
-        deliver_signal(store.as_ref(), "event:gate", SignalDelivery { signal_id: None, step_id: None, name: "price-settled".to_string(), payload: serde_json::json!({ "px": 62000 }), meta: None })
-        .unwrap();
-        // Drive #2 起：`sleep_until(0)` 会挂起，由 timer 投递推进。
-        let out = drive_through_timers(&store, &wf, opts).await;
+        // Drive #2 起：信号载荷随首次 drive 给；`sleep_until(0)` 会挂起，
+        // 之后由 timer 投递推进。
+        let out = drive_through_timers(
+            &store,
+            &wf,
+            opts,
+            Some(FirstDelivery::Signal(SignalDelivery {
+                signal_id: None,
+                step_id: None,
+                name: "price-settled".to_string(),
+                payload: serde_json::json!({ "px": 62000 }),
+                meta: None,
+            })),
+        )
+        .await;
         assert_eq!(out.status, RunStatus::Finished);
         assert_eq!(
             out.output.clone().unwrap()["settlement"],
@@ -1531,10 +1600,20 @@ mod tests {
         };
         assert_eq!(drive_to_pause(&store, &wf, opts).await, RunStatus::Paused);
 
-        deliver_signal(store.as_ref(), "event:crash", SignalDelivery { signal_id: None, step_id: None, name: "price-settled".to_string(), payload: serde_json::json!({ "px": 3000 }), meta: None })
-        .unwrap();
-        // `sleep_until(0)` 也会挂起，由 timer 投递推进。
-        let out = drive_through_timers(&store, &wf, opts).await;
+        // 信号载荷随首次 drive 给；`sleep_until(0)` 也会挂起，之后由 timer 推进。
+        let out = drive_through_timers(
+            &store,
+            &wf,
+            opts,
+            Some(FirstDelivery::Signal(SignalDelivery {
+                signal_id: None,
+                step_id: None,
+                name: "price-settled".to_string(),
+                payload: serde_json::json!({ "px": 3000 }),
+                meta: None,
+            })),
+        )
+        .await;
         assert_eq!(out.status, RunStatus::Finished);
         assert_eq!(
             out.output.clone().unwrap()["settlement"],

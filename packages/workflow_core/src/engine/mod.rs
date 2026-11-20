@@ -17,7 +17,7 @@ use crate::define::AnyWorkflowDefinition;
 use crate::error::{RunError, StoreError, WorkflowError};
 use crate::event::{RunStatus, StepAttempt, WorkflowEvent};
 use crate::resource::Gate;
-use crate::run_store::{DeliveryOutcome, RunStore, SignalDelivery};
+use crate::run_store::{ApprovalDecision, DeliveryOutcome, RunStore, SignalDelivery};
 
 mod run_workflow;
 pub mod state_diff;
@@ -1526,9 +1526,23 @@ fn project_run_wait(store: &Arc<dyn RunStore>, run_id: &str, kind: WaitKind) {
 /// `WorkflowExecutionStore` 上（`types.ts:340`），`workflow-core` 的 `RunStore`
 /// 只有 `appendEvent` / `getEvents`——core 根本不知道「信号」为何物。
 ///
-/// 本仓之所以需要它：engine 的重放短路靠扫日志找 `SignalResolved`
-/// （[`find_resume`]），所以**信号必须在 drive 之前就落进日志**；上游则把这个
-/// 动作放在 store 的 `deliverSignal` 内部（它改 run 状态，事件由引擎 drive 时写）。
+/// ## 什么时候用它，什么时候别用
+///
+/// **首选** [`RunWorkflowOptions::signal_delivery`]：载荷随 drive 一起给，
+/// 引擎在 `append_seed` 里定位等待点、去重、落事件。那是上游的形状
+/// （`runWorkflow({ signalDelivery })`），也是 runtime 的
+/// `deliver_signal` 内部的走法。
+///
+/// 本函数只在两种场景需要：
+///
+/// 1. **run 已经 spawn 出去、正挂在等待点上**——此时没有「下一次 drive」可以
+///    挂载荷，只能从外部把事件写进日志把它唤醒（见 `restart_survives` 的
+///    跨进程测试）。
+/// 2. **要检查四态返回值本身**（`NotWaiting` / `NotFound`）。
+///    走 `signal_delivery` 时「没在等」会变成 `RUN_ERRORED`——那是引擎该有的
+///    反应，但测不到返回值。
+///
+/// 也就是说：它是**直接写日志的工具**，不是投递的主路径。
 ///
 /// 一个函数覆盖上游那种定位方式的两种取值：
 ///
@@ -1595,7 +1609,10 @@ pub fn deliver_signal(
 
 /// 投递一个审批决定。
 ///
-/// 同 [`deliver_signal`]：本仓独有（上游在 runtime 层的 `deliverApproval`）。
+/// 同 [`deliver_signal`]：本仓独有（上游在 runtime 层的 `deliverApproval`），
+/// 且**同样不是主路径**——首选 [`RunWorkflowOptions::approval`]。只有
+/// 「run 已 spawn 出去、正挂在审批上」时才需要从外部写日志唤醒它。
+///
 /// 审批是**结构化决定**（`approved` + `feedback`），没有 payload——事件形状
 /// 逐字对齐上游 `APPROVAL_RESOLVED`。
 pub fn deliver_approval(
@@ -2492,13 +2509,16 @@ mod tests {
         assert!(st.waiting_for.is_none());
         assert!(decided.lock().unwrap().is_none(), "挂起时 handler 未继续");
 
-        // 外部投递（这是 runtime 的 `deliver_approval` 做的事）。
-        deliver_approval(store.as_ref(), "r1", "release", true, None).unwrap();
-
-        // Drive #2 —— 从日志短路 `charge`，pause 有 resume 直接放行。
+        // 外部投递：载荷随 Drive #2 一起给（上游 `approval` 选项）。
+        // Drive #2 会从日志短路 `charge`，pause 有 resume 直接放行。
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
+                .approval(ApprovalDecision {
+                    approval_id: "release".to_string(),
+                    approved: true,
+                    feedback: None,
+                })
             .run_id("r1"),
         )
         .outcome().await
@@ -2538,9 +2558,13 @@ mod tests {
         )));
     }
 
-    /// `deliver_signal` **过闸**（对齐上游默认 `not-waiting`）：没泊在信号上就
-    /// 拒绝，不静默写日志。早到信号由 runtime 的可选收件箱承接
+    /// 投递**过闸**（对齐上游默认 `not-waiting`）：没泊在信号上就拒绝，
+    /// 不静默写日志。早到信号由 runtime 的可选收件箱承接
     /// （`buffer_signal` + `buffer_signals`），不是靠 core 无条件 append。
+    ///
+    /// 这里直接调 `deliver_signal` 而不是走 `run_workflow` 的 `signal_delivery`：
+    /// 后者会把「没在等」变成 `RUN_ERRORED`（引擎该有的反应），而本测试要的是
+    /// 四态里的 `NotWaiting` 这个**返回值**。
     #[test]
     fn deliver_signal_reports_not_waiting_when_nothing_is_parked() {
         let store = InMemoryStore::new();
@@ -2699,6 +2723,9 @@ mod tests {
             "replay must not re-append the pause checkpoint"
         );
 
+        // **两步是必需的**：`t2` 的 drive 已 spawn 出去、正挂在审批等待点上，
+        // 只能从外部投递唤醒它。一步写法（`opts.approval(..)`）要求载荷在
+        // drive 开始前给出，与本测试要验的「进程 B 挂起 → 外部决定」时序不符。
         deliver_approval(store.as_ref(), "r2", "release", true, None).unwrap();
         let out = t2.await.unwrap().unwrap();
         assert_eq!(out.status, RunStatus::Finished);
@@ -2769,13 +2796,18 @@ mod tests {
         assert_eq!(w.signal_name, "__timer", "sleep 的通道是内部 __timer");
         assert!(w.deadline.is_some(), "sleep 的 due_at 应投影为 deadline");
 
-        // 外部投递（runtime sweep 在 deadline 到点后做的事）。
-        deliver_signal(store.as_ref(), "s1", SignalDelivery { signal_id: None, step_id: Some("cooldown".to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None }).unwrap();
-
-        // Drive #2：放行。
+        // Drive #2：放行。载荷随 drive 给（runtime sweep 在 deadline 到点后
+        // 做的事，也是同一种形状）。
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
+                .signal_delivery(SignalDelivery {
+                    signal_id: None,
+                    step_id: Some("cooldown".to_string()),
+                    name: String::new(),
+                    payload: serde_json::Value::Null,
+                    meta: None,
+                })
             .run_id("s1"),
         )
         .outcome().await
@@ -2822,10 +2854,14 @@ mod tests {
         .outcome().await
         .unwrap();
         assert_eq!(out.status, RunStatus::Paused);
-        deliver_approval(store.as_ref(), "r3", "gate", true, None).unwrap();
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
+                .approval(ApprovalDecision {
+                    approval_id: "gate".to_string(),
+                    approved: true,
+                    feedback: None,
+                })
             .run_id("r3"),
         )
         .outcome().await
@@ -2898,12 +2934,17 @@ mod tests {
         assert_eq!(w.step_id.as_deref(), Some("review"));
         assert!(st.pending_approval.is_none(), "named event 不是 approval");
 
-        // 外部投递 → Drive #2 放行。
-        deliver_signal(store.as_ref(), "ne1", SignalDelivery { signal_id: None, step_id: None, name: "review-approved".to_string(), payload: serde_json::json!({ "ok": true }), meta: None })
-        .unwrap();
+        // Drive #2 放行——载荷随 drive 给。
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
+                .signal_delivery(SignalDelivery {
+                    signal_id: None,
+                    step_id: None,
+                    name: "review-approved".to_string(),
+                    payload: serde_json::json!({ "ok": true }),
+                    meta: None,
+                })
             .run_id("ne1"),
         )
         .outcome().await
@@ -3020,10 +3061,16 @@ mod tests {
         .outcome().await
         .unwrap();
         assert_eq!(out.status, RunStatus::Paused);
-        deliver_signal(store.as_ref(), "ne2", SignalDelivery { signal_id: None, step_id: None, name: "go".to_string(), payload: serde_json::json!(42), meta: None }).unwrap();
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
+                .signal_delivery(SignalDelivery {
+                    signal_id: None,
+                    step_id: None,
+                    name: "go".to_string(),
+                    payload: serde_json::json!(42),
+                    meta: None,
+                })
             .run_id("ne2"),
         )
         .outcome().await
@@ -3081,10 +3128,16 @@ mod tests {
             "过期的 due_at 照实投影——由 sweep 判断「已到点」"
         );
 
-        deliver_signal(store.as_ref(), &out.run_id, SignalDelivery { signal_id: None, step_id: Some("cooldown".to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None }).unwrap();
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
+                .signal_delivery(SignalDelivery {
+                    signal_id: None,
+                    step_id: Some("cooldown".to_string()),
+                    name: String::new(),
+                    payload: serde_json::Value::Null,
+                    meta: None,
+                })
             .run_id(out.run_id),
         )
         .outcome().await
@@ -3124,10 +3177,16 @@ mod tests {
         assert_eq!(w.signal_name, "__timer");
         assert_eq!(w.deadline, Some(due), "deadline 应是调用方给的时间戳");
 
-        deliver_signal(store.as_ref(), "stu1", SignalDelivery { signal_id: None, step_id: Some("cooldown".to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None }).unwrap();
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
+                .signal_delivery(SignalDelivery {
+                    signal_id: None,
+                    step_id: Some("cooldown".to_string()),
+                    name: String::new(),
+                    payload: serde_json::Value::Null,
+                    meta: None,
+                })
             .run_id("stu1"),
         )
         .outcome().await
@@ -3207,11 +3266,15 @@ mod tests {
         .outcome().await
         .unwrap();
         assert_eq!(out.status, RunStatus::Paused);
-        deliver_approval(store.as_ref(), "det1", "gate", true, None).unwrap();
         // Drive #2：`__now-0` / `__uuid-0` 从日志缓存取（deterministic replay）。
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
+                .approval(ApprovalDecision {
+                    approval_id: "gate".to_string(),
+                    approved: true,
+                    feedback: None,
+                })
             .run_id("det1"),
         )
         .outcome().await
@@ -3294,10 +3357,14 @@ mod tests {
         .unwrap();
         assert_eq!(out.status, RunStatus::Paused);
 
-        deliver_approval(store.as_ref(), "named1", "gate", true, None).unwrap();
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
+                .approval(ApprovalDecision {
+                    approval_id: "gate".to_string(),
+                    approved: true,
+                    feedback: None,
+                })
                 .run_id("named1"),
         )
         .outcome()
@@ -3576,10 +3643,16 @@ mod tests {
 
         // `Aborted` 是锁存终态：投递 resume 也唤不回来（上游 `resumeRun`
         // 对 aborted 直接 route 到 attach，`run-workflow.ts:275-282`）。
-        deliver_signal(store.as_ref(), "ca2", SignalDelivery { signal_id: None, step_id: Some("hold".to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None }).unwrap();
         let out3 = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
+                .signal_delivery(SignalDelivery {
+                    signal_id: None,
+                    step_id: Some("hold".to_string()),
+                    name: String::new(),
+                    payload: serde_json::Value::Null,
+                    meta: None,
+                })
             .run_id("ca2"),
         )
         .outcome().await
@@ -3678,11 +3751,17 @@ mod tests {
         assert_eq!(w.signal_name, "__timer");
         assert!(w.deadline.is_some(), "yield 的 target 应投影为 deadline");
 
-        // host 重新唤起（延期预算）→ 投递 timer。
-        deliver_signal(store.as_ref(), "y1", SignalDelivery { signal_id: None, step_id: Some("__yield-0".to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None }).unwrap();
+        // host 重新唤起（延期预算）→ 载荷随 drive 给。
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
+                .signal_delivery(SignalDelivery {
+                    signal_id: None,
+                    step_id: Some("__yield-0".to_string()),
+                    name: String::new(),
+                    payload: serde_json::Value::Null,
+                    meta: None,
+                })
             .run_id("y1"),
         )
         .outcome().await
@@ -3738,10 +3817,16 @@ mod tests {
             "yield_resume_at 应原样成为 deadline"
         );
 
-        deliver_signal(store.as_ref(), "y2", SignalDelivery { signal_id: None, step_id: Some("__yield-0".to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None }).unwrap();
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
+                .signal_delivery(SignalDelivery {
+                    signal_id: None,
+                    step_id: Some("__yield-0".to_string()),
+                    name: String::new(),
+                    payload: serde_json::Value::Null,
+                    meta: None,
+                })
             .run_id("y2"),
         )
         .outcome().await
@@ -4115,10 +4200,16 @@ mod tests {
         assert_eq!(out.status, RunStatus::Paused);
 
         // 投递一个缺 `approved` 字段的 payload
-        deliver_signal(store.as_ref(), "sc1", SignalDelivery { signal_id: None, step_id: Some("hold".to_string()), name: String::new(), payload: serde_json::json!({ "ok": 1 }), meta: None }).unwrap();
         let out2 = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
+                .signal_delivery(SignalDelivery {
+                    signal_id: None,
+                    step_id: Some("hold".to_string()),
+                    name: String::new(),
+                    payload: serde_json::json!({ "ok": 1 }),
+                    meta: None,
+                })
                 .run_id("sc1"),
         )
         .outcome().await
@@ -4152,11 +4243,16 @@ mod tests {
         )
         .outcome().await
         .unwrap();
-        deliver_signal(store.as_ref(), "sc2", SignalDelivery { signal_id: None, step_id: Some("hold".to_string()), name: String::new(), payload: serde_json::json!({ "approved": true }), meta: None })
-        .unwrap();
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
+                .signal_delivery(SignalDelivery {
+                    signal_id: None,
+                    step_id: Some("hold".to_string()),
+                    name: String::new(),
+                    payload: serde_json::json!({ "approved": true }),
+                    meta: None,
+                })
                 .run_id("sc2"),
         )
         .outcome().await

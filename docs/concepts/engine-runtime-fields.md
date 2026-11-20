@@ -70,6 +70,40 @@ match cached { StepFinished { result, .. } => .., StepFailed { error, .. } => ..
 
 与上游「查到事件、在调用点 match」同形。
 
+## 二·六、信号 / 审批投递在哪一层
+
+上游 `deliverSignal` **只在 `workflow-runtime`**（`workflow-core` 里 grep 是
+`No matches found`）：
+
+```ts
+// types.ts:397  runtime 门面
+deliverSignal(args) -> Promise<WorkflowRuntimeRunResult>
+
+// runtime-driver.ts:202  内部实现
+async function deliverSignal(config, telemetry, args)
+  -> config.store.deliverSignal(...)          // 四态 + status=queued
+  -> driveClaimedRun({ ..., signalDelivery })  // 载荷作为参数
+    -> runWorkflow({ signalDelivery })
+      -> appendSeed(...)   // 定位 SIGNAL_AWAITED、去重、写 SIGNAL_RESOLVED
+```
+
+**载荷是 `runWorkflow` 的入参，不是独立的日志写入动作。** 本仓据此改成：
+
+| 本仓 | 上游对应 | 说明 |
+| --- | --- | --- |
+| `RunWorkflowOptions::signal_delivery` / `approval` | `signalDelivery` / `approval` | **主路径** |
+| `run_workflow` 里的 `append_seed` | `appendSeed` | 重放 handler **之前**落事件 |
+| `engine::deliver_signal` / `deliver_approval` | **无** | 本仓扩展，仅两种场景 |
+
+那两个自由函数**不是主路径**，只在：
+
+1. run 已经 spawn 出去、正挂在等待点上 —— 没有「下一次 drive」可挂载荷，
+   只能从外部写日志唤醒（`restart_survives` 的跨进程测试）；
+2. 要检查四态返回值本身（`NotWaiting` / `NotFound`）—— 走 `signal_delivery`
+   时「没在等」会变成 `RUN_ERRORED`，测不到返回值。
+
+---
+
 同理，`register_compensation` 原来读 `store.get_events()` 判断「是否已登记」，
 现在扫内存日志（两份都查）。
 
