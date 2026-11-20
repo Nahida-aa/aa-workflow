@@ -21,9 +21,9 @@
 
 ## 决策
 
-把声明与调度核心放进 `aa_workflow_middlewares::dag::core`（从 `aa_workflow_dag`
-复制而来，那个包暂留待删），对外只暴露一个入口：`dag_to_handler(spec)` 生成
-handler 函数体，用户挂到 `.handler(dag_to_handler(spec))`：
+把声明与调度核心放进 `aa_workflow_middlewares::dag::core`（原 `aa_workflow_dag` 包
+已迁入并删除，DAG 代码与测试集中一处），对外只暴露一个入口：`dag_to_handler(spec)`
+生成 handler 函数体，用户挂到 `.handler(dag_to_handler(spec))`：
 
 ```rust
 // dag::core::declare

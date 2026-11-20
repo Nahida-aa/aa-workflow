@@ -21,18 +21,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aa_workflow_dag"
-version = "0.1.0"
-dependencies = [
- "aa_graph",
- "aa_workflow_core",
- "aa_workflow_runtime",
- "anyhow",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "aa_workflow_middlewares"
 version = "0.1.0"
 dependencies = [
@@ -321,6 +309,7 @@ name = "example_store_file"
 version = "0.1.0"
 dependencies = [
  "aa_workflow_core",
+ "aa_workflow_middlewares",
  "aa_workflow_runtime",
  "anyhow",
  "example_shared",

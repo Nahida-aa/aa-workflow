@@ -1,7 +1,5 @@
-//! 形状与名单计算：从 `aa_workflow_dag` 复制而来（过渡期，见 ADR 0019）。
-//!
-//! `DagShape` 只算名单（`reseed` 的失效闭包），不发起 step；发起 step 的是
-//! 同目录的 [`declare`](super::declare)。
+//! 形状与名单计算：`DagShape` 只算 `reseed` 的失效闭包，不发起 step；发起 step 的是
+//! 同目录的 [`scheduler`](super::scheduler)。
 use aa_graph::dag::{builder::DagBuilder, error::DagError, static_dag::StaticDag};
 use aa_workflow_core::WorkflowEvent;
 use std::collections::{BTreeSet, HashMap};

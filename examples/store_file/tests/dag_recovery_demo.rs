@@ -11,7 +11,7 @@ use aa_workflow_core::{
     CreateWorkflowConfig, StepCtx, WorkflowCtx, WorkflowDefinition, WorkflowEvent,
     create_workflow,
 };
-use aa_workflow_dag::DagShape;
+use aa_workflow_middlewares::DagShape;
 use aa_workflow_runtime::{
     InMemoryExecutionStore, WorkflowRegistration, WorkflowRuntimeConfig, WorkflowRuntimeDefinition,
     WorkflowRuntimeRunResultKind, WorkflowRuntimeStartRunArgs,

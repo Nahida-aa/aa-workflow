@@ -1,7 +1,6 @@
 //! DAG 核心：名单计算（`shape`）、声明与校验（`declare`）、调度（`scheduler`）。
 //!
-//! 从 `aa_workflow_dag` 复制而来，使 `workflow_middlewares` 自包含、不再依赖
-//! 那个包。原包暂留（供其自身测试），删除是后续事项。分三块：
+//! 原为独立包 `aa_workflow_dag`，现已迁入本模块，DAG 代码与测试集中一处。分三块：
 //!
 //! | 块 | 角色 |
 //! | --- | --- |

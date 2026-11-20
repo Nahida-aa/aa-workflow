@@ -7,7 +7,7 @@ use aa_workflow_core::{
     create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunStatus,
     RunWorkflowOptions,
 };
-use aa_workflow_dag::{DagSpec, dag_to_handler, define_dag};
+use aa_workflow_middlewares::{DagSpec, dag_to_handler, define_dag};
 use serde_json::{Value, json};
 
 #[tokio::test]
