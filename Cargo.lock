@@ -39,6 +39,7 @@ dependencies = [
  "aa_workflow_core",
  "aa_workflow_dag",
  "anyhow",
+ "serde",
  "serde_json",
  "tokio",
  "tower",

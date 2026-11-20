@@ -57,13 +57,9 @@ fn make_wf(
                 for id in ["a", "b", "c"] {
                     let exec = exec.clone();
                     let sid = id.to_string();
-                    ctx.step(id, move |_sc: StepCtx| {
-                        let exec = exec.clone();
-                        let sid = sid.clone();
-                        async move {
-                            exec.lock().unwrap().push(sid.clone());
-                            Ok(serde_json::json!({ "id": sid }))
-                        }
+                    ctx.step(id, move |_sc: StepCtx| async move {
+                        exec.lock().unwrap().push(sid.clone());
+                        Ok(serde_json::json!({ "id": sid }))
                     })
                     .await?;
                 }

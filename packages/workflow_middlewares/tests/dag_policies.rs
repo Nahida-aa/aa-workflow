@@ -54,13 +54,11 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
                     for id in ["load", "enrich", "translate", "merge", "publish"] {
                         let exec = exec.clone();
                         let sid = id.to_string();
-                        ctx.step(id, move |_sc: StepCtx| {
-                            let exec = exec.clone();
-                            let sid = sid.clone();
-                            async move {
-                                exec.lock().unwrap().push(sid.clone());
-                                Ok(serde_json::json!({ "id": sid }))
-                            }
+                        // `FnOnce`：闭包只跑一次，`async move` 可以直接消耗捕获值，
+                        // 不必先 clone 一份。
+                        ctx.step(id, move |_sc: StepCtx| async move {
+                            exec.lock().unwrap().push(sid.clone());
+                            Ok(serde_json::json!({ "id": sid }))
                         })
                         .await?;
                     }
@@ -180,12 +178,9 @@ async fn no_plan_means_no_behavior() {
             move |ctx: WorkflowCtx| {
                 let exec = exec.clone();
                 async move {
-                    ctx.step("a", move |_sc: StepCtx| {
-                        let exec = exec.clone();
-                        async move {
-                            exec.lock().unwrap().push("a".to_string());
-                            Ok(serde_json::json!(1))
-                        }
+                    ctx.step("a", move |_sc: StepCtx| async move {
+                        exec.lock().unwrap().push("a".to_string());
+                        Ok(serde_json::json!(1))
                     })
                     .await?;
                     Ok(serde_json::json!({ "ok": true }))
