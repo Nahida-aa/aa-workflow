@@ -106,7 +106,7 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
     let wf = Arc::new(
         create_workflow(CreateWorkflowConfig::new("dag-pol").input::<serde_json::Value>())
             // handler 天然最内层：策略的 wrap_step 先注册，顺序约束自动满足。
-            .middleware([dag_policies(shape(), loader(store.clone()))])
+            .middleware(dag_policies(shape(), loader(store.clone())))
             .handler(dag_to_handler(spec)),
     );
 
@@ -208,7 +208,7 @@ async fn no_plan_means_no_behavior() {
     let debug_exec_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
     let wf = create_workflow(CreateWorkflowConfig::new("no-plan").input::<serde_json::Value>())
-        .middleware([dag_policies(shape(), loader(store.clone()))])
+        .middleware(dag_policies(shape(), loader(store.clone())))
         .handler({
             let debug_exec_log = debug_exec_log.clone();
             move |ctx: WorkflowCtx| {

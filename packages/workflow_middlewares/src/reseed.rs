@@ -85,7 +85,7 @@ pub struct SourceStep {
 /// `RunWorkflowOptions.meta` 传：
 ///
 /// ```ignore
-/// .middleware([reseed(load_results)])            // 挂一次
+/// .middleware(reseed(load_results))            // 挂一次
 /// RunWorkflowOptions::new(wf, store)
 ///     .meta(MetaBag::new().with::<ReseedKey>(ReseedPlan {
 ///         source_run_id: "rev1".into(),

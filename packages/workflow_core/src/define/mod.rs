@@ -681,9 +681,6 @@ pub struct WorkflowDefinition<
     /// Fallback retry policy for steps that declare none
     /// (TanStack `defaultStepRetry`). Per-step [`StepOptions::retry`] wins.
     pub default_step_retry: Option<RetryPolicy>,
-    /// Middleware list, in the order TanStack's `composeMiddlewares` chains
-    /// them (first = outermost wrapping of the typed handler).
-    pub middlewares: Vec<Middleware>,
     /// Older versions of the same workflow. Resume routes by the persisted
     /// `workflow_version` to the matching entry (see
     /// [`select_workflow_version`](crate::engine::select_workflow_version)).
@@ -775,7 +772,6 @@ impl<TInput, TOutput, TState, TMeta> Clone for WorkflowDefinition<TInput, TOutpu
             version: self.version.clone(),
             description: self.description.clone(),
             default_step_retry: self.default_step_retry.clone(),
-            middlewares: self.middlewares.clone(),
             previous_versions: self.previous_versions.clone(),
             handler: Arc::clone(&self.handler),
             initialize: Arc::clone(&self.initialize),
@@ -879,7 +875,6 @@ impl<TInput, TOutput, TState, TMeta> WorkflowDefinition<TInput, TOutput, TState,
             version: self.version,
             description: self.description,
             default_step_retry: self.default_step_retry,
-            middlewares: self.middlewares,
             previous_versions: self.previous_versions,
             handler: self.handler,
             initialize: self.initialize,
@@ -906,7 +901,6 @@ impl WorkflowDefinition {
             version: None,
             description: None,
             default_step_retry: None,
-            middlewares: Vec::new(),
             previous_versions: Vec::new(),
             handler: Arc::new(|_ctx: WorkflowCtx| Box::pin(async { Ok(serde_json::Value::Null) })),
             initialize: Arc::new(|_| Ok(serde_json::Value::Object(Default::default()))),
@@ -1021,7 +1015,7 @@ mod tests {
             Box::pin(async move { sc.next(Some(DefExt::<UserNs>::new(UserExt { user: "bob".into() }).into_value())).await })
         });
         let wf = create_workflow(CreateWorkflowConfig::new("mw-fn").input::<Value>())
-            .middleware([Middleware { server: ext }])
+            .middleware(Middleware { server: ext })
             .handler(|ctx: WorkflowCtx| async move {
                 Ok(serde_json::json!({ "user": ctx.ext.user().user }))
             });
@@ -1042,14 +1036,14 @@ mod tests {
     async fn middleware_next_ext_is_readable_by_handler() {
         let store = Arc::new(InMemoryStore::new());
         let wf = create_workflow(CreateWorkflowConfig::new("mw-ext").input::<Value>())
-            .middleware([Middleware::new().server(|mut sc: MiddlewareServerFnArgs| {
+            .middleware(Middleware::new().server(|mut sc: MiddlewareServerFnArgs| {
                 Box::pin(async move {
                     sc.next(Some(
                         DefExt::<UserNs>::new(UserExt { user: "alice".into() }).into_value(),
                     ))
                     .await
                 })
-            })])
+            }))
             .handler(|ctx: WorkflowCtx| async move {
                 // 第二个中间件不写扩展 → 空袋
                 Ok(serde_json::json!({ "user": ctx.ext.user().user }))
@@ -1107,7 +1101,7 @@ mod tests {
             })
         });
         let wf = create_workflow(CreateWorkflowConfig::new("mw-merge").input::<Value>())
-            .middleware([m_user, m_trace])
+            .middleware(m_user).middleware(m_trace)
             .handler(|ctx: WorkflowCtx| async move {
                 let b = ctx.ext.get::<BundleNs>();
                 Ok(serde_json::json!({ "shared": b.shared }))
@@ -1148,7 +1142,7 @@ mod tests {
         let m_in = make_server("in", &order);
         let m_out = make_server("out", &order);
         let wf = create_workflow(CreateWorkflowConfig::new("mw-order").input::<Value>())
-            .middleware([m_in, m_out])
+            .middleware(m_in).middleware(m_out)
             .handler(|ctx: BaseCtx<Value>| async move {
                 ctx.step("inner", |_sc: StepCtx| async move {
                     Ok(serde_json::json!({ "ok": true }))
@@ -1184,11 +1178,11 @@ mod tests {
         let ran_mw = ran.clone();
 
         let wf = create_workflow(CreateWorkflowConfig::new("mw-interceptor").input::<Value>())
-            .middleware([Middleware::new().server(move |mut sc: MiddlewareServerFnArgs| async move {
+            .middleware(Middleware::new().server(move |mut sc: MiddlewareServerFnArgs| async move {
                 // 用 tower 的 Layer：对 "b" 短路、对 "c" 泊车。
                 sc.wrap_step(TestPolicyLayer);
                 sc.next(None).await
-            })])
+            }))
             .handler({
                 let ran = ran_mw.clone();
                 move |ctx: WorkflowCtx| {
@@ -1297,13 +1291,13 @@ mod tests {
     async fn middleware_next_is_at_most_once() {
         let store = Arc::new(InMemoryStore::new());
         let wf = create_workflow(CreateWorkflowConfig::new("mw-next-once").input::<Value>())
-            .middleware([Middleware::new().server(|mut sc: MiddlewareServerFnArgs| {
+            .middleware(Middleware::new().server(|mut sc: MiddlewareServerFnArgs| {
                 Box::pin(async move {
                     let first = sc.next(None).await?;
                     assert!(sc.next(None).await.is_err(), "第二次 next 必须报错");
                     Ok(first)
                 })
-            })])
+            }))
             .handler(|_ctx: WorkflowCtx| async move { Ok(serde_json::json!({ "ok": true })) });
 
         let out = run_workflow(
@@ -1347,7 +1341,7 @@ mod tests {
         });
 
         let wf = create_workflow(CreateWorkflowConfig::new("mw-mixed").input::<Value>())
-            .middleware(vec![user_mw, trace_mw])
+            .middleware_any(vec![user_mw, trace_mw])
             .handler(|ctx: WorkflowCtx| async move {
                 Ok(serde_json::json!({
                     "user": ctx.ext.user().user,

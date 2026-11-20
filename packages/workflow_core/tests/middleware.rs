@@ -82,7 +82,7 @@ fn require_user() -> Middleware {
 #[tokio::test]
 async fn extends_ctx_with_middleware_added_fields() {
     let wf = create_workflow(CreateWorkflowConfig::new("mw-extends").input::<Value>())
-        .middleware([require_user()])
+        .middleware(require_user())
         .handler(|ctx: WorkflowCtx| async move {
             let user = ctx.ext.user();
             Ok(json!({ "userId": user.id, "userName": user.name }))
@@ -129,7 +129,7 @@ async fn composes_multiple_middlewares_in_order_accumulating_ctx_fields() {
     });
 
     let wf = create_workflow(CreateWorkflowConfig::new("mw-chain").input::<Value>())
-        .middleware([m1, m2])
+        .middleware(m1).middleware(m2)
         .handler(|ctx: WorkflowCtx| async move {
             // 两个来源的扩展分别读，无需合并类型
             let sum = ctx.ext.counts().a + ctx.ext.extra().b;
@@ -164,7 +164,7 @@ async fn wraps_the_handler_so_middleware_can_run_code_before_and_after() {
 
     let log2 = events.clone();
     let wf = create_workflow(CreateWorkflowConfig::new("mw-wrap").input::<Value>())
-        .middleware([m1])
+        .middleware(m1)
         .handler(move |_ctx: WorkflowCtx| {
             let log = log2.clone();
             async move {
@@ -198,7 +198,7 @@ async fn rejects_calling_next_more_than_once_in_a_middleware() {
     });
 
     let wf = create_workflow(CreateWorkflowConfig::new("mw-broken").input::<Value>())
-        .middleware([broken])
+        .middleware(broken)
         .handler(|_ctx: WorkflowCtx| async move { Ok(json!({})) });
 
     let out = run_workflow(

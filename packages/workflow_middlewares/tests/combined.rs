@@ -47,7 +47,7 @@ fn make_wf(
     serde_json::Value,
 > {
     create_workflow(CreateWorkflowConfig::new("combined").input::<serde_json::Value>())
-        .middleware(middlewares)
+        .middleware_any(middlewares)
         .handler(move |ctx: WorkflowCtx| {
             let ran = ran.clone();
             async move {

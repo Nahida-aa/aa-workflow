@@ -15,7 +15,7 @@ use std::sync::Arc;
 use super::meta_spec::{Nil, Push};
 use super::MetaKey;
 use super::{AnyWorkflowDefinition, BaseCtx, InitializeFn, RetryPolicy, StateValidatorFn, WorkflowCtx, WorkflowDefinition, WorkflowHandler};
-use crate::middleware::{AnyMiddleware, Middleware};
+use crate::middleware::{AnyMiddleware, Append, DynListMw, Middleware, MiddlewareServer, MiddlewareStack};
 
 /// The declaration config consumed by [`create_workflow`]. Mirrors TanStack's
 /// `createWorkflow(options)`; only `id` is required (`initialize` defaults to
@@ -229,7 +229,7 @@ pub fn create_workflow<TInput, TOutput, TState>(
     WorkflowBuilder {
         _meta: PhantomData,
         config,
-        middlewares: Vec::new(),
+        stack: (),
         previous: Vec::new(),
     }
 }
@@ -263,42 +263,63 @@ impl<K> MetaMiddleware<K> {
     }
 }
 
-pub struct WorkflowBuilder<TInput, TOutput, TState, TMeta = Nil> {
+pub struct WorkflowBuilder<TInput, TOutput, TState, TMeta = Nil, TMw = ()> {
     config: CreateWorkflowConfig<TInput, TOutput, TState>,
-    middlewares: Vec<Middleware>,
+    /// 中间件栈（类型层组合，[`MiddlewareStack`]）——常态逐个注册，
+    /// 每加一个，`TMw` 长一格；洋葱在 [`handler`](Self::handler) 时折叠。
+    stack: TMw,
     previous: Vec<AnyWorkflowDefinition>,
     _meta: PhantomData<TMeta>,
 }
 
-impl<TInput, TOutput, TState, TMeta> WorkflowBuilder<TInput, TOutput, TState, TMeta> {
-    /// 注册中间件数组 —— 对齐上游
-    /// `middleware(middlewares: ReadonlyArray<AnyMiddleware>)`
-    /// （`types.ts:494`、`define-workflow.ts:149`）。
+impl<TInput, TOutput, TState, TMeta, TMw: MiddlewareStack>
+    WorkflowBuilder<TInput, TOutput, TState, TMeta, TMw>
+{
+    /// 注册一个中间件 —— **typestate**：`TMw` 长一格（tower `ServiceBuilder`
+    /// 同款），洋葱在 [`handler`](Self::handler) 时以具体类型折叠——
+    /// 逐层零箱，定义期只在终点擦一次。
     ///
     /// ```ignore
     /// let wf = create_workflow(cfg)
-    ///     .middleware([agent_middleware(), auth()])   // 不同来源也能混装
+    ///     .middleware(agent_middleware())   // 逐个注册（常态）
+    ///     .middleware(auth())
     ///     .handler(|ctx| async move {
-    ///         let auth = ctx.ext.auth();              // 按命名空间取
+    ///         let auth = ctx.ext.auth();    // 按命名空间取
     ///         ...
     ///     });
     /// ```
     ///
-    /// 与上游一致的地方：可多次调用叠加、元素可混装、顺序即注册顺序。
-    ///
-    /// 差异只有一处：**不需要写扩展类型**——上游靠 `TCtxExt & AccumulateExtensions`
-    /// 在编译期求交集（handler 的 `ctx` 多出字段）；这里扩展在运行期按命名空间
-    /// 存取（[`ExtBag`](crate::define::ExtBag)），所以没有「合并后的类型」这回事，
-    /// 使用者也不必自己定义 `Combined`。
-    pub fn middleware(
-        mut self,
-        middlewares: impl IntoIterator<Item = AnyMiddleware>,
-    ) -> Self {
-        // 对齐上游 `.middleware([...])`：收一个数组、可叠加。
-        for m in middlewares {
-            self.middlewares.push(m);
+    /// 与上游一致：可多次调用叠加、顺序即注册顺序（先注册 = 外层）。
+    /// **不需要写扩展类型**——扩展在运行期按命名空间存取
+    /// （[`ExtBag`](crate::define::ExtBag)，见 `docs/decisions/0015`）。
+    pub fn middleware<M>(self, m: M) -> WorkflowBuilder<TInput, TOutput, TState, TMeta, TMw::Out>
+    where
+        M: MiddlewareServer + 'static,
+        TMw: Append<M>,
+    {
+        WorkflowBuilder {
+            config: self.config,
+            stack: self.stack.append(m),
+            previous: self.previous,
+            _meta: PhantomData,
         }
-        self
+    }
+
+    /// **擦除逃生门**：运行期动态的中间件集合（低代码）——收擦除元素列表，
+    /// 折叠成一个子洋葱作为单个栈元素（逐层箱 = 动态的固有税，见 ADR 0021）。
+    pub fn middleware_any(
+        self,
+        middlewares: impl IntoIterator<Item = Middleware>,
+    ) -> WorkflowBuilder<TInput, TOutput, TState, TMeta, TMw::Out>
+    where
+        TMw: Append<DynListMw>,
+    {
+        WorkflowBuilder {
+            config: self.config,
+            stack: self.stack.append(DynListMw(middlewares.into_iter().collect())),
+            previous: self.previous,
+            _meta: PhantomData,
+        }
     }
 
     /// 注册一个**声明了 meta 需求**的中间件。
@@ -319,19 +340,21 @@ impl<TInput, TOutput, TState, TMeta> WorkflowBuilder<TInput, TOutput, TState, TM
     /// 为什么单独一个方法而不是让 `middleware` 收 `MetaMiddleware`：数组要求
     /// 元素**完全同型**，`MetaMiddleware<A>` 与 `MetaMiddleware<B>` 装不进同一个
     /// `[T; N]`，而它们混装恰恰是最常见的用法。
-    pub fn meta_middleware<K>(self, mw: MetaMiddleware<K>) -> WorkflowBuilder<TInput, TOutput, TState, TMeta::Out>
+    pub fn meta_middleware<K>(
+        self,
+        mw: MetaMiddleware<K>,
+    ) -> WorkflowBuilder<TInput, TOutput, TState, TMeta::Out, TMw::Out>
     where
         K: MetaKey,
         TMeta: Push<K>,
+        TMw: Append<Middleware>,
     {
-        let mut this = WorkflowBuilder {
+        WorkflowBuilder {
             config: self.config,
-            middlewares: self.middlewares,
+            stack: self.stack.append(mw.middleware),
             previous: self.previous,
             _meta: PhantomData,
-        };
-        this.middlewares.push(mw.middleware);
-        this
+        }
     }
 
     /// Older versions of the same workflow to route resumed runs to (see
@@ -374,8 +397,6 @@ impl<TInput, TOutput, TState, TMeta> WorkflowBuilder<TInput, TOutput, TState, TM
             _state: _,
         } = self.config;
         let handler = Arc::new(handler);
-        let middlewares = self.middlewares.clone();
-        let workflow_middlewares = self.middlewares.clone();
         let validator = output_validator.clone();
         // 中间件折叠（对齐 TS `composeMiddlewares` 的洋葱模型）：
         // 最内层 = typed ctx + handler；每个 middleware 的 `server` 包住内层。
@@ -414,43 +435,14 @@ impl<TInput, TOutput, TState, TMeta> WorkflowBuilder<TInput, TOutput, TState, TM
                 Ok(value)
             })
         });
-        // server 链：注册顺序 = 外层先执行（TanStack `composeMiddlewares` 同义）。
-        // 每层把 `MiddlewareServerFnArgs` 交给 middleware 的 server；`next` 闭包推进到内层。
-        let mut engine_handler: WorkflowHandler = innermost;
-        for m in middlewares.iter().rev() {
-            let server = m.server.clone();
-            let inner = std::sync::Arc::clone(&engine_handler);
-            engine_handler = Arc::new(move |ctx: WorkflowCtx| {
-                let server = server.clone();
-                let inner = inner.clone();
-                Box::pin(async move {
-                    let sc = crate::middleware::MiddlewareServerFnArgs {
-                        ctx: ctx.clone(),
-                        pipeline: Some(std::sync::Arc::new(
-                            move |ext: Option<serde_json::Value>| {
-                                let inner = inner.clone();
-                                let ctx = ctx.clone();
-                                // `next(ext)` 一次调用做两件事，位置与上游
-                                // `run-workflow.ts:1502` 一一对应：
-                                //   ① Object.assign(ctx, opts.context)
-                                //   ② compose(index + 1)
-                                if let Some(ext) = ext {
-                                    ctx.engine.merge_ext(ext);
-                                }
-                                Box::pin(async move { inner(ctx).await })
-                            },
-                        )),
-                    };
-                    server.serve(sc).await
-                })
-            });
-        }
+        // 洋葱折叠（typestate 栈）：中间件栈在类型层组合，定义期一次擦除
+        // （`MiddlewareStack::serve` 把栈折叠成一个 WorkflowHandler）。
+        let engine_handler: WorkflowHandler = self.stack.serve(innermost);
         WorkflowDefinition {
             id,
             version,
             description,
             default_step_retry,
-            middlewares: workflow_middlewares,
             previous_versions: self.previous,
             handler: engine_handler,
             initialize,

@@ -77,7 +77,7 @@ impl Service<StepRequest> for RecordService {
 async fn completed_snapshot_sees_prior_steps_in_order() {
     let seen: Arc<Mutex<Vec<(String, Vec<String>)>>> = Arc::new(Mutex::new(Vec::new()));
     let wf = create_workflow(CreateWorkflowConfig::new("snap").input::<serde_json::Value>())
-        .middleware([recorder(seen.clone())])
+        .middleware(recorder(seen.clone()))
         .handler(|ctx: WorkflowCtx| async move {
             for id in ["a", "b", "c"] {
                 let sid = id.to_string();
@@ -114,7 +114,7 @@ async fn completed_snapshot_never_contains_self() {
     let seen: Arc<Mutex<Vec<(String, Vec<String>)>>> = Arc::new(Mutex::new(Vec::new()));
 
     let wf = create_workflow(CreateWorkflowConfig::new("snap-self").input::<serde_json::Value>())
-        .middleware([recorder(seen.clone())])
+        .middleware(recorder(seen.clone()))
         .handler({
             let counter = counter.clone();
             move |ctx: WorkflowCtx| {
@@ -199,9 +199,9 @@ async fn completed_accumulates_across_drives() {
     let ran_in = ran.clone();
 
     let wf = create_workflow(CreateWorkflowConfig::new("acc").input::<serde_json::Value>())
-        .middleware([interim_goals(move |run_id| {
+        .middleware(interim_goals(move |run_id| {
             Ok(store_for_hook.get_events(run_id)?)
-        })])
+        }))
         .handler(move |ctx: WorkflowCtx| {
             let ran = ran_in.clone();
             async move {

@@ -50,7 +50,7 @@ fn make_wf(
     serde_json::Value,
 > {
     create_workflow(CreateWorkflowConfig::new("redo").input::<serde_json::Value>())
-        .middleware([mw])
+        .middleware(mw)
         .handler(move |ctx: WorkflowCtx| {
             let exec = exec.clone();
             async move {
@@ -208,7 +208,7 @@ async fn redo_with_missing_source_runs_everything() {
     let ran_in = ran.clone();
 
     let wf = create_workflow(CreateWorkflowConfig::new("redo2").input::<serde_json::Value>())
-        .middleware([reseed(loader(store.clone()))])
+        .middleware(reseed(loader(store.clone())))
         .handler(move |ctx: WorkflowCtx| {
             let ran = ran_in.clone();
             async move {

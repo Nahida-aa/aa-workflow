@@ -146,7 +146,7 @@ fn workflow(
     serde_json::Value,
 > {
     create_workflow(CreateWorkflowConfig::new("step-onion").input::<serde_json::Value>())
-        .middleware(middlewares)
+        .middleware_any(middlewares)
         .handler(move |ctx: WorkflowCtx| {
             let ran = ran.clone();
             async move {

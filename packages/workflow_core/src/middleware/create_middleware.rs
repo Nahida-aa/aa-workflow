@@ -42,29 +42,46 @@ use std::sync::Arc;
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::define::{BoxFuture, WorkflowCtx};
+use crate::define::{BoxFuture, WorkflowCtx, WorkflowHandler};
 
-/// 擦除后的 server 实现（擦除位）。
+/// **静态门**：中间件的 server 实现（RPITIT——返回具体 future，不装箱）。
 ///
-/// 返回 future **借 `&self`**（lifetime-tied）——这是 tower `Service` 的形状：
-/// dyn 安全（无 GAT），且让 struct 形态的中间件把构造参数放进**字段**、
-/// 按引用使用，零克隆零仪式。三种构造形态见 [`Middleware`]。
-pub trait MiddlewareServer: Send + Sync {
+/// `Clone` supertrait 是 scope-borrow 洋葱的纪律（tower 同款）：typestate 栈
+/// 的递归组合要把各层 clone 进 `'static` 闭包——struct 中间件的字段用
+/// `Arc` 句柄即可（Clone = 引用计数）。
+pub trait MiddlewareServer: Send + Sync + Clone + 'static {
     /// 名字刻意不是 `call`——与 `Fn::call` 在 blanket 场景下会歧义（E0034）。
-    fn serve<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>>;
+    fn serve<'a>(
+        &'a self,
+        args: MiddlewareServerFnArgs,
+    ) -> impl Future<Output = Result<Value>> + Send + 'a;
 }
 
-/// `Fn(Args) -> 'static future` 的 blanket：**现有闭包写法零改动**——闭包的
-/// future 自持全部数据，对任意 `'a` 都成立（「自有 ⊇ 借用」）。
-/// 真异步闭包（`AsyncFn*`）的 blanket 需要写 `CallRefFuture` 的 GAT Send
-/// 投影 bound，目前撞 E0658（`async_fn_traits` 未稳定）——解禁后三行可加，
-/// 见 ADR 0020。
-impl<F, Fut> MiddlewareServer for F
+/// **擦除门**（dyn）：运行期动态的中间件集合（低代码）用。静态注册不走这里
+/// ——见 [`MiddlewareStack`]（typestate 栈，零箱到终点擦一次）。
+pub trait DynMiddlewareServer: Send + Sync {
+    fn call<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>>;
+}
+
+/// 静态 → 擦除的适配器：[`Middleware::from_impl`] 用它把 struct 中间件
+/// 收进擦除世界（专用 newtype 而非 blanket——blanket 会与下面的 `Fn`
+/// blanket 构成 coherence 冲突：下游类型可以同时是 `Fn` 和
+/// `MiddlewareServer`）。
+pub struct Erased<M: MiddlewareServer>(M);
+
+impl<M: MiddlewareServer + 'static> DynMiddlewareServer for Erased<M> {
+    fn call<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>> {
+        Box::pin(self.0.serve(args))
+    }
+}
+
+/// `Fn(Args) -> 'static future` 的擦除 blanket：现有闭包写法零改动。
+impl<F, Fut> DynMiddlewareServer for F
 where
     F: Fn(MiddlewareServerFnArgs) -> Fut + Send + Sync,
     Fut: Future<Output = Result<Value>> + Send + 'static,
 {
-    fn serve<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>> {
+    fn call<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>> {
         Box::pin((self)(args))
     }
 }
@@ -76,13 +93,13 @@ struct StateServer<S, F> {
     f: F,
 }
 
-impl<S, F, Fut> MiddlewareServer for StateServer<S, F>
+impl<S, F, Fut> DynMiddlewareServer for StateServer<S, F>
 where
     S: Clone + Send + Sync + 'static,
     F: Fn(S, MiddlewareServerFnArgs) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<Value>> + Send + 'static,
 {
-    fn serve<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>> {
+    fn call<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>> {
         let state = self.state.clone();
         Box::pin((self.f)(state, args))
     }
@@ -91,15 +108,158 @@ where
 /// [`Middleware::default`] 的透传实现。
 struct PassthroughServer;
 
-impl MiddlewareServer for PassthroughServer {
-    fn serve<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>> {
+impl DynMiddlewareServer for PassthroughServer {
+    fn call<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>> {
         let mut args = args;
         Box::pin(async move { args.next(None).await })
     }
 }
 
-/// 中间件 `server` 函数的擦除形态。
-pub type MiddlewareServerFn = Arc<dyn MiddlewareServer>;
+/// 擦除句柄：动态中间件元素的统一类型（低代码/运行期集合）。
+pub type MiddlewareServerFn = Arc<dyn DynMiddlewareServer>;
+
+/// **typestate 栈**：中间件洋葱的类型层表示——`() `为终端，
+/// `(Head, Tail)` 递归（Head = 外层，Tail = 其余栈）。
+///
+/// `serve(&self, inner)` 把栈折叠成一个 [`WorkflowHandler`]（定义期一次
+/// 擦除）；`Append<M>` 做类型级追加（builder `.middleware(m)` 的重键）。
+/// 元素是 [`MiddlewareServer`]（静态，零箱）或 [`Middleware`]（擦除，
+/// 动态元素的固有箱）。
+pub trait MiddlewareStack: Send + Sync + Clone + 'static {
+    fn serve(&self, inner: WorkflowHandler) -> WorkflowHandler;
+}
+
+impl MiddlewareStack for () {
+    fn serve(&self, inner: WorkflowHandler) -> WorkflowHandler {
+        inner
+    }
+}
+
+impl<H, T> MiddlewareStack for (H, T)
+where
+    H: MiddlewareServer,
+    T: MiddlewareStack,
+{
+    fn serve(&self, inner: WorkflowHandler) -> WorkflowHandler {
+        let (head, tail) = self;
+        let head = head.clone();
+        let tail = tail.clone();
+        // 外层闭包是 `Fn`（跨 drive 复用）：各层 per-drive clone 一次
+        // （字段是 Arc 句柄 = 引用计数；tower 的 clone-per-request 同款）。
+        Arc::new(move |ctx: WorkflowCtx| {
+            let head = head.clone();
+            let tail = tail.clone();
+            let inner = inner.clone();
+            let ctx_for_pipeline = ctx.clone();
+            // 本层的 `next(ext)`：合并 ext 进 engine，然后把 ctx 交给
+            // tail 的子洋葱（递归——pipeline 的擦除是 CPS 协议的
+            // 结构性成本，见 ADR 0021）。
+            let pipeline: NextFn = Arc::new(move |ext: Option<Value>| {
+                let tail = tail.clone();
+                let inner = inner.clone();
+                let mut ctx = ctx_for_pipeline.clone();
+                if let Some(ext) = ext {
+                    ctx.engine.merge_ext(ext);
+                }
+                Box::pin(async move { tail.serve(inner)(ctx).await })
+            });
+            let sc = MiddlewareServerFnArgs {
+                ctx,
+                pipeline: Some(pipeline),
+            };
+            Box::pin(async move { head.serve(sc).await })
+        })
+    }
+}
+
+/// **擦除列表的栈元素**（`.middleware_any(iter)`——低代码逃生门）：内部把
+/// 列表折叠成一条子洋葱再驱动。逐层箱 = 动态的固有税（ADR 0021）。
+#[derive(Clone)]
+pub struct DynListMw(pub Vec<Middleware>);
+
+impl MiddlewareServer for DynListMw {
+    fn serve<'a>(
+        &'a self,
+        args: MiddlewareServerFnArgs,
+    ) -> impl Future<Output = Result<Value>> + Send + 'a {
+        let list = self.0.clone();
+        async move {
+            let ctx0 = sc_ctx(&args);
+            let outer_next: NextFn = match args.pipeline.clone() {
+                Some(p) => p,
+                None => Arc::new(|_| {
+                    Box::pin(async {
+                        anyhow::bail!("middleware list ran with no pipeline (taken over)")
+                    }) as BoxFuture<'static, Result<Value>>
+                }),
+            };
+            // 终端：外层续延以 None 调用（各子层的 ext 已由自己的 pipeline 合并）
+            let mut inner: WorkflowHandler = {
+                let outer_next = outer_next.clone();
+                Arc::new(move |_ctx: WorkflowCtx| {
+                    let outer_next = outer_next.clone();
+                    Box::pin(async move { outer_next(None).await })
+                })
+            };
+            // 从最内向前折：每个元素得到「ctx + pipeline = 目前为止的内层」
+            for m in list.iter().rev() {
+                let m = m.clone();
+                let inner_prev = inner.clone();
+                let ctx = ctx0.clone();
+                inner = Arc::new(move |ctx: WorkflowCtx| {
+                    let m = m.clone();
+                    let inner_prev = inner_prev.clone();
+                    let ctx_for_pipe = ctx.clone();
+                    let pipeline: NextFn = Arc::new(move |ext: Option<Value>| {
+                        let inner_prev = inner_prev.clone();
+                        let mut ctx = ctx_for_pipe.clone();
+                        if let Some(ext) = ext {
+                            ctx.engine.merge_ext(ext);
+                        }
+                        Box::pin(async move { inner_prev(ctx).await })
+                    });
+                    let sc = MiddlewareServerFnArgs {
+                        ctx,
+                        pipeline: Some(pipeline),
+                    };
+                    Box::pin(async move { m.server.call(sc).await })
+                });
+            }
+            inner(ctx0).await
+        }
+    }
+}
+
+fn sc_ctx(args: &MiddlewareServerFnArgs) -> WorkflowCtx {
+    args.ctx.clone()
+}
+
+/// 类型级追加：builder `.middleware(m)` 的重键机制。
+pub trait Append<M>: MiddlewareStack {
+    type Out: MiddlewareStack;
+    fn append(self, m: M) -> Self::Out;
+}
+
+impl<M: MiddlewareServer + 'static> Append<M> for () {
+    /// 终端 + 首个中间件 = 二元组 `(M, ())`（Cons 形状——追加在**尾**，
+    /// 递归 impl 只需 `()` 与 `(H, T)` 两个，任意长度成立）。
+    type Out = (M, ());
+    fn append(self, m: M) -> Self::Out {
+        (m, ())
+    }
+}
+
+impl<H, T, M> Append<M> for (H, T)
+where
+    H: MiddlewareServer,
+    T: MiddlewareStack + Append<M>,
+    M: MiddlewareServer + 'static,
+{
+    type Out = (H, T::Out);
+    fn append(self, m: M) -> Self::Out {
+        (self.0.clone(), self.1.append(m))
+    }
+}
 
 /// 后续管线：吃一个扩展对象、返回 future（对齐上游 `next(opts)`）。
 ///
@@ -354,6 +514,16 @@ impl Clone for Middleware {
     }
 }
 
+/// 擦除元素也是合法的静态栈成员（委托给内层 dyn——动态元素的固有箱）。
+impl MiddlewareServer for Middleware {
+    fn serve<'a>(
+        &'a self,
+        args: MiddlewareServerFnArgs,
+    ) -> impl Future<Output = Result<Value>> + Send + 'a {
+        self.server.call(args)
+    }
+}
+
 impl Default for Middleware {
     /// 空中间件：**直接透传**（对齐 TS「不设 server 则什么也不做」）。
     fn default() -> Self {
@@ -435,7 +605,7 @@ impl Middleware {
     /// let mw = Middleware::from_impl(InterimGoalsMw { get_events });
     /// ```
     pub fn from_impl<M: MiddlewareServer + 'static>(m: M) -> Middleware {
-        Middleware { server: Arc::new(m) }
+        Middleware { server: Arc::new(Erased(m)) }
     }
 }
 
@@ -457,6 +627,7 @@ mod tests {
     /// 不 per-call 克隆）——struct 形态与 server_state 形态都成立。
     #[tokio::test]
     async fn parameterized_middleware_state_persists_across_drives() {
+        #[derive(Clone)]
         struct CountingMw {
             calls: Arc<AtomicUsize>,
         }
@@ -475,9 +646,9 @@ mod tests {
 
         let calls = Arc::new(AtomicUsize::new(0));
         let wf = create_workflow(CreateWorkflowConfig::new("mw-count").input::<serde_json::Value>())
-            .middleware([Middleware::from_impl(CountingMw {
+            .middleware(Middleware::from_impl(CountingMw {
                 calls: Arc::clone(&calls),
-            })])
+            }))
             .handler(|ctx: WorkflowCtx| async move {
                 ctx.step("a", |_sc: StepCtx| async { Ok(serde_json::Value::Null) }).await
             });
@@ -497,12 +668,12 @@ mod tests {
         // server_state 形态：state 由框架代克隆（同一 Arc 跨 drive 递增）
         let state_calls = Arc::new(AtomicUsize::new(0));
         let wf2 = create_workflow(CreateWorkflowConfig::new("mw-state").input::<serde_json::Value>())
-            .middleware([Middleware::new().server_state(Arc::clone(&state_calls), |calls, mut sc| {
+            .middleware(Middleware::new().server_state(Arc::clone(&state_calls), |calls, mut sc| {
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
                     sc.next(None).await
                 }
-            })])
+            }))
             .handler(|ctx: WorkflowCtx| async move {
                 ctx.step("a", |_sc: StepCtx| async { Ok(serde_json::Value::Null) }).await
             });
@@ -523,6 +694,7 @@ mod tests {
     /// 三种形态（struct / server_state / 闭包）混装进同一条链。
     #[tokio::test]
     async fn middleware_forms_compose_together() {
+        #[derive(Clone)]
         struct Nop;
         impl MiddlewareServer for Nop {
             fn serve<'a>(
@@ -534,7 +706,7 @@ mod tests {
         }
         let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
         let wf = create_workflow(CreateWorkflowConfig::new("mw-mix").input::<serde_json::Value>())
-            .middleware([Middleware::from_impl(Nop)])
+            .middleware(Middleware::from_impl(Nop))
             .handler(|ctx: WorkflowCtx| async move {
                 ctx.step("a", |_sc: StepCtx| async { Ok(serde_json::Value::Null) }).await
             });

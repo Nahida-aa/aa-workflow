@@ -67,7 +67,7 @@ pub type GetEvents =
 /// `RunWorkflowOptions.meta` 传：
 ///
 /// ```ignore
-/// .middleware([interim_goals(get_events)])          // 挂一次
+/// .middleware(interim_goals(get_events))          // 挂一次
 /// RunWorkflowOptions::new(wf, store)
 ///     .meta(MetaBag::new().with::<InterimGoalsKey>(vec!["b".into()]))   // 每次可不同
 /// ```
@@ -88,6 +88,7 @@ where
 
 /// struct 形态（tower `Service` 同款）：参数是**字段**，`serve<'a>(&'a self)`
 /// 的 future 借 `&self`——零捕获仪式、零 per-call 克隆。
+#[derive(Clone)]
 struct InterimGoalsMw {
     get_events: Arc<GetEvents>,
 }

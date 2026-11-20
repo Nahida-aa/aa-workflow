@@ -49,7 +49,7 @@ fn workflow_with(
     serde_json::Value,
 > {
     create_workflow(CreateWorkflowConfig::new(id).input::<serde_json::Value>())
-        .middleware([mw])
+        .middleware(mw)
         .handler(move |ctx: WorkflowCtx| {
             let ran = ran.clone();
             async move {
@@ -102,9 +102,9 @@ async fn tower_timeout_layer_actually_times_out() {
     let wf = create_workflow(
         CreateWorkflowConfig::new("tower-timeout-hit").input::<serde_json::Value>(),
     )
-    .middleware([with_layer(tower::timeout::TimeoutLayer::new(
+    .middleware(with_layer(tower::timeout::TimeoutLayer::new(
         Duration::from_millis(50),
-    ))])
+    )))
     .handler(|ctx: WorkflowCtx| async move {
         ctx.step("slow", |_sc: StepCtx| async move {
             tokio::time::sleep(Duration::from_millis(500)).await;

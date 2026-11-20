@@ -109,6 +109,7 @@ pub fn dag_policies(shape: Arc<DagShape>, get_events: Arc<GetEvents>) -> Middlew
 
 /// struct 形态（tower `Service` 同款）：两个构造期参数都是**字段**，
 /// `serve<'a>(&'a self)` 的 future 借 `&self`——零捕获仪式、零 per-call 克隆。
+#[derive(Clone)]
 struct DagPoliciesMw {
     shape: Arc<DagShape>,
     get_events: Arc<GetEvents>,

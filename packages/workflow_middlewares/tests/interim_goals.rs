@@ -34,9 +34,9 @@ async fn parks_at_the_goal_step_and_does_not_run_later_steps() {
     let store_for_hook = store.clone();
 
     let wf = create_workflow(CreateWorkflowConfig::new("goal").input::<serde_json::Value>())
-        .middleware([interim_goals(move |run_id| {
+        .middleware(interim_goals(move |run_id| {
             Ok(store_for_hook.get_events(run_id)?)
-        })])
+        }))
         .handler(move |ctx: WorkflowCtx| {
             let log = log2.clone();
             async move {
@@ -114,10 +114,10 @@ async fn no_goals_means_no_parking() {
     let ran_in = ran.clone();
 
     let wf = create_workflow(CreateWorkflowConfig::new("noop").input::<serde_json::Value>())
-        .middleware([interim_goals(move |run_id| {
+        .middleware(interim_goals(move |run_id| {
             let _ = store_for_hook.get_events(run_id)?;
             Ok(vec![])
-        })])
+        }))
         .handler(move |ctx: WorkflowCtx| {
             let ran = ran_in.clone();
             async move {

@@ -38,9 +38,9 @@
 //!
 //! ```rust,ignore
 //! // 中间件：挂一次，不含 run 级参数
-//! .middleware([interim_goals(get_events)])
-//! .middleware([reseed(load_results)])
-//! .middleware([dag_policies(shape, get_events)])   // shape 是静态图，不是 run 级参数
+//! .middleware(interim_goals(get_events))
+//! .middleware(reseed(load_results))
+//! .middleware(dag_policies(shape, get_events))   // shape 是静态图，不是 run 级参数
 //!
 //! // run 级参数：每次 drive 各自给
 //! RunWorkflowOptions::new(wf, store)
@@ -53,7 +53,7 @@
 //!
 //! ```rust,ignore
 //! create_workflow(config)
-//!     .middleware([dag_policies(shape, get_events)])  // 策略照旧挂
+//!     .middleware(dag_policies(shape, get_events))  // 策略照旧挂
 //!     .handler(dag_to_handler(spec));                  // handler 天然最内层
 //! ```
 //!
