@@ -1,4 +1,4 @@
-# 0019 — DAG 声明式调度：`dag(spec)` / `dag_to_handler(spec)`
+# 0019 — DAG 声明式调度：`dag_scheduler(spec)` / `dag_to_handler(spec)`
 
 **状态**：已接受（2026-11-21）
 **关联**：[0006](0006-dag-dual-drive-and-middleware.md)、
@@ -36,7 +36,7 @@ pub struct DagSpec { pub id: String, pub nodes: BTreeMap<String, DagNode> }
 async fn run_dag(ctx: &WorkflowCtx, spec: &DagSpec) -> Result<BTreeMap<String, Value>>;
 
 // ① 中间件：接管 handler（Rust 一等能力）
-pub fn dag(spec: Arc<DagSpec>) -> Middleware;   // server 里 take_over()
+pub fn dag_scheduler(spec: Arc<DagSpec>) -> Middleware;   // server 里 take_over()
 
 // ② 工厂：用户自己控制 id/input/meta 元数据
 pub fn dag_to_handler(spec: Arc<DagSpec>) -> /* impl Fn(WorkflowCtx) -> BoxFuture */;
@@ -50,7 +50,7 @@ pub fn dag_to_handler(spec: Arc<DagSpec>) -> /* impl Fn(WorkflowCtx) -> BoxFutur
   `{ "results": { 节点 id → 结果 } }`，与 `dagToHandler` 的 `{ results }` 同形。
 - **声明期校验**由 `define_dag` 调 `DagShape::build` 完成：重复节点 / 未知依赖 /
   环全部在构建时报错；`__dag*` 前缀的节点 id 保留。
-- **组合顺序**：`dag(spec)` 必须是 `.middleware([...policies, dag(spec)])` 的
+- **组合顺序**：`dag_scheduler(spec)` 必须是 `.middleware([...policies, dag_scheduler(spec)])` 的
   最后一个——委托 [0007](0007-middleware-compose-order.md)，库不自动重排。
 
 ## 被否决的选项

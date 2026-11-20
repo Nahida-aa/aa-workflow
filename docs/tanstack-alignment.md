@@ -199,7 +199,7 @@ sleep 的保留信号名。
    上游对齐的写法仍然是 `ctx.emit` → `WorkflowEvent::Custom`；
    需要 step 归因时用 `progress`。示例见 `examples/store_file/src/progress_report.rs`。
    背景见 `docs/concepts/ctx-state.md`「那 step 内部的进度呢？」。
-7. **DAG 声明式调度（`dag` / `dag_to_handler`）**：**主线 TanStack 没有**——
+7. **DAG 声明式调度（`dag_scheduler` / `dag_to_handler`）**：**主线 TanStack 没有**——
    core 的 engine "has no list of them and no graph"
    （`run-workflow.ts:126-129`），release/docs 也只展示 code-as-DAG
    （`docs/dag-strategies.md` §1 强信号 #2）。本能力来自 f2-lite/wf-demo

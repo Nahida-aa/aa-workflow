@@ -146,7 +146,7 @@ handler 里跑哪些 step 仍由用户手写（测试里就是把 shape 的节�
 
 **自然形态**（两侧同构，对齐 wf-demo）：
 
-- `dag(spec)` 中间件：调 `take_over()` 接管 handler，按数据依赖调度全部
+- `dag_scheduler(spec)` 中间件：调 `take_over()` 接管 handler，按数据依赖调度全部
   `ctx.step`，run output 为 `{ "results": { 节点 id → 结果 } }`；
 - `dag_to_handler(spec)` 工厂：同一套调度逻辑做成 handler，供用户自己控制
   id / input / meta 等元数据。
@@ -161,12 +161,13 @@ memo 去重保证每节点恰好一个任务；节点函数收到 `(deps, input)
 实验线，是**有意偏离**；偏离点与代价在
 [ADR 0019](decisions/0019-dag-declarative-scheduling.md) 记录，不并进主线对齐口径。
 
-**组合约束**：`dag(spec)` 必须是 `.middleware([...policies, dag(spec)])` 的最后一个
+**组合约束**：`dag_scheduler(spec)` 必须是 `.middleware([...policies, dag_scheduler(spec)])` 的最后一个
 （最内层）——策略中间件的 `wrap_step` 必须先注册，否则调度调到的还是未包装的
 `ctx.step`，复用静默失效（ADR 0007 实测）。
 
 **通用约束核对**：不涉及新开 run；不碰 store 契约；命名沿用 wf-demo
-（`dag` / `dag_to_handler` / `DagSpec`）；「用户不写 handler」正是要消除的负担。
+（`dag_scheduler` / `dag_to_handler` / `DagSpec`，其中 Rust 把 TS 的 `dag` 改名为
+`dag_scheduler` 以与策略层 `dag_policies` 消歧）；「用户不写 handler」正是要消除的负担。
 
 ## 通用约束（本轮明确过的，新增功能都要过）
 

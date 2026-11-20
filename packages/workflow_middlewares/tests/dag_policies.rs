@@ -11,7 +11,9 @@ use aa_workflow_core::{
     RunWorkflowOptions, WorkflowCtx,
 };
 use aa_workflow_dag::{DagNode, DagShape, DagSpec, define_dag};
-use aa_workflow_middlewares::{DagPlan, DagPlanKey, INTERIM_GOAL_SIGNAL, dag, dag_policies};
+use aa_workflow_middlewares::{
+    DagPlan, DagPlanKey, INTERIM_GOAL_SIGNAL, dag_policies, dag_scheduler,
+};
 use serde_json::{Value, json};
 
 fn shape() -> Arc<DagShape> {
@@ -75,7 +77,7 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
     let wf = Arc::new(
         create_workflow(CreateWorkflowConfig::new("dag-pol").input::<serde_json::Value>())
             // dag 必须最后（最内层）：策略的 wrap_step 要先注册。
-            .middleware([dag_policies(shape(), loader(store.clone())), dag(spec)])
+            .middleware([dag_policies(shape(), loader(store.clone())), dag_scheduler(spec)])
             .handler(|_ctx: WorkflowCtx| async move { Ok(serde_json::json!(null)) }),
     );
 

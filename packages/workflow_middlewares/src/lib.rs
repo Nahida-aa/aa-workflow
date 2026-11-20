@@ -40,7 +40,7 @@
 //! .middleware([interim_goals(get_events)])
 //! .middleware([reseed(load_results)])
 //! .middleware([dag_policies(shape, get_events)])   // shape 是静态图，不是 run 级参数
-//! .middleware([dag(spec)])                         // 调度器最后（最内层，ADR 0007）
+//! .middleware([dag_scheduler(spec)])               // 调度器最后（最内层，ADR 0007）
 //!
 //! // run 级参数：每次 drive 各自给
 //! RunWorkflowOptions::new(wf, store)
@@ -64,16 +64,16 @@
 //! **中间件的构造参数只放静态配置**（`get_events` / `load_results` / `shape`），
 //! 不放「每次 run 可能不同」的东西——那些都走 `ctx.meta` 的类型化 key
 //! （`InterimGoalsKey` / `ReseedKey` / `DagPlan`）。
-mod dag;
+mod dag_policies;
 mod dag_scheduler;
 mod step_layer;
 mod interim_goals;
 mod reseed;
 
-pub use dag::{
+pub use dag_policies::{
     DagPlan, DagPlanAccess, DagPlanKey, GetEvents, INTERIM_GOAL_SIGNAL, dag_policies,
 };
-pub use dag_scheduler::dag;
+pub use dag_scheduler::dag_scheduler;
 pub use interim_goals::{InterimGoalsAccess, InterimGoalsKey, interim_goals};
 pub use reseed::{LoadResults, ReseedAccess, ReseedKey, ReseedPlan, SourceStep, reseed};
 
