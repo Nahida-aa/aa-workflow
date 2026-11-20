@@ -204,6 +204,28 @@ clone（借不到，编不过）。
 **两侧状态**：Rust 已实现（`create_middleware.rs`）；上游 TS 无对应物
 （TS 闭包原生捕获、无此问题）。
 
+## F9. 中间件注册 typestate 化（静态栈零箱、擦除逃生门）
+
+**状态**：已实现（ADR 0021）。
+
+**场景**：中间件注册的常态是**逐个**（`.middleware(a).middleware(b)`）；
+传列表（`.middleware([..])`）是少数需求——低代码/运行时动态决定集合。
+静态注册的洋葱应该在**类型层**组合（tower `ServiceBuilder` 同构），
+擦除只留给动态。
+
+**为什么现有手段不够**：列表形态把洋葱压成定义期逐层擦除（N+1 次箱）+
+drive 期逐层箱（2N 次）——静态注册本可以零箱到终点擦一次（tower/axum
+同款）。`next(ext)` 的 CPS 续延（每层每 drive 一次 pipeline 擦除）是协议
+结构性成本，不在消除范围。
+
+**自然形态**：`MiddlewareServer`（RPITIT，静态门，`Clone` 纪律）+
+`MiddlewareStack`（元组递归栈，`Append` 类型级追加）+ builder 第 5 类型
+参数 `TMw`；`.middleware(m)` 单件追加、`.middleware((a, b, c))` 静态列表、
+`.middleware_any(iter)` 擦除逃生门。`DynMiddlewareServer`（dyn）承接动态
+元素，任何静态中间件可按需擦除（blanket 互转）。
+
+**两侧状态**：Rust 已实现；上游 TS 无此分层（JS 闭包无此问题）。
+
 ## 通用约束（本轮明确过的，新增功能都要过）
 
 1. **隐式新开 run 默认禁止**。引擎在 resume 时内部创建新 run 而调用方不直接

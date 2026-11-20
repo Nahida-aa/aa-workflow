@@ -19,6 +19,7 @@ Y 时，这条记录在未来就是不可复核的。别的文件（`feature/`�
 | [0004](0004-signal-inbox.md) | 信号收件箱：可选能力方法（A'），core 投递过闸 | 已接受 |
 | [0005](0005-naming-reseedRun-redoSet.md) | 命名对齐：reseedRun / redoSet，不留 alias | 已接受 |
 | [0020](0020-scope-borrowed-middleware-server.md) | 中间件 server 改为 scope-borrowed：`MiddlewareServer` trait | 已接受 |
+| [0021](0021-typestate-middleware-registration.md) | 中间件注册 typestate 化：静态栈零箱、擦除只留给动态 | 已接受 |
 | [0006](0006-dag-dual-drive-and-middleware.md) | DAG 双驱动（core/runtime）+ DAG 作为中间件 | 已接受 |
 | [0007](0007-middleware-compose-order.md) | 中间件组合顺序约束：调度器必须在最内层 | 已接受 |
 | [0008](0008-drop-reference-generator.md) | 删除 docs/reference 生成器与生成物 | 已接受 |
