@@ -176,8 +176,9 @@ fn base_dir(tag: &str) -> PathBuf {
             "进程 B 不能重复 append SignalAwaited"
         );
 
-        aa_workflow_core::deliver_approval(store2.as_ref(), "approve:r", "review", true, None, 0)
-            .unwrap();
+        let outcome = aa_workflow_core::deliver_approval(store2.as_ref(), "approve:r", "review", true, None)
+        .unwrap();
+        assert_eq!(outcome, aa_workflow_core::DeliveryOutcome::Delivered);
         let (out, store2b) = t2.await.unwrap().unwrap();
         assert_eq!(out.status, RunStatus::Finished);
         assert_eq!(
@@ -254,7 +255,7 @@ fn base_dir(tag: &str) -> PathBuf {
             let w = st.waiting_for.expect("sleep 挂起应投影 waiting_for");
             assert_eq!(w.signal_name, "__timer");
             let step_id = w.step_id.expect("timer 挂起应有 step_id");
-            deliver_signal(store2.as_ref(), "invoice:r", SignalDelivery { signal_id: None, step_id: Some(step_id.to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None }, 0)
+            deliver_signal(store2.as_ref(), "invoice:r", SignalDelivery { signal_id: None, step_id: Some(step_id.to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None })
             .unwrap();
             out = Some(
                 drive(

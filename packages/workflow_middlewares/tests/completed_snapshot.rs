@@ -191,6 +191,7 @@ async fn completed_snapshot_never_contains_self() {
 async fn completed_accumulates_across_drives() {
     use aa_workflow_core::{deliver_signal, RunStore};
     use aa_workflow_core::define::MetaBag;
+    use aa_workflow_core::DeliveryOutcome;
     use aa_workflow_middlewares::{interim_goals, InterimGoalsKey, INTERIM_GOAL_SIGNAL};
 
     let store = Arc::new(InMemoryStore::new());
@@ -235,8 +236,15 @@ async fn completed_accumulates_across_drives() {
     assert_eq!(ran.lock().unwrap().clone(), vec!["a".to_string()]);
 
     // 续驱：a 已在日志里 → goals_done_at_start 成立 → 不重复泊车，b/c 跑完
-    deliver_signal(store.as_ref(), "acc:1", SignalDelivery { signal_id: None, step_id: None, name: INTERIM_GOAL_SIGNAL.to_string(), payload: serde_json::Value::Null, meta: None }, 0)
+    let outcome = deliver_signal(store.as_ref(), "acc:1", SignalDelivery {
+            signal_id: None,
+            step_id: None,
+            name: INTERIM_GOAL_SIGNAL.to_string(),
+            payload: serde_json::Value::Null,
+            meta: None,
+        })
     .unwrap();
+    assert_eq!(outcome, DeliveryOutcome::Delivered, "信号应当投递到泊车点");
     run_workflow(
         RunWorkflowOptions::new(Arc::new(wf), store.clone())
             .input(serde_json::json!({}))

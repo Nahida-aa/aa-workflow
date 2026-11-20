@@ -30,7 +30,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use aa_workflow_core::define::{MetaBag, MetaKey};
+use aa_workflow_core::define::MetaKey;
 use aa_workflow_core::middleware::{Middleware, MiddlewareServerFnArgs, StepRequest};
 
 use crate::step_layer::{step_layer, Decision};

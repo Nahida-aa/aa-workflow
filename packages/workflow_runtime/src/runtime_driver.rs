@@ -661,18 +661,13 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
         match &delivered {
             DeliverSignalResult::Delivered { run } => {
                 let workflow_id = run.workflow_id.clone();
-                aa_workflow_core::deliver_signal(
-                    run_store.as_ref(),
-                    &args.run_id,
-                    aa_workflow_core::SignalDelivery {
+                aa_workflow_core::deliver_signal(run_store.as_ref(), &args.run_id, aa_workflow_core::SignalDelivery {
                         signal_id: Some(args.signal_id.clone()),
                         step_id: None,
                         name: args.name.clone(),
                         payload: args.payload.clone(),
                         meta: args.meta.clone(),
-                    },
-                    now,
-                )?;
+                    })?;
                 let workflow = self.load_workflow(&workflow_id)?;
                 return self
                     .drive_claimed_run(DriveArgs {
@@ -777,14 +772,7 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
         let run_store = create_run_store_adapter(Arc::clone(&self.config.store));
         // 我们的 core：approve 的 pause key 即 approval_id。产出
         // `ApprovalResolved`（对齐上游 `APPROVAL_RESOLVED`，无 payload）。
-        aa_workflow_core::deliver_approval(
-            run_store.as_ref(),
-            &args.run_id,
-            &args.approval.approval_id,
-            args.approval.approved,
-            args.approval.feedback.as_deref(),
-            now,
-        )?;
+        aa_workflow_core::deliver_approval(run_store.as_ref(), &args.run_id, &args.approval.approval_id, args.approval.approved, args.approval.feedback.as_deref())?;
 
         let workflow = self.load_workflow(&workflow_id)?;
         // 同 `deliver_signal`：resume 必须带持久化的 input。

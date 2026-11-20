@@ -27,7 +27,7 @@
 //!   （与 TanStack 0.0.4 一致）。
 
 use std::time::Duration;
-use aa_workflow_core::{SignalDelivery, AnyWorkflowDefinition, Backoff, BaseCtx, CreateWorkflowConfig, RetryPolicy, StepCtx, StepOptions, WorkflowCtx, WorkflowDefinition, create_workflow};
+use aa_workflow_core::{AnyWorkflowDefinition, Backoff, BaseCtx, CreateWorkflowConfig, RetryPolicy, SignalDelivery, StepCtx, StepOptions, WorkflowCtx, WorkflowDefinition, create_workflow};
 
 // ========================================================================
 // 输入类型 = workflow 的「schema」（Rust 版 zod `inputSchema`）：serde
@@ -742,10 +742,10 @@ mod tests {
                 .get("feedback")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
-            deliver_approval(store.as_ref(), &run_id, step_id, approved, feedback.as_deref(), now_ms())
+            deliver_approval(store.as_ref(), &run_id, step_id, approved, feedback.as_deref())
             .unwrap();
         } else {
-            deliver_signal(store.as_ref(), &run_id, SignalDelivery { signal_id: None, step_id: Some(step_id.to_string()), name: String::new(), payload: payload, meta: None }, now_ms()).unwrap();
+            deliver_signal(store.as_ref(), &run_id, SignalDelivery { signal_id: None, step_id: Some(step_id.to_string()), name: String::new(), payload: payload, meta: None }).unwrap();
         }
         run_workflow(opts(wf.clone().into(), store.clone()))
             .outcome().await
@@ -788,7 +788,7 @@ mod tests {
             {
                 tokio::time::sleep(Duration::from_millis((due - now_ms()) as u64)).await;
             }
-            deliver_signal(store.as_ref(), &run_id, SignalDelivery { signal_id: None, step_id: Some(w.step_id.as_deref().expect("timer 挂起应有 step_id").to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None }, now_ms())
+            deliver_signal(store.as_ref(), &run_id, SignalDelivery { signal_id: None, step_id: Some(w.step_id.as_deref().expect("timer 挂起应有 step_id").to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None })
             .unwrap();
         }
     }
@@ -1117,7 +1117,7 @@ mod tests {
         // 驱动到泊上 `refund-policy`。
         let out = drive_through_timers(&store, &wf, opts).await;
         assert_eq!(out.status, RunStatus::Paused, "timer 后应泊在 refund-policy");
-        deliver_approval(store.as_ref(), "refund:q", "refund-policy", true, None, now_ms()).unwrap();
+        deliver_approval(store.as_ref(), "refund:q", "refund-policy", true, None).unwrap();
         let out = drive_through_timers(&store, &wf, opts).await;
         assert_eq!(out.status, RunStatus::Finished);
         assert_eq!(out.output.clone().unwrap()["status"], "refunded");
@@ -1436,7 +1436,7 @@ mod tests {
 
         // 进程 B：同 run_id 重跑 → state 从 initialize 重建为 5，`bump-inside`
         // 已被 checkpoint 记录 → 闭包跳过（+1 丢失），只剩闭包之外的 mutation。
-        deliver_approval(store.as_ref(), "state:edge", "gate", true, None, now_ms()).unwrap();
+        deliver_approval(store.as_ref(), "state:edge", "gate", true, None).unwrap();
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({ "amount": 5 }))
@@ -1491,7 +1491,7 @@ mod tests {
         assert_eq!(w.signal_name, "price-settled");
         assert!(st.pending_approval.is_none());
 
-        deliver_signal(store.as_ref(), "event:gate", SignalDelivery { signal_id: None, step_id: None, name: "price-settled".to_string(), payload: serde_json::json!({ "px": 62000 }), meta: None }, now_ms())
+        deliver_signal(store.as_ref(), "event:gate", SignalDelivery { signal_id: None, step_id: None, name: "price-settled".to_string(), payload: serde_json::json!({ "px": 62000 }), meta: None })
         .unwrap();
         // Drive #2 起：`sleep_until(0)` 会挂起，由 timer 投递推进。
         let out = drive_through_timers(&store, &wf, opts).await;
@@ -1531,7 +1531,7 @@ mod tests {
         };
         assert_eq!(drive_to_pause(&store, &wf, opts).await, RunStatus::Paused);
 
-        deliver_signal(store.as_ref(), "event:crash", SignalDelivery { signal_id: None, step_id: None, name: "price-settled".to_string(), payload: serde_json::json!({ "px": 3000 }), meta: None }, now_ms())
+        deliver_signal(store.as_ref(), "event:crash", SignalDelivery { signal_id: None, step_id: None, name: "price-settled".to_string(), payload: serde_json::json!({ "px": 3000 }), meta: None })
         .unwrap();
         // `sleep_until(0)` 也会挂起，由 timer 投递推进。
         let out = drive_through_timers(&store, &wf, opts).await;
