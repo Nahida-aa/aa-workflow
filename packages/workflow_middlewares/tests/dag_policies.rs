@@ -7,7 +7,7 @@ use aa_workflow_core::define::StepCtx;
 use aa_workflow_core::event::WorkflowEvent;
 use aa_workflow_dag::DagShape;
 use aa_workflow_core::{
-    create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunStore,
+    create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunStatus, RunStore,
     RunWorkflowOptions, WorkflowCtx,
 };
 
@@ -119,7 +119,8 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
         vec!["translate".to_string(), "merge".to_string()],
         "load/enrich 复用、merge 达成即停、publish 不跑"
     );
-    assert_ne!(format!("{:?}", out.status), "Finished", "应泊车");
+    // 真断言 Paused（同 interim_goals 的测试：`!= Finished` 会放过 Errored）。
+    assert_eq!(out.status, RunStatus::Paused, "应泊车");
     assert!(
         store
             .get_events("r2")

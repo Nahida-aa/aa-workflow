@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use aa_workflow_core::define::StepCtx;
 use aa_workflow_core::event::WorkflowEvent;
 use aa_workflow_core::{
-    CreateWorkflowConfig, InMemoryStore, RunStore, RunWorkflowOptions, SignalDelivery, WorkflowCtx,
-    create_workflow, run_workflow,
+    CreateWorkflowConfig, InMemoryStore, RunStatus, RunStore, RunWorkflowOptions, SignalDelivery,
+    WorkflowCtx, create_workflow, run_workflow,
 };
 
 use aa_workflow_core::define::MetaBag;
@@ -74,7 +74,9 @@ async fn parks_at_the_goal_step_and_does_not_run_later_steps() {
         vec!["a".to_string(), "b".to_string()],
         "目标 b 达成后应立刻停，c 不该执行"
     );
-    assert_ne!(format!("{:?}", out.status), "Finished");
+    // 真断言 Paused（曾经写成 `assert_ne!(.., Finished)`，而 `Decision::Park`
+    // 因错误类型被格式化而退化成 Errored——也满足 `!= Finished`，于是假通过）。
+    assert_eq!(out.status, RunStatus::Paused, "目标达成后应泊车");
 
     // 日志里有一条 __interim-goal 的 SignalAwaited，meta 带目标
     let has_await = store.get_events("g:1").unwrap().iter().any(|e| {

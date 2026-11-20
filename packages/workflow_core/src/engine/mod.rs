@@ -870,7 +870,23 @@ where
                 .map_err(|e| anyhow::anyhow!("step service not ready: {e}"))?;
             tower::Service::call(&mut chain, req).await
         }
-        .map_err(|e| anyhow::anyhow!("step middleware failed: {e}"))?;
+        .map_err(|e| {
+            // **泊车 / 取消是控制流，不是失败。** 它们由中间件经
+            // `StepCall::park` / 取消检查产生，类型是 `WorkflowParked` /
+            // `WorkflowCancelled`；上层的 `exec_step` 靠 `downcast_ref` 识别并
+            // 直接传播（不落 `STEP_FAILED`、不进重试）。
+            //
+            // 若在这里统一 `anyhow!("step middleware failed: {e}")`，类型会被
+            // 格式化抹掉，downcast 失效 → 泊车被当成 step 失败 → run 报 Errored
+            // 而不是 Paused。（组合测试 `combined.rs` 抓到的就是这个。）
+            if e.downcast_ref::<crate::engine::WorkflowParked>().is_some() {
+                return anyhow::Error::from(crate::engine::WorkflowParked);
+            }
+            if e.downcast_ref::<crate::engine::WorkflowCancelled>().is_some() {
+                return anyhow::Error::from(crate::engine::WorkflowCancelled);
+            }
+            anyhow::anyhow!("step middleware failed: {e}")
+        })?;
         return serde_json::from_value(raw).map_err(|e| {
             anyhow::anyhow!(
                 "step `{step_id}`: a step middleware result does not deserialize into \
