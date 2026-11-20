@@ -77,8 +77,9 @@ StepFinished{result, attempts}——耐久重试与补偿的持久化挂载点�
 `SignalResolved` 加的 `meta` 是个恒为 `None` 的空壳——挂起方向（`exec_pause_with`）
 一直收 `meta`，只有投递方向缺。
 
-已补：`SignalDelivery.meta` + args 透传 + `signal_event` / `signal_run` 增加 `meta`
-参数 + 三个 adapter 的收件箱消费也带上（in_memory / file 取 `delivery.meta`，
+已补：`SignalDelivery.meta` + args 透传 + 投递原语带 `meta`
+参数（彼时函数名 `signal_event` / `signal_run`，2026-11 已合并为
+deliver_signal / deliver_approval） + 三个 adapter 的收件箱消费也带上（in_memory / file 取 `delivery.meta`，
 postgres 从 jsonb 取，注意 `SignalDelivery` 是 `rename_all = "camelCase"`，键是
 `meta`）。端到端测试 `delivered_signal_meta_reaches_the_resolved_event` 钉住「投递的
 meta 原样落进 `SignalResolved.meta`」。
@@ -238,9 +239,13 @@ pause/非 abort → 若 `engine.compensations` 非空 → 逆序执行补偿链 
 - 测试：重试等待期杀驱动 → sweep → 同 attempt 号重入（幂等键稳定）→ 耗尽后
   终态。
 
-## 3. Phase 3 — 信号收件箱（评估先行）
+## 3. Phase 3 — 信号收件箱（已收官，见 3.1 最终形态）
 
-- Rust D3 现状：`signal_run`/`signal_event` **先经 store 契约持久化再驱动**
+> 下面的评估期 bullet 保留作历史（评估时函数名是 `signal_run`/`signal_event`，
+> 2026-11 已合并为 `deliver_signal`/`deliver_approval`；「D3 先持久化再驱动」
+> 的描述也已被过闸 + 可选收件箱取代）。
+
+- 评估期原状：投递先经 store 契约持久化再驱动
   （D3 形态）——需评估：run 尚未等待时的投递，当前是拒绝还是已按契约持久
   化？core 只区分"哪些需要持久化、哪些是运行时数据"，介质（磁盘与否）不在
   它的词汇里。
@@ -295,11 +300,12 @@ emit 即 append）再放行；`None` 回落既有 `find_resume` 全日志扫描�
 | runtime API | `runtime-driver.ts:49`/`:200` | `runtime_driver.rs` `deliver_signal` |
 | store 契约 | `runtime-driver.ts:272` `store.deliverSignal` | `in_memory_store.rs` `deliver_signal` |
 | 引擎消费点 | `run-workflow.ts:1095` `consumeBufferedSignal` | `exec_pause_with` → `consume_buffered_signal` |
-| core 投递原语 | **不存在**（core 只收 `signalDelivery` 作 resume 入参） | `signal_run` / `signal_event` |
+| core 投递原语 | **不存在**（core 只收 `signalDelivery` 作 resume 入参） | ~~`signal_run`/`signal_event`~~ → `deliver_signal` / `deliver_approval`（2026-11 三函数合并为二，过闸语义不变） |
 
 **core 直投原语已过闸**（对齐上游默认 `not-waiting` / `approval_lost`）：
-`signal_run` / `signal_approval` / `signal_event` 都只在目标确实泊着时落盘，否则报
-`SignalLost` 且不在日志留任何东西。原先「core 层无条件收件箱」随之移除——早到信号
+`deliver_signal` / `deliver_approval`（2026-11 由 `signal_run`/`signal_approval`/
+`signal_event` 三函数合并为二）都只在目标确实泊着时落盘，否则返回
+`NotWaiting` 且不在日志留任何东西。原先「core 层无条件收件箱」随之移除——早到信号
 改由上面的可选收件箱承接。
 
 ## 3.3 与 #19 的剩余差距（都是设计差，不是缺功能）
@@ -310,7 +316,7 @@ emit 即 append）再放行；`None` 回落既有 `find_resume` 全日志扫描�
    去重已由 `buffer_signal` 的 signalId 键补上（这是原先缺的那条）。
 2. **`__timer` 只在 store 单闸豁免**：上游在 core（`name !== '__timer'`）与 store
    （`in-memory-store.ts:165`）**双闸**；Rust 的 store 闸有（`buffer_signal` 拒收
-   `__timer`），core 等待点也有豁免，但 `signal_event(..., "__timer", ...)` 这条
+   `__timer`），core 等待点也有豁免，但 `deliver_signal(.., name: "__timer", ..)` 这条
    直投路径仍能注入——timer 的投递由 sweep 自己保证，实际不可达，但形状上少一道。
 3. **字段大小写**：`rename_all` 只作用于事件类型 tag，字段是 `signal_id` 而非
    `signalId`。这是 postgres 省略上游 `workflow_events_signal_id_idx` 的原因之一

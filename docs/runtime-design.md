@@ -400,7 +400,7 @@ drive 正常结束、进程可以走了。
 
 | | 上游 | 我们（改前） |
 | --- | --- | --- |
-| `approve` 挂起 | 1ms 返回 `paused` | **阻塞等外部 `signal_run`** |
+| `approve` 挂起 | 1ms 返回 `paused` | **阻塞等外部 `deliver_signal`** |
 | `sleep(60s)` | 0ms 返回 `paused` + `deadline` | **自轮询 60 秒**，同一次 drive 内恢复 |
 | 挂起期间需要进程活着吗 | **不需要** | **需要** |
 
@@ -466,7 +466,7 @@ Err(e) if e.downcast_ref::<WorkflowParked>().is_some() => {
 | `examples/.../runtime.rs` | `invoice_double_sleep_survives_restart` |
 
 **漏的是「阻塞式 approve」那一类**：它们在评估时被当作「已经是正确写法」（因为
-测试用的是 `spawn` + `wait_until` + 外部 `signal_run`），但那个写法的前提正是
+测试用的是 `spawn` + `wait_until` + 外部 `deliver_signal`），但那个写法的前提正是
 「drive 会一直阻塞」，所以也得改。教训：**别按「测试怎么写」分类，要按「依赖了
 哪个行为」分类**。
 

@@ -26,8 +26,8 @@ anyhow = "1"
 ```rust
 use std::sync::Arc;
 use aa_workflow_core::{
-    CreateWorkflowConfig, InMemoryStore, RunStatus, RunStore, RunWorkflowOptions, StepCtx,
-    Workflow, WorkflowDefinition, create_workflow, run_workflow, signal_event, signal_run,
+    CreateWorkflowConfig, DeliveryOutcome, InMemoryStore, RunStatus, RunStore, RunWorkflowOptions,
+    SignalDelivery, StepCtx, WorkflowDefinition, create_workflow, deliver_signal, run_workflow,
     // 下面各节还会用到：Middleware / StepOptions / RetryPolicy / Backoff
 };
 
@@ -52,7 +52,7 @@ fn charge_workflow() -> WorkflowDefinition<ChargeInput, serde_json::Value> {
 
 let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
 let outcome = run_workflow(
-    RunWorkflowOptions::new(Arc::new(charge_workflow().into_workflow()), store)
+    RunWorkflowOptions::new(charge_workflow(), store)
         .input(serde_json::json!({ "amount": 4200, "userId": "cus_123" })),
 ).outcome().await?;
 
@@ -76,9 +76,9 @@ let outcome = run_workflow(
 - **`.input::<T>()` 就是「有 schema」**：每次 drive 都做
   `from_value::<TInput>`,**缺字段 / 类型错 → run 直接 `Errored`**。这是它相对
   「裸 JSON」的主要收益。
-- 不要 schema 就用 `Workflow::new("id")` 入口 —— 下面「审批挂起」一节就是，
-  此时 `ctx.input` 是 `serde_json::Value`（且 `Workflow::new(...).handler(..)` 直接返回
-  `Workflow`,不需要 `.into_workflow()`;`create_workflow(..)` 返回 `WorkflowDefinition`)。
+- 没有明确 schema 就用 `.input::<serde_json::Value>()`（下面「审批挂起」一节就是），
+  此时 `ctx.input` 是 `serde_json::Value`。声明期的唯一入口是 `create_workflow(..)`
+  ——它返回 `WorkflowDefinition`，`RunWorkflowOptions::new` 直接吃它（泛型 `W`）。
 
 ### `serde_json::Value` 不是 TS 的 `any`
 
@@ -98,8 +98,9 @@ let outcome = run_workflow(
 `WorkflowParked`，drive 以 `Paused` 收尾，进程可以退出；唤醒一律来自外部。
 
 ```rust
-// 没有 input schema 时用 `Workflow::new`（返回 Workflow，不用 .into_workflow()）
-let wf = Workflow::new("order").handler(|ctx| async move {
+// 没有 schema 就声明 Value 输入
+let wf = create_workflow(CreateWorkflowConfig::new("order").input::<serde_json::Value>())
+    .handler(|ctx| async move {
     let decision = ctx.approve("large-order", "金额超限，需要人工放行").await?;
     if decision.get("approved").and_then(|v| v.as_bool()) != Some(true) {
         return Ok(serde_json::json!({ "status": "rejected" }));
@@ -115,9 +116,20 @@ let out = run_workflow(
 ).outcome().await?;
 assert_eq!(out.status, RunStatus::Paused);
 
-// 外部投递审批决定，再 drive 一次：前缀 checkpoint 短路，直接从唤醒点继续。
-signal_run(store.as_ref(), "order-1", "large-order",
-           serde_json::json!({ "approved": true }))?;
+// 外部投递审批决定（过闸：只落在确实泊着的等待点上；早到 = NotWaiting，
+// 幂等令牌防重复），再 drive 一次：前缀 checkpoint 短路，直接从唤醒点继续。
+let outcome = deliver_signal(
+    store.as_ref(),
+    "order-1",
+    SignalDelivery {
+        signal_id: Some("order-1:large-order".into()),  // 幂等令牌
+        step_id: None,                                  // None = 按 name 找等待点
+        name: "large-order".into(),
+        payload: serde_json::json!({ "approved": true }),
+        meta: None,
+    },
+)?;
+assert!(matches!(outcome, DeliveryOutcome::Delivered));
 let out = run_workflow(
     RunWorkflowOptions::new(Arc::new(wf.clone()), store)
         .input(serde_json::json!({ "amount": 1500 }))
@@ -130,14 +142,23 @@ assert_eq!(out.status, RunStatus::Finished);
 
 ```rust
 let payment = ctx.wait_for_event("payment", "payment-received").await?;
-// payment: serde_json::Value —— 投递方用 signal_event 带进来的 payload
+// payment: serde_json::Value —— 投递方用 deliver_signal 带进来的 payload
 ```
 
 投递方：
 
 ```rust
-signal_event(store.as_ref(), "checkout-1", "payment-received",
-             serde_json::json!({ "amount": 4200, "reference": "pi_1" }))?;
+deliver_signal(
+    store.as_ref(),
+    "checkout-1",
+    SignalDelivery {
+        signal_id: Some("pi_1".into()),
+        step_id: None,
+        name: "payment-received".into(),
+        payload: serde_json::json!({ "amount": 4200, "reference": "pi_1" }),
+        meta: None,
+    },
+)?;
 ```
 
 注意两个键的区别：`wait_for_event` 的第一个参数是 **pause key**（确定性重放用），
@@ -249,21 +270,28 @@ let v2 = create_workflow(CreateWorkflowConfig::new("pipeline").version("v2"))
 resume 时引擎读 run 里的 `workflowVersion`，在 `[当前] + previous_versions` 里
 选定义（`select_workflow_version`）；匹配不上不回退。
 
-## Recipe: 失败重试——新开一个 run
+## Recipe: 失败重试
 
-**失败即终局**：`STEP_FAILED` 只会 rethrow，不自动重跑。重试只有一条路：**新开一个 run**，
-把已完成的部分作为 input 带进去（`continue_from` 那套日志截断曾是本地扩展，
-因**不是上游能力**已删除，见 `AGENTS.md`）。
+两层。**attempt 内**：`StepOptions::retry`（`durable: true` 时失败泊车、sweep 续跑，
+attempts 跨驱动携带）。**终态后**（attempts 耗尽 / 修了 bug / 世界变了）：没有原地
+重试——`STEP_FAILED` 只会 rethrow。重跑 = **`reseedRun` 开新 run**：源 run 幸存的
+checkpoint 导入短路，失效名单（`redoSet`）里的步骤真实重算——`continue_from` 那套
+日志截断曾是本地扩展，因**不是上游能力**已删除（见 `AGENTS.md`）。
 
 ```rust
 let outcome = run_workflow(
-    RunWorkflowOptions::new(Arc::new(wf.clone()), store)
+    RunWorkflowOptions::new(wf.clone(), store)
         .input(json!({ "order_id": "o-1", "retry_of": "run-1" }))
         .run_id("run-2"),
 ).outcome().await?;
 ```
 
-跑一部分后停在某步用 `.target_step("gen-pdf")`（本地扩展，保留）。
+reseed 的机制与名单语义见 `docs/feature/_03_redo.md`；名单由上层形状图展开
+（`DagShape`，`packages/workflow_dag`），core 只透传。
+
+跑到某步后泊车（分段执行）走 `RunWorkflowOptions.meta` 的策略键
+（`MetaBag::new().with::<InterimGoalsKey>(..)`，由策略中间件消费）——策略参数不进
+引擎本体（ADR 0001/0011）；端到端用法见 `packages/workflow_dag/tests/dag_recovery_demo.rs`。
 
 
 ## Recipe: 换 store
@@ -298,9 +326,13 @@ store 是可插拔的，workflow 代码不动。本仓三个实现跑**同一份
   事件」，runtime 的 `classifyRun` 只看 store。原因是重放幂等——重 drive 一个已
   挂起的 run 一条新事件都不写。推导见 `docs/tanstack-alignment.md` 的「决策
   (2026-09-30)」。
-- 多了 `target_step`；少了 `recover` / `attach` / `signal` /
-  `threadId` / `outputSink` / `telemetry`（对照表见 `docs/tanstack-alignment.md`）。
-  （`continue_from` 曾是本地扩展，已因非上游能力删除。）
+- `signalDelivery` / `approval` / `attach` / `threadId` 已对齐上游（投递载荷是
+  `RunWorkflowOptions` 的入参，core 在 drive 内 `appendSeed` 落 `SIGNAL_RESOLVED`）。
+  仍少的：`recover`（认领过期 lease 后重放中断的恢复入口）/ `outputSink` /
+  `telemetry`。策略参数（泊车目标 /
+  redo 计划）不在引擎选项上，走 `meta` 通道（`MetaBag`，ADR 0001）。
+  （`continue_from` 曾是本地扩展，已因非上游能力删除；`target_step` 已退役为
+  meta 策略键。）
 - 挂起即返回：所有 pause 类原语写完 checkpoint 就结束本次 drive。
 
 ## Where next

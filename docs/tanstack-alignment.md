@@ -179,8 +179,9 @@ sleep 的保留信号名。
 5. **signals / pause**：TanStack 用 `ctx.approve` + `__timer`（sleep）内建；
    我们按同一语义落地：`ctx.approve(key, reason)` / `ctx.sleep(key, dur)` 在
    handler 内挂起，引擎持久化 `SIGNAL_AWAITED` checkpoint（`deadline` 是**绝对
-   时间戳**，供 timer 驱动器索引），外部 `signal_run(run_id, step_id, payload)`
-   追加 `SIGNAL_RESOLVED` 唤醒；重放时已交付的 `SIGNAL_RESOLVED` 从日志短路，挂起点
+   时间戳**，供 timer 驱动器索引），外部 `deliver_signal(store, run_id,
+   SignalDelivery { .. })` 追加 `SIGNAL_RESOLVED` 唤醒；重放时已交付的
+   `SIGNAL_RESOLVED` 从日志短路，挂起点
    幂等（绝无重复 append）。
    **挂起即返回**：写到挂起点就抛 `WorkflowParked`，drive 以 `Paused` 收尾，
    不阻塞——与上游 `throw new WorkflowPaused()` / `if (engine.paused) return`
@@ -214,7 +215,7 @@ sleep 的保留信号名。
 | `target_step` | 仅 `run-workflow.ts:1412` 一个**同名局部变量**，非选项 | 见上节 2 |
 | ~~`continue_from`~~ + ~~`truncate_log_at_step`~~ | `continueFrom` = **0**；上游 `RunStore` 只有 6 个方法 | **已删除**，见上节 1 |
 | `cancel_run` | `cancelRun` = **0** | 取消一个 run（写 `Aborted` 终局）；上游只有 `AbortSignal` |
-| `signal_run` / `signal_event` | `signalEvent` = **0**；上游 `RunStore` 接口**无投递方法** | 上游只有 ctx 侧 `waitForEvent`，**投递侧无公开入口** |
+| ~~`signal_run` / `signal_event`~~ → `deliver_signal` / `deliver_approval` | 上游已补投递面：store 契约 `deliverSignal`（四态）+ `RunWorkflowOptions.signalDelivery`/`approval`（`appendSeed` 在 drive 内落账，`run-workflow.ts:50/:409`） | 本仓同形态（2026-11 对齐；三函数合并为二，见 `docs/decisions/0004-signal-inbox.md`） |
 | `select_workflow_version` + `previous_versions` + `WorkflowVersionMismatch` | = **0** | **正确性保护**，非便利功能（见下） |
 | `StepState` + `fold_step_states` | `StepState` = **0 文件** | 事件折叠成 per-step 状态投影；上游有 `StepAttempt` 但无 `StepState` |
 | `StepProgress` + `StepCtx::progress` | = **0** | 见上节 6 |
@@ -322,7 +323,7 @@ ctx.sleep("a", 100ms) 与 ctx.sleep("b", 600s) 并发，park 用 ? 传播
 `SIGNAL_AWAITED` checkpoint——状态与日志分叉。`let _ =` / `.ok()` / `if let Ok(..)`
 都会踩。
 
-`signal_run` / `signal_event`（`engine/mod.rs:752` / `:780`）**读事件日志、不读
+`deliver_signal` / `deliver_approval` **读事件日志、不读
 `waiting_for`**（后者扫日志找最后一个 `name` 匹配的 `SignalAwaited`），所以
 信号投递也不依赖那个单槽。
 
@@ -334,8 +335,10 @@ ctx.sleep("a", 100ms) 与 ctx.sleep("b", 600s) 并发，park 用 ? 传播
 
 ```rust
 RunWorkflowOptions::new(workflow, run_store)   // 必填两项由 new() 强制
-    .input(..).run_id(..).target_step(..)
+    .input(..).run_id(..).meta(MetaBag::new()) // 策略通道（ADR 0001）
     .deadline(..).min_yield_remaining(..).yield_resume_at(..)
+    .thread_id(..).attach()
+    .signal_delivery(..).approval(..)
     .publish(Some(..))
 ```
 
@@ -347,12 +350,13 @@ RunWorkflowOptions::new(workflow, run_store)   // 必填两项由 new() 强制
 | `input` / `runId` | ✅ 同名 | |
 | `deadline` / `minYieldRemainingMs` / `yieldResumeAt` | ✅ 同名 | |
 | `publish` | ✅ `publish` | 位置从参数移进结构体；回调签名 `(run_id, event)` 与上游逐参一致 |
-| `signalDelivery` / `approval` | — | 形态差异：上游「带投递再跑一次」是一个调用；本仓先 `signal_run` / `signal_event` 落盘（`SIGNAL_RESOLVED`），再单独 drive（D3） |
+| `signalDelivery` / `approval` | ✅ 同名字段（2026-11 对齐） | 形态已与上游一致：载荷随 drive 进 `appendSeed`，由 core 落 `SIGNAL_RESOLVED`——不再是「先落盘再单独 drive」的 D3 两段式 |
 | `recover` | ❌ 暂无 | 「认领过期 lease 后重放中断的 run」。本仓有 `claim_stale_runs`（认领）但没有对应的恢复入口——**真缺口**，补它要连着 runtime 闭环 |
-| `attach` | ❌ 暂无 | 只读订阅已有 run（不驱动）。本仓 `subscribe` 只能 tail 事件，拿不到 RunState 快照 |
+| `attach` | ✅ `attach()` | 只读回放已有 run（不驱动） |
 | `signal`（AbortSignal） | ❌ 暂无 | 本仓有 `cancel_run`（写 Aborted 终局），不是 drive 参数 |
-| `threadId` / `outputSink` / `telemetry` | ❌ 暂无 | 无 thread 概念 / 无 OTel 集成 |
-| — | ➕ `target_step` | **本地扩展**（见上节 2；`continue_from` 曾是本地扩展，已删除） |
+| `threadId` | ✅ `thread_id` | 只写进 `RUN_STARTED` 事件，不落 store |
+| `outputSink` / `telemetry` | ❌ 暂无 | 无 OTel 集成 |
+| — | ➕ `meta` | **策略通道**（ADR 0001/0011）：`MetaBag` 类型化键承载泊车目标 / redo 计划等策略参数，由策略中间件消费——引擎本体不加业务参数（`target_step` 已退役为这条通道） |
 
 名字差异：旧版本仓叫 `RunOptions`，2026-09-18 起对齐为 `RunWorkflowOptions`。
 另注：上游把这个接口定义在 `engine/run-workflow.ts` 而非 `types.ts`（与 `RunStore`
