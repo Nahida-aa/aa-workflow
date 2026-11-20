@@ -17,7 +17,7 @@
 实际后果不是「少个语法糖」：`docs/.../dag_policies.rs` 的 handler 必须手写
 `for id in ["load", "enrich", "translate", "merge", "publish"]`，把 shape 里
 声明过的节点再抄一遍。图和执行没有驱动关系——改图不改 handler 不会报错，
-两边不一致也不会被发现。F7 的场景（声明 `DagSpec` 就自动按偏序跑）无从满足。
+两边不一致也不会被发现。F7 的场景（声明 `DagSpec` 就按依赖自动并发地跑）无从满足。
 
 ## 决策
 
@@ -75,7 +75,7 @@ pub fn dag_to_handler(spec: Arc<DagSpec>) -> /* impl Fn(WorkflowCtx) -> BoxFutur
 实现更简单，但波栅栏会让「第 1 波里先完成的节点」白等同波最慢的节点才推进
 后继。TS 参考实现明确按**每节点就绪**调度（`index.ts:174-176` 注释：
 「严格按 DAG 偏序，与手写 try_join! 的链级并发同构，无波栅栏的假等待」）。
-`tokio::sync::OnceCell` + `JoinSet` 足以实现真正的偏序，没有理由接受这层损失。
+`tokio::sync::OnceCell` + `JoinSet` 足以实现同样的**按依赖自动并发**，没有理由接受这层损失。
 
 ### 3. 改 core 让引擎持有 DAG 并自动调度
 
@@ -108,6 +108,6 @@ store 契约，违反 [0001](0001-strategy-vs-mechanism.md) 的策略/机制分�
   `next()` 前发的 step 绕过内层包装。
 - TS 参考：`wf-demo/packages/workflow-middlewares/src/dag.ts:34-62`（接管 /
   传值）、`wf-demo/packages/workflow-dag/src/index.ts:167-196`（memo 化
-  `ensure` 偏序调度）。
+  `ensure` 按依赖调度）。
 - ADR 0006 已记录 Rust/TS 中间件返回值差异（`:63-66`）；ADR 0007 已实测
   顺序错误的静默后果（`:30-39`）。

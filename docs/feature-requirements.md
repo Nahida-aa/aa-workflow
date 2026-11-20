@@ -133,7 +133,7 @@ TS 实验线 `learn_ls/wf-demo` 已有 `dag(spec)` 与 `dagToHandler(spec)` 两�
 handler 里跑哪些 step 仍由用户手写（测试里就是把 shape 的节点名抄一遍）。
 
 **场景**：用户声明 `DagSpec { id, nodes: { id → { deps, run } } }`，希望 workflow
-按依赖偏序自动执行全部节点：依赖结果按节点 id 传给下游，节点函数只通过
+按依赖关系自动并发执行全部节点（有依赖的按先后、无依赖的同时跑）：依赖结果按节点 id 传给下游，节点函数只通过
 `ctx.step` 做耐久副作用，用户**不写 handler**。
 
 **为什么现有手段不够**：
@@ -152,7 +152,7 @@ handler 里跑哪些 step 仍由用户手写（测试里就是把 shape 的节�
   id / input / meta 等元数据。
 
 调度语义（对齐 `wf-demo/workflow-dag/src/index.ts:167-196`）：每个节点一个任务，
-**自身依赖的 future 全部 resolve 后立即执行**（严格偏序、无波栅栏的假等待），
+**自身依赖的 future 全部 resolve 后立即执行**（按依赖自动并发、无波栅栏的假等待），
 memo 去重保证每节点恰好一个任务；节点函数收到 `(deps, input)`，`deps` 的键是
 直接依赖的节点 id。
 
