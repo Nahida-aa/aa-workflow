@@ -14,10 +14,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::define::{RetryPolicy, StepCtx, StepOptions};
 #[cfg(test)]
 use crate::define::AnyWorkflowDefinition;
-use crate::error::{RunError, StoreError, WorkflowError};
-use crate::event::{RunStatus, StepAttempt, StepState, StepStatus, WorkflowEvent};
+use crate::error::{RunError, WorkflowError};
+use crate::event::{RunStatus, StepAttempt, WorkflowEvent};
 use crate::resource::Gate;
-use crate::run_store::RunStore;
+use crate::run_store::{
+    DeliverApprovalArgs, DeliverSignalArgs, DeliveryOutcome, RunStore, SignalDelivery,
+};
 
 mod run_workflow;
 pub mod state_diff;
@@ -1546,33 +1548,30 @@ pub fn signal_run(
     payload: serde_json::Value,
     meta: Option<serde_json::Value>,
 ) -> Result<(), WorkflowError> {
-    let events = store.get_events(run_id)?;
-    let Some(name) = events.iter().rev().find_map(|ev| match ev {
-        WorkflowEvent::SignalAwaited { step_id: id, name, .. } if id == step_id => {
-            Some(name.clone())
-        }
-        _ => None,
-    }) else {
-        return Err(WorkflowError::SignalLost(format!(
-            "no step in run `{run_id}` is parked on a signal at step `{step_id}`"
-        )));
-    };
-    loop {
-        let n = store.get_events(run_id)?.len();
-        let ev = WorkflowEvent::SignalResolved {
-            ts: now_ms(),
-            run_id: run_id.to_string(),
-            step_id: step_id.to_string(),
-            name: name.clone(),
+    // 走 store 的原子投递（对齐上游 `deliverSignal`）——查泊车、去重、追加
+    // 在 store 内部一次完成，不在这里 get_events + append_event
+    // （那是两次独立调用，中间会有竞态窗口）。
+    let outcome = store.deliver_signal(DeliverSignalArgs {
+        run_id: run_id.to_string(),
+        delivery: SignalDelivery {
             signal_id: None,
-            payload: payload.clone(),
-            meta: meta.clone(),
-        };
-        match store.append_event(run_id, n, &ev) {
-            Ok(()) => return Ok(()),
-            Err(StoreError::Conflict { .. }) => continue,
-            Err(e) => return Err(e.into()),
-        }
+            step_id: Some(step_id.to_string()),
+            // 按 step 定位时 name 由 store 从日志里取；这里给空串作占位，
+            // store 实现在定位到 step 后会用日志里的真实 name 覆盖。
+            name: String::new(),
+            payload,
+            meta,
+        },
+        now: now_ms(),
+    })?;
+    match outcome {
+        DeliveryOutcome::Delivered | DeliveryOutcome::Duplicate => Ok(()),
+        DeliveryOutcome::NotWaiting => Err(WorkflowError::SignalLost(format!(
+            "no step in run `{run_id}` is parked on a signal at step `{step_id}`"
+        ))),
+        DeliveryOutcome::NotFound => Err(WorkflowError::SignalLost(format!(
+            "run `{run_id}` does not exist"
+        ))),
     }
 }
 
@@ -1591,32 +1590,22 @@ pub fn signal_approval(
     approved: bool,
     feedback: Option<&str>,
 ) -> Result<(), WorkflowError> {
-    let events = store.get_events(run_id)?;
-    let parked = events.iter().rev().any(|ev| matches!(
-        ev,
-        WorkflowEvent::ApprovalRequested { approval_id: id, .. } if id == approval_id
-    ));
-    if !parked {
-        return Err(WorkflowError::SignalLost(format!(
+    // 走 store 的原子投递（对齐上游 `deliverApproval`）。
+    let outcome = store.deliver_approval(DeliverApprovalArgs {
+        run_id: run_id.to_string(),
+        approval_id: approval_id.to_string(),
+        approved,
+        feedback: feedback.map(str::to_string),
+        now: now_ms(),
+    })?;
+    match outcome {
+        DeliveryOutcome::Delivered | DeliveryOutcome::Duplicate => Ok(()),
+        DeliveryOutcome::NotWaiting => Err(WorkflowError::SignalLost(format!(
             "run `{run_id}` is not parked on approval `{approval_id}`"
-        )));
-    }
-    loop {
-        let n = store.get_events(run_id)?.len();
-        let ev = WorkflowEvent::ApprovalResolved {
-            ts: now_ms(),
-            run_id: run_id.to_string(),
-            step_id: approval_id.to_string(),
-            approval_id: approval_id.to_string(),
-            approved,
-            feedback: feedback.map(str::to_string),
-            meta: None,
-        };
-        match store.append_event(run_id, n, &ev) {
-            Ok(()) => return Ok(()),
-            Err(StoreError::Conflict { .. }) => continue,
-            Err(e) => return Err(e.into()),
-        }
+        ))),
+        DeliveryOutcome::NotFound => Err(WorkflowError::SignalLost(format!(
+            "run `{run_id}` does not exist"
+        ))),
     }
 }
 
@@ -1638,37 +1627,25 @@ pub fn signal_event(
     payload: serde_json::Value,
     meta: Option<serde_json::Value>,
 ) -> Result<(), WorkflowError> {
-    let events = store.get_events(run_id)?;
-    let step_id = events.iter().rev().find_map(|ev| match ev {
-        WorkflowEvent::SignalAwaited { step_id, name, .. } if name == event_name => {
-            Some(step_id.clone())
-        }
-        _ => None,
-    });
-    match step_id {
-        Some(step_id) => {
-            let name = event_name.to_string();
-            let signal_id = signal_id.map(str::to_string);
-            loop {
-                let n = store.get_events(run_id)?.len();
-                let ev = WorkflowEvent::SignalResolved {
-                    ts: now_ms(),
-                    run_id: run_id.to_string(),
-                    step_id: step_id.clone(),
-                    name: name.clone(),
-                    signal_id: signal_id.clone(),
-                    payload: payload.clone(),
-                    meta: meta.clone(),
-                };
-                match store.append_event(run_id, n, &ev) {
-                    Ok(()) => return Ok(()),
-                    Err(StoreError::Conflict { .. }) => continue,
-                    Err(e) => return Err(e.into()),
-                }
-            }
-        }
-        None => Err(WorkflowError::SignalLost(format!(
+    // 走 store 的原子投递（对齐上游 `deliverSignal`）。
+    let outcome = store.deliver_signal(DeliverSignalArgs {
+        run_id: run_id.to_string(),
+        delivery: SignalDelivery {
+            signal_id: signal_id.map(str::to_string),
+            step_id: None,
+            name: event_name.to_string(),
+            payload,
+            meta,
+        },
+        now: now_ms(),
+    })?;
+    match outcome {
+        DeliveryOutcome::Delivered | DeliveryOutcome::Duplicate => Ok(()),
+        DeliveryOutcome::NotWaiting => Err(WorkflowError::SignalLost(format!(
             "no step in run `{run_id}` is parked on event `{event_name}`"
+        ))),
+        DeliveryOutcome::NotFound => Err(WorkflowError::SignalLost(format!(
+            "run `{run_id}` does not exist"
         ))),
     }
 }

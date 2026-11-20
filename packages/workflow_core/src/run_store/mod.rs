@@ -45,6 +45,55 @@ pub struct PendingApproval {
     pub meta: Option<serde_json::Value>,
 }
 
+/// 一次信号投递的载荷（对齐 TanStack `SignalDelivery`，`workflow-runtime/src/types.ts:148`）。
+///
+/// 由调用方构造，交给 [`RunStore::deliver_signal`]。`step_id` 为 `None` 时由 storeに按等待的 `name` 定位。
+#[derive(Debug, Clone)]
+pub struct SignalDelivery {
+    /// 幂等令牌：同一个 `signal_id` 重复投递应当是 `duplicate` 而非新建事件。
+    pub signal_id: Option<String>,
+    /// 指定的 step（`ctx.wait_for_event` 的暂停键）；`None` = 按 `name` 找当前泊车的 step。
+    pub step_id: Option<String>,
+    pub name: String,
+    pub payload: serde_json::Value,
+    pub meta: Option<serde_json::Value>,
+}
+
+/// [`RunStore::deliver_signal`] 的参数（对齐 `DeliverSignalArgs`，同文件 `:164`）。
+#[derive(Debug, Clone)]
+pub struct DeliverSignalArgs {
+    pub run_id: String,
+    pub delivery: SignalDelivery,
+    /// 写入事件的时间戳（幂等重试时应保持不变）。
+    pub now: i64,
+}
+
+/// [`RunStore::deliver_approval`] 的参数（对齐 `DeliverApprovalArgs`）。
+#[derive(Debug, Clone)]
+pub struct DeliverApprovalArgs {
+    pub run_id: String,
+    pub approval_id: String,
+    pub approved: bool,
+    pub feedback: Option<String>,
+    pub now: i64,
+}
+
+/// 投递结果（对齐 `DeliverSignalResult` / `DeliverApprovalResult`）。
+///
+/// **四态而非 `Result`**：「没人在等」在上游是**正常返回值**，不是异常。
+/// 用 `Err` 表示会迫使每个调用方 try/catch 一个预期之内的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    /// 已落盘。
+    Delivered,
+    /// 同一 `signal_id` 已投递过（幂等）。
+    Duplicate,
+    /// run 不在等这个信号 / 审批（已终态或在等别的）。
+    NotWaiting,
+    /// run 不存在。
+    NotFound,
+}
+
 /// 一个挂起中的等待（对齐 TanStack `RunAwaitable`，`types.ts:517-529`）。
 ///
 /// 这是 `RunState.awaiting` 的元素类型，也是**规范形**（canonical）：数组 +
@@ -325,6 +374,30 @@ pub trait RunStore: Send + Sync {
         _name: &str,
     ) -> Result<Option<WorkflowEvent>, StoreError> {
         Ok(None)
+    }
+
+    /// 投递一个信号（对齐上游 `WorkflowExecutionStore.deliverSignal`。`workflow-runtime/src/types.ts:340`）。
+    ///
+    /// **必须在实现内部原子完成三件事**：用 `signal_id` 去重、确认 run确实泊在
+    /// 这个信号上、追加 `SignalResolved`。三步放在一次调用里才能保证
+    /// 「查到泊车」与「追加」之间没有竞态窗口。
+    ///
+    /// 为什么不能像旧版 [`signal_event`](crate::engine::signal_event) 那样在自由函数里
+    /// `get_events` + `append_event`：那是两次独立调用，中间可能被别的写入插进去。
+    ///
+    /// 默认实现返回 [`DeliveryOutcome::NotFound`]（对应上游的可选 `?`）——不支持投递的 store
+    /// 不需改代码，函数上层会回落到旧行为。
+    fn deliver_signal(&self, _args: DeliverSignalArgs) -> Result<DeliveryOutcome, StoreError> {
+        Ok(DeliveryOutcome::NotFound)
+    }
+
+    /// 投递一个审批结果（对齐 `deliverApproval`）。原子性要求同
+    /// [`deliver_signal`](Self::deliver_signal)。
+    fn deliver_approval(
+        &self,
+        _args: DeliverApprovalArgs,
+    ) -> Result<DeliveryOutcome, StoreError> {
+        Ok(DeliveryOutcome::NotFound)
     }
 }
 

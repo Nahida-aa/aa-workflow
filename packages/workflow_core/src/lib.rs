@@ -66,4 +66,7 @@ pub use middleware::{
     StepService, StepServiceError,
 };
 pub use resource::{Gate, GateGuard, ResourceKey};
-pub use run_store::{DeleteReason, InMemoryStore, PendingApproval, RunAwaitable, RunState, RunStore, WaitForState};
+pub use run_store::{
+    DeliverApprovalArgs, DeliverSignalArgs, DeliveryOutcome, DeleteReason, InMemoryStore,
+    PendingApproval, RunAwaitable, RunState, RunStore, SignalDelivery, WaitForState,
+};
