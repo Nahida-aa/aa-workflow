@@ -43,7 +43,7 @@ use aa_workflow_core::middleware::{
     Middleware, MiddlewareServerFnArgs, StepRequest,
 };
 use crate::dag::core::DagShape;
-use crate::step_layer::{step_layer, Decision};
+use aa_workflow_core::middleware::{step_layer, Decision};
 
 /// 保留信号名（与 `__timer` 同族）。
 pub const INTERIM_GOAL_SIGNAL: &str = "__interim-goal";

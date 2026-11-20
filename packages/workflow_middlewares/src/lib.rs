@@ -73,7 +73,6 @@
 //! 不放「每次 run 可能不同」的东西——那些都走 `ctx.meta` 的类型化 key
 //! （`InterimGoalsKey` / `ReseedKey` / `DagPlan`）。
 mod dag;
-mod step_layer;
 mod interim_goals;
 mod reseed;
 

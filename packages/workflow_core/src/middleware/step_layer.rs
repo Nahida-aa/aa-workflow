@@ -1,8 +1,9 @@
-//! 把「一个判断函数」变成 tower `Layer` 的小工具。
+//! 把「一个判断函数」变成 tower `Layer<StepService>` 的工具——供中间件作者用。
 //!
-//! 三个内置策略的形状都是「看请求 → 决定 放行 / 短路 / 泊车」，差别只在判断
-//! 逻辑。tower 的 `Service` 样板（`poll_ready`、泛型约束、future 装箱）写三遍
-//! 没有意义，收成 [`step_layer`]。
+//! step 策略的形状都是「看请求 → 决定 放行 / 短路 / 泊车」，差别只在判断逻辑。
+//! tower 的 `Service` 样板（`poll_ready`、泛型约束、future 装箱）不必每家重写，
+//! 收成 [`step_layer`]。本模块操作的是 core 自己的 [`StepService`] / [`StepRequest`]
+//! / [`StepFuture`]，因此是 core 中间件机制的一部分，而不是某个具体中间件。
 //!
 //! ```ignore
 //! let layer = step_layer(move |req: StepRequest| {
@@ -11,9 +12,7 @@
 //! ```
 use std::sync::Arc;
 
-use aa_workflow_core::middleware::{
-    StepRequest, StepService, StepServiceError,
-};
+use crate::middleware::{StepRequest, StepService, StepServiceError};
 use tower::{Layer, Service};
 
 /// 一层对这个 step 的处置。
@@ -28,7 +27,7 @@ pub enum Decision {
         /// step 的结果。
         result: serde_json::Value,
         /// 出处。
-        from: aa_workflow_core::event::ImportedFrom,
+        from: crate::event::ImportedFrom,
     },
     /// 在边界泊车（整条 drive 结束）。
     Park {
@@ -76,7 +75,7 @@ pub struct PolicyService {
 impl Service<StepRequest> for PolicyService {
     type Response = serde_json::Value;
     type Error = StepServiceError;
-    type Future = aa_workflow_core::middleware::StepFuture;
+    type Future = crate::middleware::StepFuture;
 
     fn poll_ready(
         &mut self,
@@ -99,7 +98,7 @@ impl Service<StepRequest> for PolicyService {
             Decision::Skip(result) => req.skip(result),
             Decision::SkipImported { result, from } => req.skip_with_meta(
                 result,
-                aa_workflow_core::event::StepMeta {
+                crate::event::StepMeta {
                     imported_from: Some(from),
                 },
             ),

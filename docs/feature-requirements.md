@@ -140,7 +140,7 @@ handler 里跑哪些 step 仍由用户手写（测试里就是把 shape 的节�
 
 - `DagShape` 只算 `reseed_plan` 的名单（`from ∪ descendants`），不发起 step；
 - `dag_policies` 的 `Decision` 只有 `Pass / Skip / SkipImported / Park`
-  （`step_layer.rs:20-38`），只能处置 handler 已发出的 step，无法发起节点；
+  （`workflow_core::middleware::step_layer`），只能处置 handler 已发出的 step，无法发起节点；
 - 因此图对**执行**没有任何驱动力：声明与 handler 不一致时不会报错，
   改图还要同步改 handler 两处（ADR 0006 称之为「调度是 handler 的职责」）。
 

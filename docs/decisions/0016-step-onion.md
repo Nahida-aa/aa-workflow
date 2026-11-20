@@ -142,7 +142,7 @@ let chain = layers.into_iter().rev().fold(leaf, |inner, f| f(inner));
 ### 策略中间件
 
 三个策略都是「看请求 → 放行 / 短路 / 泊车」，tower 的 `Service` 样板收在
-`workflow_middlewares::step_layer`：
+`workflow_core::middleware::step_layer`（core 中间件机制的一部分，供中间件作者用）：
 
 ```rust
 sc.wrap_step(step_layer(move |req: &StepRequest| {

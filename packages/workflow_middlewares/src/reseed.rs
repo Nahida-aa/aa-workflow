@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use aa_workflow_core::middleware::{Middleware, MiddlewareServerFnArgs};
 
-use crate::step_layer::{step_layer, Decision};
+use aa_workflow_core::middleware::{step_layer, Decision};
 
 /// 一次 redo 的计划：从哪里播种、哪些 step 重跑。
 ///
