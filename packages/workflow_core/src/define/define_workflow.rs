@@ -426,7 +426,6 @@ impl<TInput, TOutput, TState, TMeta> WorkflowBuilder<TInput, TOutput, TState, TM
                 Box::pin(async move {
                     let sc = crate::middleware::MiddlewareServerFnArgs {
                         ctx: ctx.clone(),
-                        erased: ctx.clone(),
                         pipeline: Some(std::sync::Arc::new(
                             move |ext: Option<serde_json::Value>| {
                                 let inner = inner.clone();

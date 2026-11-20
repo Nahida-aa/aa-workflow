@@ -61,8 +61,6 @@ pub type NextFn = Arc<dyn Fn(Option<Value>) -> BoxFuture<'static, Result<Value>>
 pub struct MiddlewareServerFnArgs {
     /// 完整的 workflow ctx（`input` / `state` / `ext` / `meta`）。
     pub ctx: WorkflowCtx,
-    /// 擦除层的完整 ctx（clone 廉价：内部全是 `Arc`）。
-    pub(crate) erased: WorkflowCtx,
     /// 上游 `next` 参数的**实现**（不是 `next` 本身）。
     pub(crate) pipeline: Option<NextFn>,
 }
@@ -102,7 +100,7 @@ impl MiddlewareServerFnArgs {
             + 'static,
         <L::Service as tower::Service<StepRequest>>::Future: Send + 'static,
     {
-        self.erased.engine.wrap_step(layer.clone());
+        self.ctx.engine.wrap_step(layer.clone());
     }
 
     /// 推进到内层中间件与 handler —— 对齐上游 `next(opts)`（`run-workflow.ts:1502`）。
@@ -137,11 +135,6 @@ impl MiddlewareServerFnArgs {
     /// 例如 DAG 中间件。
     pub fn take_over(&mut self) {
         self.pipeline = None;
-    }
-
-    /// 擦除层的完整 ctx。
-    pub fn erased(&self) -> &WorkflowCtx {
-        &self.erased
     }
 }
 
