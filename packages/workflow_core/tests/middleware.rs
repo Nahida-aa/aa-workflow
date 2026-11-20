@@ -48,6 +48,19 @@ impl ExtNamespace for CountsNs {
 }
 aa_workflow_core::impl_ext_accessors!(CountsNs => CountsAccess, counts, try_counts);
 
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+struct Extra {
+    b: i64,
+}
+
+/// 第二个命名空间：模拟「来自另一个开发者」的中间件扩展。
+struct ExtraNs;
+impl ExtNamespace for ExtraNs {
+    const KEY: &'static str = "extra";
+    type Value = Extra;
+}
+aa_workflow_core::impl_ext_accessors!(ExtraNs => ExtraAccess, extra, try_extra);
+
 /// 直接返回 `Middleware<(), Ext>` 的写法（中间件作者固定扩展类型）。
 fn require_user() -> Middleware {
     Middleware::new().server(|mut sc: MiddlewareServerFnArgs| {
@@ -93,11 +106,14 @@ async fn extends_ctx_with_middleware_added_fields() {
 
 /// 对齐上游用例 2：`composes multiple middlewares in order, accumulating ctx fields`
 ///
-/// 上游 `m2` 读 `ctx.a`；Rust 里 `m2` 读 `sc.ctx.ext.counts_b()` —— 两个扩展
-/// 来自**不同**的中间件，使用者不需要定义任何「合并后的类型」。
+/// 上游 m1/m2 各加一个字段、handler `ctx.a + ctx.b`。
+/// Rust：两个**不同命名空间**（来自不同开发者）各写各的 JSON key，handler 分别读
+/// `ctx.ext.counts()` / `ctx.ext.extra()` 求和——使用者不需要定义任何「合并后的类型」
+/// （0015 的核心场景）。与上游的一个差异：中间件**之间**不通过 `sc.ctx.ext` 读前序
+/// 扩展（那是 handler 才有的能力，见本用例末尾说明），所以 m2 不依赖 m1 的值。
 #[tokio::test]
 async fn composes_multiple_middlewares_in_order_accumulating_ctx_fields() {
-    // m1 写 counts.a = 1
+    // m1 写 counts = { a: 1, b: 0 }
     let m1 = Middleware::new().server(|mut sc: MiddlewareServerFnArgs| {
         Box::pin(async move {
             sc.next(Some(
@@ -107,11 +123,23 @@ async fn composes_multiple_middlewares_in_order_accumulating_ctx_fields() {
         })
     });
 
+    // m2 写自己的 extra = { b: 10 }（独立命名空间，来自另一个开发者）
+    // 与上游用例 2 的差异：上游 m2 读前序 `ctx.a`；本仓 `sc.ctx.ext` 是最早构造的
+    // 快照，读不到 m1 经 next(ext) 写进 engine.ext_extra 的值——只有 handler 的
+    // ctx 会在调用时重读 ext_extra。故 m2 不读前序扩展（见 ADR 0015 的能力边界）。
+    let m2 = Middleware::new().server(|mut sc: MiddlewareServerFnArgs| {
+        Box::pin(async move {
+            sc.next(Some(DefExt::<ExtraNs>::new(Extra { b: 10 }).into_value()))
+                .await
+        })
+    });
+
     let wf = create_workflow(CreateWorkflowConfig::new("mw-chain").input::<Value>())
-        .middleware([m1])
+        .middleware([m1, m2])
         .handler(|ctx: WorkflowCtx| async move {
-            let c = ctx.ext.counts();
-            Ok(json!({ "a": c.a }))
+            // 两个来源的扩展分别读，无需合并类型
+            let sum = ctx.ext.counts().a + ctx.ext.extra().b;
+            Ok(json!({ "sum": sum }))
         });
 
     let out = run_workflow(
@@ -121,7 +149,7 @@ async fn composes_multiple_middlewares_in_order_accumulating_ctx_fields() {
     .await
     .unwrap();
     assert_eq!(out.status, RunStatus::Finished);
-    assert_eq!(out.output, Some(json!({ "a": 1 })));
+    assert_eq!(out.output, Some(json!({ "sum": 11 })));
 }
 
 /// 对齐上游用例 3：`wraps the handler so middleware can run code before AND after`
