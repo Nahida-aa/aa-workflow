@@ -1,5 +1,8 @@
-//! `dag` 模块命名空间：核心（`core`）= 从 `aa_workflow_dag` 复制的名单计算与调度。
+//! `dag` 模块命名空间：DAG 相关代码集中在此。
 //!
-//! 策略层 `dag_policies` 是平级文件，通过 `crate::dag::core` 使用这里的共享核心；
+//! - [`core`]：从 `aa_workflow_dag` 复制的名单计算与调度（shape / declare / scheduler）
+//! - [`policies`]：策略层中间件 `dag_policies`（redo 复用 + 目标泊车）
+//!
 //! 调度入口是 [`dag_to_handler`](crate::dag_to_handler)（作为 handler 用，天然最内层）。
 pub mod core;
+pub mod policies;

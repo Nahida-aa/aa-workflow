@@ -73,18 +73,16 @@
 //! 不放「每次 run 可能不同」的东西——那些都走 `ctx.meta` 的类型化 key
 //! （`InterimGoalsKey` / `ReseedKey` / `DagPlan`）。
 mod dag;
-mod dag_policies;
 mod step_layer;
 mod interim_goals;
 mod reseed;
 
-// DAG 核心（名单 + 调度）从 aa_workflow_dag 复制而来，在此 re-export，
-// 让本包自包含；调用方无需再依赖 aa_workflow_dag。
+// DAG 代码集中在 dag 模块，在此 re-export 让调用方路径简洁。
 pub use dag::core::{
     DagNode, DagRunFn, DagShape, DagSpec, RedoPlan, ShapeError, dag_to_handler, define_dag,
     run_dag,
 };
-pub use dag_policies::{
+pub use dag::policies::{
     DagPlan, DagPlanAccess, DagPlanKey, GetEvents, INTERIM_GOAL_SIGNAL, dag_policies,
 };
 pub use interim_goals::{InterimGoalsAccess, InterimGoalsKey, interim_goals};
