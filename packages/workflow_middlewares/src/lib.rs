@@ -25,12 +25,14 @@
 //!
 //! Rust 侧还**多**两项能力：包装层能 `park`（在 step 边界停下整条 drive），
 //! `server` 也能 `take_over`（跳过 handler 直接出结果）。见
-//! `docs/decisions/0016-step-onion.md`。
+//! `docs/decisions/0016-step-onion.md`。`take_over` 的首个实际用户是
+//! [`dag`](crate::dag)：它据此**发起** step、按图调度全部节点，用户不写 handler
+//! （TS 没有这个能力，只能经 `ctx.dagResults` 转手）。见 `docs/decisions/0019`。
 //!
 //! # 使用者不用写 `<Ext>`（内置中间件固定 `Middleware<(), ()>`）
 //!
-//! 三个内置中间件都是**不写扩展**的策略（只读 `meta` / `input`），所以它们的构造函数
-//! 返回 `Middleware<(), ()>` 而不是泛型未知的 `Middleware`。好处是调用点
+//! 内置中间件都是**不写扩展**的策略（只读 `meta` / `input`），所以它们的构造函数
+//! 返回统一的 `Middleware` 而不是泛型未知的 `Middleware`。好处是调用点
 //! **完全不用写类型参数**：
 //!
 //! ```rust,ignore
@@ -38,6 +40,7 @@
 //! .middleware([interim_goals(get_events)])
 //! .middleware([reseed(load_results)])
 //! .middleware([dag_policies(shape, get_events)])   // shape 是静态图，不是 run 级参数
+//! .middleware([dag(spec)])                         // 调度器最后（最内层，ADR 0007）
 //!
 //! // run 级参数：每次 drive 各自给
 //! RunWorkflowOptions::new(wf, store)
@@ -62,6 +65,7 @@
 //! 不放「每次 run 可能不同」的东西——那些都走 `ctx.meta` 的类型化 key
 //! （`InterimGoalsKey` / `ReseedKey` / `DagPlan`）。
 mod dag;
+mod dag_scheduler;
 mod step_layer;
 mod interim_goals;
 mod reseed;
@@ -69,6 +73,7 @@ mod reseed;
 pub use dag::{
     DagPlan, DagPlanAccess, DagPlanKey, GetEvents, INTERIM_GOAL_SIGNAL, dag_policies,
 };
+pub use dag_scheduler::dag;
 pub use interim_goals::{InterimGoalsAccess, InterimGoalsKey, interim_goals};
 pub use reseed::{LoadResults, ReseedAccess, ReseedKey, ReseedPlan, SourceStep, reseed};
 

@@ -17,6 +17,7 @@
 | F4 | 信号收件箱（buffer_signals） | ✅（基线 taren 分支） | ✅ | 已实现（Rust 侧 `c536e03` 等） |
 | F5 | 耐久重试 + 补偿 | ✅ | ✅ | 已实现 |
 | F6 | INVALIDATED 耐久失效原语 | ❌ | ❌ | **已评估：不做**（区别于 F2 redo/seed，见 `docs/concepts/redo-vs-invalidation.md`） |
+| F7 | DAG 声明式调度（图驱动 handler） | ✅（wf-demo `dag` / `dagToHandler`） | ❌（只有 `dag_policies` 策略层） | **已接受未落地**（ADR 0006/0007） |
 
 ## F1. 同 run 继续：resume + 失效名单 + 临时目标
 
@@ -122,6 +123,50 @@ TS 侧基线 `taren/durable-recovery` 原生有 `bufferSignals`。
 更详尽 rationale（engine complexity、redo trade-offs、decision tree、upstream
 supporting points）见 `docs/concepts/redo-vs-invalidation.md`（ADR 式，编号与本仓
 F1/F2/F6 对齐）。
+
+## F7. DAG 声明式调度（图驱动 handler）
+
+**状态**：设计已接受（[ADR 0006](decisions/0006-dag-dual-drive-and-middleware.md) /
+[0007](decisions/0007-middleware-compose-order.md)），**Rust 侧未实现**。
+TS 实验线 `learn_ls/wf-demo` 已有 `dag(spec)` 与 `dagToHandler(spec)` 两个入口；
+本仓目前只有 `DagShape`（名单计算）和 `dag_policies`（策略层），**调度那一半缺失**——
+handler 里跑哪些 step 仍由用户手写（测试里就是把 shape 的节点名抄一遍）。
+
+**场景**：用户声明 `DagSpec { id, nodes: { id → { deps, run } } }`，希望 workflow
+按依赖偏序自动执行全部节点：依赖结果按节点 id 传给下游，节点函数只通过
+`ctx.step` 做耐久副作用，用户**不写 handler**。
+
+**为什么现有手段不够**：
+
+- `DagShape` 只算 `reseed_plan` 的名单（`from ∪ descendants`），不发起 step；
+- `dag_policies` 的 `Decision` 只有 `Pass / Skip / SkipImported / Park`
+  （`step_layer.rs:20-38`），只能处置 handler 已发出的 step，无法发起节点；
+- 因此图对**执行**没有任何驱动力：声明与 handler 不一致时不会报错，
+  改图还要同步改 handler 两处（ADR 0006 称之为「调度是 handler 的职责」）。
+
+**自然形态**（两侧同构，对齐 wf-demo）：
+
+- `dag(spec)` 中间件：调 `take_over()` 接管 handler，按数据依赖调度全部
+  `ctx.step`，run output 为 `{ "results": { 节点 id → 结果 } }`；
+- `dag_to_handler(spec)` 工厂：同一套调度逻辑做成 handler，供用户自己控制
+  id / input / meta 等元数据。
+
+调度语义（对齐 `wf-demo/workflow-dag/src/index.ts:167-196`）：每个节点一个任务，
+**自身依赖的 future 全部 resolve 后立即执行**（严格偏序、无波栅栏的假等待），
+memo 去重保证每节点恰好一个任务；节点函数收到 `(deps, input)`，`deps` 的键是
+直接依赖的节点 id。
+
+**与上游主线的关系**：TanStack 主线 core 无图、无调度（code-as-DAG handler
+重放，见 `docs/dag-strategies.md` §1 强信号 #2）。本能力来自本仓 f2-lite/wf-demo
+实验线，是**有意偏离**；偏离点与代价在
+[ADR 0019](decisions/0019-dag-declarative-scheduling.md) 记录，不并进主线对齐口径。
+
+**组合约束**：`dag(spec)` 必须是 `.middleware([...policies, dag(spec)])` 的最后一个
+（最内层）——策略中间件的 `wrap_step` 必须先注册，否则调度调到的还是未包装的
+`ctx.step`，复用静默失效（ADR 0007 实测）。
+
+**通用约束核对**：不涉及新开 run；不碰 store 契约；命名沿用 wf-demo
+（`dag` / `dag_to_handler` / `DagSpec`）；「用户不写 handler」正是要消除的负担。
 
 ## 通用约束（本轮明确过的，新增功能都要过）
 

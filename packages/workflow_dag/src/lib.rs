@@ -1,19 +1,25 @@
 //! # aa_workflow_dag
 //!
-//! 结构化编排层（对齐 TS 侧 `workflow-dag` 包的定位）：**形状声明
-//! （aa_graph）→ 闭包展开 → 引擎名单透传**。core 不知道任何 DAG——本
-//! crate 是「DAG 术语」唯一合法的驻地：把使用者声明的形状图和源 run 日志
-//! 折算成失效名单（[`RedoPlan`]），交给 `reseed` 中间件。
+//! 结构化编排层（对齐 f2-lite / `wf-demo` 实验线的 `workflow-dag`；**上游主线
+//! TanStack 没有 DAG 包**）：形状声明（aa_graph）→ 闭包展开 → 引擎名单透传，
+//! 以及按图驱动 `ctx.step` 的声明式调度（[`declare`]，见 ADR 0019）。
+//! core 不知道任何 DAG——本 crate 是「DAG 术语」唯一合法的驻地：把使用者声明的
+//! 形状图和源 run 日志折算成失效名单（[`RedoPlan`]），交给 `reseed` 中间件；
+//! 调度半边则由 [`dag_to_handler`] / middlewares 的 `dag` 中间件发起 step。
 //!
-//! 分层契约（对齐 TS 侧已验证的分工）：
+//! 分层契约（对齐 wf-demo 已验证的分工）：
 //!
 //! | 层 | 收什么 | 计算 |
 //! | --- | --- | --- |
 //! | `reseed` 中间件 | 展开后的名单 | 无（名单透传，不校验封闭性） |
-//! | 本 crate | `from`（种子）；缺省 = 源日志未成功节点 | `种子 ∪ descendants_from(种子)` |
+//! | 本 crate（名单） | `from`（种子）；缺省 = 源日志未成功节点 | `种子 ∪ descendants_from(种子)` |
+//! | 本 crate（调度） | [`DagSpec`] 的节点 + 直接依赖 | 偏序驱动 `ctx.step`，依赖结果传下游 |
 //!
 //! demo 测试见 `tests/dag_recovery_demo.rs`（五个场景：四个引擎原语 +
 //! 形状图合龙）。
+
+pub mod declare;
+pub use declare::{DagNode, DagRunFn, DagSpec, dag_to_handler, define_dag, run_dag};
 
 use aa_graph::dag::{builder::DagBuilder, error::DagError, static_dag::StaticDag};
 use aa_workflow_core::WorkflowEvent;

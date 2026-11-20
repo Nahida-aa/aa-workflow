@@ -1,17 +1,18 @@
 //! 验证 DAG 策略中间件：redo 复用 + 临时目标泊车，计划走 `meta` 的 `DagPlanKey`。
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use aa_workflow_core::define::StepCtx;
 use aa_workflow_core::event::WorkflowEvent;
-use aa_workflow_dag::DagShape;
+use aa_workflow_core::StepCtx;
 use aa_workflow_core::{
     create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunStatus, RunStore,
     RunWorkflowOptions, WorkflowCtx,
 };
-
-use aa_workflow_middlewares::{DagPlan, DagPlanKey, INTERIM_GOAL_SIGNAL, dag_policies};
+use aa_workflow_dag::{DagNode, DagShape, DagSpec, define_dag};
+use aa_workflow_middlewares::{DagPlan, DagPlanKey, INTERIM_GOAL_SIGNAL, dag, dag_policies};
+use serde_json::{Value, json};
 
 fn shape() -> Arc<DagShape> {
     // 菱形：load → (enrich, translate) → merge → publish
@@ -38,33 +39,44 @@ fn loader(store: Arc<InMemoryStore>) -> Arc<aa_workflow_middlewares::GetEvents> 
     })
 }
 
+/// 每个节点把 id 记进 `exec`——不再由 handler 手写 step 列表。
+fn recording_node(exec: &Arc<Mutex<Vec<String>>>, deps: &[&str], id: &'static str) -> DagNode {
+    let exec = exec.clone();
+    DagNode::new(deps.iter().copied(), move |_deps, _input: Value| {
+        let exec = exec.clone();
+        async move {
+            exec.lock().unwrap().push(id.to_string());
+            Ok(json!({ "id": id }))
+        }
+    })
+}
+
 #[tokio::test]
 async fn redo_reuse_and_goal_park_via_dag_plan() {
     let store = Arc::new(InMemoryStore::new());
     let exec: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
-    // **一个 definition 跑两次 run**——plan 走 meta，中间件不含它。
-    let exec_in_wf = exec.clone();
+    // **一个 definition 跑多次 run**——plan 走 meta，中间件不含它。
+    // 调度按图自动进行：handler 只是空壳（dag 中间件 take_over 后不会执行）。
+    let spec = define_dag(DagSpec {
+        id: "dag-pol".into(),
+        nodes: BTreeMap::from([
+            ("load".into(), recording_node(&exec, &[], "load")),
+            ("enrich".into(), recording_node(&exec, &["load"], "enrich")),
+            ("translate".into(), recording_node(&exec, &["load"], "translate")),
+            (
+                "merge".into(),
+                recording_node(&exec, &["enrich", "translate"], "merge"),
+            ),
+            ("publish".into(), recording_node(&exec, &["merge"], "publish")),
+        ]),
+    })
+    .unwrap();
     let wf = Arc::new(
         create_workflow(CreateWorkflowConfig::new("dag-pol").input::<serde_json::Value>())
-            .middleware([dag_policies(shape(), loader(store.clone()))])
-            .handler(move |ctx: WorkflowCtx| {
-                let exec = exec_in_wf.clone();
-                async move {
-                    for id in ["load", "enrich", "translate", "merge", "publish"] {
-                        let exec = exec.clone();
-                        let sid = id.to_string();
-                        // `FnOnce`：闭包只跑一次，`async move` 可以直接消耗捕获值，
-                        // 不必先 clone 一份。
-                        ctx.step(id, move |_sc: StepCtx| async move {
-                            exec.lock().unwrap().push(sid.clone());
-                            Ok(serde_json::json!({ "id": sid }))
-                        })
-                        .await?;
-                    }
-                    Ok(serde_json::json!({ "ok": true }))
-                }
-            }),
+            // dag 必须最后（最内层）：策略的 wrap_step 要先注册。
+            .middleware([dag_policies(shape(), loader(store.clone())), dag(spec)])
+            .handler(|_ctx: WorkflowCtx| async move { Ok(serde_json::json!(null)) }),
     );
 
     // r1：不给 plan → 全跑
@@ -76,15 +88,12 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
     .outcome()
     .await
     .unwrap();
+    // enrich / translate 是 fan-out，彼此先后不定；排序后比集合。
+    let mut got = exec.lock().unwrap().clone();
+    got.sort();
     assert_eq!(
-        exec.lock().unwrap().clone(),
-        vec![
-            "load".to_string(),
-            "enrich".to_string(),
-            "translate".to_string(),
-            "merge".to_string(),
-            "publish".to_string(),
-        ]
+        got,
+        vec!["enrich", "load", "merge", "publish", "translate"]
     );
 
     // rev2：from=translate（重跑 translate/merge/publish），goals=[merge]
@@ -128,7 +137,7 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
     );
 
     // rev2 日志里 load/enrich 也有 checkpoint（复用提交的）→ 重放可短路
-    let finished: Vec<String> = store
+    let mut finished: Vec<String> = store
         .get_events("r2")
         .unwrap()
         .iter()
@@ -137,14 +146,10 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
             _ => None,
         })
         .collect();
+    finished.sort();
     assert_eq!(
         finished,
-        vec![
-            "load".to_string(),
-            "enrich".to_string(),
-            "translate".to_string(),
-            "merge".to_string(),
-        ],
+        vec!["enrich", "load", "merge", "translate"],
         "load/enrich/translate/merge 都有 checkpoint"
     );
 
