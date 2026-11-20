@@ -34,9 +34,14 @@
 //! **完全不用写类型参数**：
 //!
 //! ```rust,ignore
-//! .middleware([interim_goals(vec!["b".into()], get_events)])
+//! // 中间件：挂一次，不含 run 级参数
+//! .middleware([interim_goals(get_events)])
 //! .middleware([reseed(plan, load_results)])
 //! .middleware([dag_policies(shape, get_events)])
+//!
+//! // run 级参数：每次 drive 各自给
+//! RunWorkflowOptions::new(wf, store)
+//!     .meta(MetaBag::new().with::<InterimGoalsKey>(vec!["b".into()]))
 //! ```
 //!
 //! **给中间件作者的建议**：如果你的中间件不写 `ctx.ext`，函数返回值就写成
@@ -56,7 +61,7 @@ mod interim_goals;
 mod reseed;
 
 pub use dag::{DAG_PLAN_FIELD, GetEvents, INTERIM_GOAL_SIGNAL, dag_policies};
-pub use interim_goals::{INTERIM_GOALS_FIELD, interim_goals};
+pub use interim_goals::{InterimGoalsAccess, InterimGoalsKey, interim_goals};
 pub use reseed::{LoadResults, ReseedPlan, SourceStep, reseed};
 
 /// 供文档链接用：把常用名字提上来，避免调用方再导一遍 core。

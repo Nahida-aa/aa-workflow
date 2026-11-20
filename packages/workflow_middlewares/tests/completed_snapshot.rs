@@ -190,7 +190,8 @@ async fn completed_snapshot_never_contains_self() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn completed_accumulates_across_drives() {
     use aa_workflow_core::{signal_event, RunStore};
-    use aa_workflow_middlewares::{interim_goals, INTERIM_GOAL_SIGNAL};
+    use aa_workflow_core::define::MetaBag;
+    use aa_workflow_middlewares::{interim_goals, InterimGoalsKey, INTERIM_GOAL_SIGNAL};
 
     let store = Arc::new(InMemoryStore::new());
     let store_for_hook = store.clone();
@@ -198,7 +199,7 @@ async fn completed_accumulates_across_drives() {
     let ran_in = ran.clone();
 
     let wf = create_workflow(CreateWorkflowConfig::new("acc").input::<serde_json::Value>())
-        .middleware([interim_goals(vec!["a".into()], move |run_id| {
+        .middleware([interim_goals(move |run_id| {
             Ok(store_for_hook.get_events(run_id)?)
         })])
         .handler(move |ctx: WorkflowCtx| {
@@ -225,6 +226,7 @@ async fn completed_accumulates_across_drives() {
     run_workflow(
         RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
             .input(serde_json::json!({}))
+            .meta(MetaBag::new().with::<InterimGoalsKey>(vec!["a".to_string()]))
             .run_id("acc:1"),
     )
     .outcome()
@@ -245,6 +247,7 @@ async fn completed_accumulates_across_drives() {
     run_workflow(
         RunWorkflowOptions::new(Arc::new(wf), store.clone())
             .input(serde_json::json!({}))
+            .meta(MetaBag::new().with::<InterimGoalsKey>(vec!["a".to_string()]))
             .run_id("acc:1"),
     )
     .outcome()

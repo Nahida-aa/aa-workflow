@@ -17,12 +17,20 @@
 //! 所以续驱时已完成的 step 不会被重复计入 → 不会重复泊车。
 //! 开局即已达成（续驱 / reseed 导入）的情况由 `goals_done_at_start` 显式挡掉。
 //!
+//! # 参数只从 `RunWorkflowOptions.meta` 来
+//!
+//! 中间件是**提前配置**的（挂一次、跑很多次），目标却是**每次 drive 可能不同**的。
+//! 所以目标走 `ctx.meta` 的 [`InterimGoalsKey`]，构造时不接收——
+//! 与 `ctx.ext`（中间件运行期写）/ `ctx.meta`（调用方每次 run 写）的分工一致
+//! （见 `define/meta.rs` 的模块文档）。
+//!
 //! # 需要 store
 //!
 //! 判断「开局目标是否已达成」要读日志，构造时注入 `get_events`。
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use aa_workflow_core::define::{MetaBag, MetaKey};
 use aa_workflow_core::middleware::{Middleware, MiddlewareServerFnArgs, StepRequest};
 
 use crate::step_layer::{step_layer, Decision};
@@ -30,8 +38,22 @@ use crate::step_layer::{step_layer, Decision};
 /// 保留信号名（与 `__timer` 同族）。
 pub const INTERIM_GOAL_SIGNAL: &str = "__interim-goal";
 
-/// `RunWorkflowOptions.meta` 里的目标字段。
-pub const INTERIM_GOALS_FIELD: &str = "__interimGoals";
+/// `RunWorkflowOptions.meta` 里的目标列表。
+///
+/// 构造：`MetaBag::new().with::<InterimGoalsKey>(vec!["b".into()])`。
+pub struct InterimGoalsKey;
+
+impl MetaKey for InterimGoalsKey {
+    /// 与既有调用点（及 TS 侧）保持的键名，故保留旧值。
+    const KEY: &'static str = "__interimGoals";
+    type Value = Vec<String>;
+}
+
+aa_workflow_core::impl_meta_accessors!(
+    InterimGoalsKey => InterimGoalsAccess,
+    interim_goals,
+    try_interim_goals
+);
 
 /// 读某个 run 的日志（引擎事件数组）。
 pub type GetEvents =
@@ -39,73 +61,70 @@ pub type GetEvents =
 
 /// 目标全部 checkpoint 后在下一个 step 入口泊车（后续 step 不执行）。
 ///
-/// `goals` 由调用方在构造时给出；若 `meta[INTERIM_GOALS_FIELD]` 存在则**以
-/// meta 为准**（每次 drive 可换，对齐 TS 的 per-drive 参数）。
-pub fn interim_goals<F>(goals: Vec<String>, get_events: F) -> Middleware
+/// 目标本身**不在这里给**——它属于 run 级参数，调用方每次 drive 通过
+/// `RunWorkflowOptions.meta` 传：
+///
+/// ```ignore
+/// .middleware([interim_goals(get_events)])          // 挂一次
+/// RunWorkflowOptions::new(wf, store)
+///     .meta(MetaBag::new().with::<InterimGoalsKey>(vec!["b".into()]))   // 每次可不同
+/// ```
+///
+/// 没传 `InterimGoalsKey` 时中间件不装层（等价于「本次 drive 不设临时目标」），
+/// 而不是泊在空目标上。
+pub fn interim_goals<F>(get_events: F) -> Middleware
 where
     F: Fn(&str) -> anyhow::Result<Vec<aa_workflow_core::event::WorkflowEvent>>
         + Send
         + Sync
         + 'static,
 {
-    let base_goals = Arc::new(goals);
     let get_events: Arc<GetEvents> = Arc::new(get_events);
 
     Middleware::new().server(move |mut sc: MiddlewareServerFnArgs| {
-        let base_goals = base_goals.clone();
         let get_events = get_events.clone();
 
         Box::pin(async move {
-            // meta 优先（每次 drive 可换目标）；否则用构造时给的。
-            let goals: Vec<String> = sc
-                .ctx
-                .meta
-                .as_value()
-                .get(INTERIM_GOALS_FIELD)
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
+            // 目标只在 meta 里；缺失 = 本次 drive 不设临时目标。
+            let goals: Vec<String> = match sc.ctx.meta.try_get::<InterimGoalsKey>() {
+                Some(g) if !g.is_empty() => g,
+                _ => return sc.next(None).await,
+            };
+
+            // 开局已完成的目标（续驱 / reseed 导入）——不该为它们泊车。
+            let finished_at_start: HashSet<String> = get_events(&sc.ctx.run_id)?
+                .iter()
+                .filter_map(|e| match e {
+                    aa_workflow_core::event::WorkflowEvent::StepFinished { step_id, .. } => {
+                        Some(step_id.clone())
+                    }
+                    _ => None,
                 })
-                .unwrap_or_else(|| (*base_goals).clone());
+                .collect();
+            let goals_done_at_start = goals.iter().all(|g| finished_at_start.contains(g));
 
-            if !goals.is_empty() {
-                // 开局已完成的目标（续驱 / reseed 导入）——不该为它们泊车。
-                let finished_at_start: HashSet<String> = get_events(&sc.ctx.run_id)?
-                    .iter()
-                    .filter_map(|e| match e {
-                        aa_workflow_core::event::WorkflowEvent::StepFinished { step_id, .. } => {
-                            Some(step_id.clone())
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                let goals_done_at_start = goals.iter().all(|g| finished_at_start.contains(g));
-
-                // **无状态层**：判定全部读 `req.completed`（引擎给的
-                // 「本 drive 已成功 step」快照），不自己累积。
-                //
-                // 为什么可以不累积：进入某个 step 时，此前所有 step 的
-                // `STEP_FINISHED` 都已落盘（在它们自己的链返回前），引擎在
-                // 构造请求时取的快照就是准确的。
-                //
-                // 为什么不用 `parked` 标记：泊车会整条 drive 结束
-                // （`WorkflowParked`），不可能在同一 drive 内触发第二次。
-                sc.wrap_step(step_layer(move |req: &StepRequest| {
-                    if goals_done_at_start {
-                        return Decision::Pass;
-                    }
-                    // 入口判定：goals 是否已全齐（不含本 step——它还没跑）。
-                    if goals.iter().all(|g| req.completed.contains(g)) {
-                        return Decision::Park {
-                            signal: INTERIM_GOAL_SIGNAL.to_string(),
-                            meta: Some(serde_json::json!({ INTERIM_GOALS_FIELD: goals })),
-                        };
-                    }
-                    Decision::Pass
-                }));
-            }
+            // **无状态层**：判定全部读 `req.completed`（引擎给的
+            // 「本 drive 已成功 step」快照），不自己累积。
+            //
+            // 为什么可以不累积：进入某个 step 时，此前所有 step 的
+            // `STEP_FINISHED` 都已落盘（在它们自己的链返回前），引擎在
+            // 构造请求时取的快照就是准确的。
+            //
+            // 为什么不用 `parked` 标记：泊车会整条 drive 结束
+            // （`WorkflowParked`），不可能在同一 drive 内触发第二次。
+            sc.wrap_step(step_layer(move |req: &StepRequest| {
+                if goals_done_at_start {
+                    return Decision::Pass;
+                }
+                // 入口判定：goals 是否已全齐（不含本 step——它还没跑）。
+                if goals.iter().all(|g| req.completed.contains(g)) {
+                    return Decision::Park {
+                        signal: INTERIM_GOAL_SIGNAL.to_string(),
+                        meta: Some(serde_json::json!({ InterimGoalsKey::KEY: goals })),
+                    };
+                }
+                Decision::Pass
+            }));
 
             sc.next(None).await
         })

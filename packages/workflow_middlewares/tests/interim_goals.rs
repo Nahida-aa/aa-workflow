@@ -10,7 +10,13 @@ use aa_workflow_core::{
     RunStore, RunWorkflowOptions, WorkflowCtx,
 };
 
-use aa_workflow_middlewares::{interim_goals, INTERIM_GOAL_SIGNAL};
+use aa_workflow_core::define::MetaBag;
+use aa_workflow_middlewares::{interim_goals, InterimGoalsKey, INTERIM_GOAL_SIGNAL};
+
+/// 目标现在走 `RunWorkflowOptions.meta`（中间件只挂一次，目标每次 drive 可换）。
+fn goals_meta(goals: &[&str]) -> MetaBag {
+    MetaBag::new().with::<InterimGoalsKey>(goals.iter().map(|s| s.to_string()).collect())
+}
 
 /// 记执行顺序，用来断言「目标之后的 step 没跑」。
 fn recorder() -> (Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
@@ -28,7 +34,7 @@ async fn parks_at_the_goal_step_and_does_not_run_later_steps() {
     let store_for_hook = store.clone();
 
     let wf = create_workflow(CreateWorkflowConfig::new("goal").input::<serde_json::Value>())
-        .middleware([interim_goals(vec!["b".into()], move |run_id| {
+        .middleware([interim_goals(move |run_id| {
             Ok(store_for_hook.get_events(run_id)?)
         })])
         .handler(move |ctx: WorkflowCtx| {
@@ -55,6 +61,7 @@ async fn parks_at_the_goal_step_and_does_not_run_later_steps() {
     let out = run_workflow(
         RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
             .input(serde_json::json!({}))
+            .meta(goals_meta(&["b"]))
             .run_id("g:1"),
     )
     .outcome()
@@ -88,6 +95,7 @@ async fn parks_at_the_goal_step_and_does_not_run_later_steps() {
     let out2 = run_workflow(
         RunWorkflowOptions::new(Arc::new(wf), store.clone())
             .input(serde_json::json!({}))
+            .meta(goals_meta(&["b"]))
             .run_id("g:1"),
     )
     .outcome()
@@ -109,7 +117,7 @@ async fn no_goals_means_no_parking() {
     let ran_in = ran.clone();
 
     let wf = create_workflow(CreateWorkflowConfig::new("noop").input::<serde_json::Value>())
-        .middleware([interim_goals(vec![], move |run_id| {
+        .middleware([interim_goals(move |run_id| {
             let _ = store_for_hook.get_events(run_id)?;
             Ok(vec![])
         })])

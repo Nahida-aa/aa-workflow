@@ -184,6 +184,41 @@ impl<P> MetaBag<P> {
         }
     }
 
+    /// Write a field **without** advancing the `provided` type parameter
+    /// (returns the same `MetaBag<P>`).
+    ///
+    /// 与 [`set`](Self::set) 的分工：
+    ///
+    /// - `set` 用于 workflow **声明了** meta 需求的场景——插入后类型参数前进一位，
+    ///   `run_workflow` 才能在编译期校验「够不够」。
+    /// - `with` 用于调用方**自己知道**该给什么、但 workflow 没声明（因此
+    ///   `RunWorkflowOptions.meta` 的类型是 `MetaBag<Nil>`）的场景：中间件在
+    ///   运行期用 `try_get` 读，缺了也不会编译报错。
+    ///
+    /// 典型用法是策略中间件的 per-drive 参数，例如 `interim_goals` 的目标：
+    ///
+    /// ```ignore
+    /// MetaBag::new().with::<InterimGoalsKey>(vec!["b".into()])
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// 值无法序列化时 panic——调用点在构造 options 处，属于编程错误。
+    #[must_use]
+    pub fn with<K: MetaKey>(mut self, value: K::Value) -> MetaBag<P> {
+        let serialized = serde_json::to_value(&value).unwrap_or_else(|e| {
+            panic!("ctx.meta.{}: 值无法序列化为 JSON（{}）", K::KEY, e)
+        });
+        if !self.raw.is_object() {
+            self.raw = Value::Object(Default::default());
+        }
+        self.raw
+            .as_object_mut()
+            .expect("just ensured object")
+            .insert(K::KEY.to_string(), serialized);
+        self
+    }
+
 }
 
 /// 为 meta key 声明 `ctx.meta` 上的访问器 —— 对齐 `impl_ext_accessors!`。
