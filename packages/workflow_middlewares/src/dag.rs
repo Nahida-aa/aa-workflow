@@ -2,22 +2,23 @@
 //!
 //! # 与 `interim_goals` / `reseed` 的分工
 //!
-//! `interim_goals` 只认 `meta.__interimGoals`，`reseed` 的计划在**构造时**固定。
-//! 本中间件是它们的「读图版」：每次 drive 从 `meta.__dagPlan` 取策略，并用
-//! [`DagShape`] 把 `from` 闭包展开成重跑名单（缺省种子计算也要图）。
+//! 三者都从 `ctx.meta` 读 run 级策略（[`DagPlanKey`] /
+//! [`InterimGoalsKey`](crate::InterimGoalsKey) / [`ReseedKey`](crate::ReseedKey)）。
+//! 本中间件是它们的「读图版」：用 [`DagShape`] 把 `from` 闭包展开成重跑名单
+//! （缺省种子计算也要图）。
 //!
 //! 单独用时：[`interim_goals`](crate::interim_goals) /
 //! [`reseed`](crate::reseed) 更直接；要「一次给了 from + goals」就用这个。
 //!
-//! # 行为（读 `RunWorkflowOptions.meta.__dagPlan`）
+//! # 行为（读 `RunWorkflowOptions.meta` 里的 [`DagPlanKey`]）
 //!
-//! ```json
-//! { "__dagPlan": {
-//!     "source_run_id": "rev1",   // redo：播种来源
-//!     "from": ["translate"],     // redo：失效起点（闭包展开成重跑名单）
-//!     "redo_set": ["x"],         // redo：裸名单（与 from 展开取并集）
-//!     "goals": ["merge"]         // 临时目标：全 checkpoint 后泊车
-//! } }
+//! ```ignore
+//! MetaBag::new().with::<DagPlanKey>(DagPlan {
+//!     source_run_id: Some("rev1".into()),  // redo：播种来源
+//!     from: Some(vec!["translate".into()]),// redo：失效起点（闭包展开成重跑名单）
+//!     redo_set: Some(vec!["x".into()]),    // redo：裸名单（与 from 展开取并集）
+//!     goals: vec!["merge".into()],         // 临时目标：全 checkpoint 后泊车
+//! })
 //! ```
 //!
 //! - **redo**：不在重跑名单里的 step，拦截器返回 `Skip` 直接提交源结果
@@ -48,8 +49,39 @@ use crate::step_layer::{step_layer, Decision};
 /// 保留信号名（与 `__timer` 同族）。
 pub const INTERIM_GOAL_SIGNAL: &str = "__interim-goal";
 
-/// `RunWorkflowOptions.meta` 里的计划信封字段。
-pub const DAG_PLAN_FIELD: &str = "__dagPlan";
+/// `RunWorkflowOptions.meta` 里的 redo + 临时目标计划。
+///
+/// 与 [`InterimGoalsKey`](crate::InterimGoalsKey) / [`ReseedKey`](crate::ReseedKey)
+/// 同构：作为 `MetaBag::new().with::<DagPlanKey>(..)` 传入，**不是**中间件的构造参数。
+///
+/// 字段全 `Option`（`goals` 用 `Vec` + serde default）：四个维度可以只给其中几个。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DagPlan {
+    /// redo：播种来源 run。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_run_id: Option<String>,
+    /// redo：失效起点（[crate::dag] 用 shape 闭包展开成重跑名单）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<Vec<String>>,
+    /// redo：裸重跑名单（与 `from` 展开取并集）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redo_set: Option<Vec<String>>,
+    /// 临时目标：全 checkpoint 后泊车。
+    #[serde(default)]
+    pub goals: Vec<String>,
+}
+
+/// `ctx.meta` 里的 DAG 策略 key。
+pub struct DagPlanKey;
+
+impl aa_workflow_core::define::MetaKey for DagPlanKey {
+    /// 与既有调用点（及 TS 侧）保持的键名，故保留旧值。
+    const KEY: &'static str = "__dagPlan";
+    type Value = DagPlan;
+}
+
+aa_workflow_core::impl_meta_accessors!(DagPlanKey => DagPlanAccess, dag_plan, try_dag_plan);
+
 
 /// 读某个 run 的日志（引擎事件数组）。
 pub type GetEvents =
@@ -76,41 +108,29 @@ pub fn dag_policies(shape: Arc<DagShape>, get_events: Arc<GetEvents>) -> Middlew
         let shape = shape.clone();
 
         Box::pin(async move {
-            // 前置：解析 RunWorkflowOptions.meta.__dagPlan → PlanState。
-            let plan = sc
-                .ctx
-                .meta
-                .as_value()
-                .get(DAG_PLAN_FIELD)
-                .and_then(|v| v.as_object())
-                .cloned();
+            // 前置：解析 RunWorkflowOptions.meta 里的 DagPlan → PlanState。
+            // 缺失 = 本次 run 不做任何策略（与另两个中间件一致）。
+            let Some(plan) = sc.ctx.meta.try_get::<DagPlanKey>() else {
+                return sc.next(None).await;
+            };
 
-            let mut st = PlanState::default();
-            if let Some(obj) = plan {
-                if let Some(goals) = obj.get("goals").and_then(|v| v.as_array()) {
-                    st.goals = goals
-                        .iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect();
-                }
+            let mut st = PlanState {
+                goals: plan.goals.clone(),
+                ..Default::default()
+            };
 
+            {
                 // redo：source_run_id 存在才启用；from 闭包展开交给
                 // DagShape::reseed_plan（库有图，含缺省种子计算）。
-                if let Some(source_run_id) = obj.get("source_run_id").and_then(|v| v.as_str()) {
+                if let Some(source_run_id) = plan.source_run_id.as_deref() {
                     let source_log = get_events(source_run_id)?;
-                    let from = obj.get("from").and_then(|v| v.as_array()).map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(str::to_string))
-                            .collect::<Vec<_>>()
-                    });
+                    let from = plan.from.clone();
                     let reseed_run = shape.reseed_plan(&source_log, from)?;
                     let mut redo: HashSet<String> =
                         reseed_run.redo_set.iter().cloned().collect();
-                    if let Some(extra) = obj.get("redo_set").and_then(|v| v.as_array()) {
-                        for v in extra {
-                            if let Some(id) = v.as_str() {
-                                redo.insert(id.to_string());
-                            }
+                    if let Some(extra) = &plan.redo_set {
+                        for id in extra {
+                            redo.insert(id.clone());
                         }
                     }
 

@@ -1,4 +1,4 @@
-//! 验证 DAG 策略中间件：redo 复用 + 临时目标泊车，读 `input.__dagPlan`。
+//! 验证 DAG 策略中间件：redo 复用 + 临时目标泊车，计划走 `meta` 的 `DagPlanKey`。
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -11,7 +11,7 @@ use aa_workflow_core::{
     RunWorkflowOptions, WorkflowCtx,
 };
 
-use aa_workflow_middlewares::{dag_policies, INTERIM_GOAL_SIGNAL};
+use aa_workflow_middlewares::{DagPlan, DagPlanKey, INTERIM_GOAL_SIGNAL, dag_policies};
 
 fn shape() -> Arc<DagShape> {
     // 菱形：load → (enrich, translate) → merge → publish
@@ -100,13 +100,14 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
     let out = run_workflow(
         RunWorkflowOptions::new(Arc::new(mk()), store.clone())
             .input(serde_json::json!({}))
-            .meta(aa_workflow_core::define::MetaBag::from_json(serde_json::json!({
-                "__dagPlan": {
-                    "source_run_id": "r1",
-                    "from": ["translate"],
-                    "goals": ["merge"],
-                }
-            })))
+            .meta(
+                aa_workflow_core::define::MetaBag::new().with::<DagPlanKey>(DagPlan {
+                    source_run_id: Some("r1".into()),
+                    from: Some(vec!["translate".into()]),
+                    redo_set: None,
+                    goals: vec!["merge".into()],
+                }),
+            )
             .run_id("r2"),
     )
     .outcome()

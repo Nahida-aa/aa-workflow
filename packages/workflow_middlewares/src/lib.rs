@@ -66,7 +66,9 @@ mod step_layer;
 mod interim_goals;
 mod reseed;
 
-pub use dag::{DAG_PLAN_FIELD, GetEvents, INTERIM_GOAL_SIGNAL, dag_policies};
+pub use dag::{
+    DagPlan, DagPlanAccess, DagPlanKey, GetEvents, INTERIM_GOAL_SIGNAL, dag_policies,
+};
 pub use interim_goals::{InterimGoalsAccess, InterimGoalsKey, interim_goals};
 pub use reseed::{LoadResults, ReseedAccess, ReseedKey, ReseedPlan, SourceStep, reseed};
 
