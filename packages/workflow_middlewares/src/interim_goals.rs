@@ -27,13 +27,15 @@
 //! # 需要 store
 //!
 //! 判断「开局目标是否已达成」要读日志，构造时注入 `get_events`。
+use anyhow::Result;
+use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use aa_workflow_core::define::MetaKey;
-use aa_workflow_core::middleware::{Middleware, MiddlewareServerFnArgs, StepRequest};
-
-use aa_workflow_core::middleware::{step_layer, Decision};
+use aa_workflow_core::define::{BoxFuture, MetaKey};
+use aa_workflow_core::middleware::{
+    Middleware, MiddlewareServer, MiddlewareServerFnArgs, StepRequest, step_layer, Decision,
+};
 
 /// 保留信号名（与 `__timer` 同族）。
 pub const INTERIM_GOAL_SIGNAL: &str = "__interim-goal";
@@ -79,12 +81,21 @@ where
         + Sync
         + 'static,
 {
-    let get_events: Arc<GetEvents> = Arc::new(get_events);
+    Middleware::from_impl(InterimGoalsMw {
+        get_events: Arc::new(get_events),
+    })
+}
 
-    Middleware::new().server(move |mut sc: MiddlewareServerFnArgs| {
-        let get_events = get_events.clone();
+/// struct 形态（tower `Service` 同款）：参数是**字段**，`serve<'a>(&'a self)`
+/// 的 future 借 `&self`——零捕获仪式、零 per-call 克隆。
+struct InterimGoalsMw {
+    get_events: Arc<GetEvents>,
+}
 
-        async move {
+impl MiddlewareServer for InterimGoalsMw {
+    fn serve<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>> {
+        Box::pin(async move {
+            let mut sc = args;
             // 目标只在 meta 里；缺失 = 本次 drive 不设临时目标。
             let goals: Vec<String> = match sc.ctx.meta.try_get::<InterimGoalsKey>() {
                 Some(g) if !g.is_empty() => g,
@@ -92,7 +103,9 @@ where
             };
 
             // 开局已完成的目标（续驱 / reseed 导入）——不该为它们泊车。
-            let finished_at_start: HashSet<String> = get_events(&sc.ctx.run_id)?
+            // `&self.get_events` 直接借字段——server_state/闭包形态里这曾是
+            // 「async move 前 clone 一行」的仪式位。
+            let finished_at_start: HashSet<String> = (self.get_events)(&sc.ctx.run_id)?
                 .iter()
                 .filter_map(|e| match e {
                     aa_workflow_core::event::WorkflowEvent::StepFinished { step_id, .. } => {
@@ -127,6 +140,6 @@ where
             }));
 
             sc.next(None).await
-        }
-    })
+        })
+    }
 }

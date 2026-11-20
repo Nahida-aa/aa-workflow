@@ -36,14 +36,16 @@
 //! # 需要 store
 //!
 //! `reseed_plan` 要读源 run 日志——构造时注入 `get_events`。
+use anyhow::Result;
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use aa_workflow_core::define::BoxFuture;
 use aa_workflow_core::middleware::{
-    Middleware, MiddlewareServerFnArgs, StepRequest,
+    Middleware, MiddlewareServer, MiddlewareServerFnArgs, StepRequest, step_layer, Decision,
 };
 use crate::dag::core::DagShape;
-use aa_workflow_core::middleware::{step_layer, Decision};
 
 /// 保留信号名（与 `__timer` 同族）。
 pub const INTERIM_GOAL_SIGNAL: &str = "__interim-goal";
@@ -102,11 +104,20 @@ struct PlanState {
 ///
 /// `shape` 提供图（`from` 闭包展开、缺省种子计算）；`get_events` 提供日志读取。
 pub fn dag_policies(shape: Arc<DagShape>, get_events: Arc<GetEvents>) -> Middleware {
-    Middleware::new().server(move |mut sc: MiddlewareServerFnArgs| {
-        let get_events = get_events.clone();
-        let shape = shape.clone();
+    Middleware::from_impl(DagPoliciesMw { shape, get_events })
+}
 
-        async move {
+/// struct 形态（tower `Service` 同款）：两个构造期参数都是**字段**，
+/// `serve<'a>(&'a self)` 的 future 借 `&self`——零捕获仪式、零 per-call 克隆。
+struct DagPoliciesMw {
+    shape: Arc<DagShape>,
+    get_events: Arc<GetEvents>,
+}
+
+impl MiddlewareServer for DagPoliciesMw {
+    fn serve<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>> {
+        Box::pin(async move {
+            let mut sc = args;
             // 前置：解析 RunWorkflowOptions.meta 里的 DagPlan → PlanState。
             // 缺失 = 本次 run 不做任何策略（与另两个中间件一致）。
             let Some(plan) = sc.ctx.meta.try_get::<DagPlanKey>() else {
@@ -122,9 +133,9 @@ pub fn dag_policies(shape: Arc<DagShape>, get_events: Arc<GetEvents>) -> Middlew
                 // redo：source_run_id 存在才启用；from 闭包展开交给
                 // DagShape::reseed_plan（库有图，含缺省种子计算）。
                 if let Some(source_run_id) = plan.source_run_id.as_deref() {
-                    let source_log = get_events(source_run_id)?;
+                    let source_log = (self.get_events)(source_run_id)?;
                     let from = plan.from.clone();
-                    let reseed_run = shape.reseed_plan(&source_log, from)?;
+                    let reseed_run = self.shape.reseed_plan(&source_log, from)?;
                     let mut redo: HashSet<String> =
                         reseed_run.redo_set.iter().cloned().collect();
                     if let Some(extra) = &plan.redo_set {
@@ -182,6 +193,6 @@ pub fn dag_policies(shape: Arc<DagShape>, get_events: Arc<GetEvents>) -> Middlew
             }));
 
             sc.next(None).await
-        }
-    })
+        })
+    }
 }

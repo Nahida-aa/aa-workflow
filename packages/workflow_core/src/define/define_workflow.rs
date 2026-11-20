@@ -441,7 +441,7 @@ impl<TInput, TOutput, TState, TMeta> WorkflowBuilder<TInput, TOutput, TState, TM
                             },
                         )),
                     };
-                    server(sc).await
+                    server.serve(sc).await
                 })
             });
         }

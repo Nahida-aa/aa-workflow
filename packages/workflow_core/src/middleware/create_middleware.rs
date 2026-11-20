@@ -44,9 +44,62 @@ use serde_json::Value;
 
 use crate::define::{BoxFuture, WorkflowCtx};
 
-/// 中间件 `server` 函数的签名（对齐上游 `MiddlewareServerFn`）。
-pub type MiddlewareServerFn =
-    Arc<dyn Fn(MiddlewareServerFnArgs) -> BoxFuture<'static, Result<Value>> + Send + Sync>;
+/// 擦除后的 server 实现（擦除位）。
+///
+/// 返回 future **借 `&self`**（lifetime-tied）——这是 tower `Service` 的形状：
+/// dyn 安全（无 GAT），且让 struct 形态的中间件把构造参数放进**字段**、
+/// 按引用使用，零克隆零仪式。三种构造形态见 [`Middleware`]。
+pub trait MiddlewareServer: Send + Sync {
+    /// 名字刻意不是 `call`——与 `Fn::call` 在 blanket 场景下会歧义（E0034）。
+    fn serve<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>>;
+}
+
+/// `Fn(Args) -> 'static future` 的 blanket：**现有闭包写法零改动**——闭包的
+/// future 自持全部数据，对任意 `'a` 都成立（「自有 ⊇ 借用」）。
+/// 真异步闭包（`AsyncFn*`）的 blanket 需要写 `CallRefFuture` 的 GAT Send
+/// 投影 bound，目前撞 E0658（`async_fn_traits` 未稳定）——解禁后三行可加，
+/// 见 ADR 0020。
+impl<F, Fut> MiddlewareServer for F
+where
+    F: Fn(MiddlewareServerFnArgs) -> Fut + Send + Sync,
+    Fut: Future<Output = Result<Value>> + Send + 'static,
+{
+    fn serve<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>> {
+        Box::pin((self)(args))
+    }
+}
+
+/// [`Middleware::server_state`] 的适配器：框架每次调用 clone 一份 state
+/// （axum `from_fn_with_state` 同款——仪式收进框架，调用方零克隆行）。
+struct StateServer<S, F> {
+    state: S,
+    f: F,
+}
+
+impl<S, F, Fut> MiddlewareServer for StateServer<S, F>
+where
+    S: Clone + Send + Sync + 'static,
+    F: Fn(S, MiddlewareServerFnArgs) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Value>> + Send + 'static,
+{
+    fn serve<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>> {
+        let state = self.state.clone();
+        Box::pin((self.f)(state, args))
+    }
+}
+
+/// [`Middleware::default`] 的透传实现。
+struct PassthroughServer;
+
+impl MiddlewareServer for PassthroughServer {
+    fn serve<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>> {
+        let mut args = args;
+        Box::pin(async move { args.next(None).await })
+    }
+}
+
+/// 中间件 `server` 函数的擦除形态。
+pub type MiddlewareServerFn = Arc<dyn MiddlewareServer>;
 
 /// 后续管线：吃一个扩展对象、返回 future（对齐上游 `next(opts)`）。
 ///
@@ -305,9 +358,7 @@ impl Default for Middleware {
     /// 空中间件：**直接透传**（对齐 TS「不设 server 则什么也不做」）。
     fn default() -> Self {
         Self {
-            server: Arc::new(|mut sc: MiddlewareServerFnArgs| {
-                Box::pin(async move { sc.next(None).await })
-            }),
+            server: Arc::new(PassthroughServer),
         }
     }
 }
@@ -324,6 +375,11 @@ impl Middleware {
     /// 调用方直接写 `async move { .. }`，不必自己装箱（对齐 `ctx.step` 的写法）。
     /// 旧的 `Box::pin(..)` 写法仍然兼容（`Pin<Box<dyn Future>>` 本身也是 `Future`）。
     ///
+    /// **future 是 `'static`**：不能借闭包的捕获状态。带构造期参数时，
+    /// 非 Copy 捕获（`Arc<dyn Fn>` 句柄等）在 `async move` 前需要一行
+    /// per-call clone——那正是 [`Self::server_state`] / [`MiddlewareServer`]
+    /// struct 形态要消灭的仪式。
+    ///
     /// ```ignore
     /// let mw = Middleware::new().server(|mut sc: MiddlewareServerFnArgs| {
     ///     async move { sc.next(None).await }
@@ -334,13 +390,160 @@ impl Middleware {
         F: Fn(MiddlewareServerFnArgs) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Value>> + Send + 'static,
     {
-        self.server = Arc::new(move |sc| Box::pin(f(sc)));
+        self.server = Arc::new(f);
         self
     }
+
+    /// **带参数的闭包形态**（axum `from_fn_with_state` 同款）：框架每次调用
+    /// clone 一份 `state` 传作闭包首参，调用方**零克隆行**。`state` 用 `Arc`
+    /// 时克隆是引用计数。
+    ///
+    /// ```ignore
+    /// let mw = Middleware::new().server_state(get_events, |get_events, mut sc| {
+    ///     async move {
+    ///         let events = get_events(&sc.ctx.run_id)?;   // state 作首参进来
+    ///         sc.next(None).await
+    ///     }
+    /// });
+    /// ```
+    pub fn server_state<S, F, Fut>(mut self, state: S, f: F) -> Self
+    where
+        S: Clone + Send + Sync + 'static,
+        F: Fn(S, MiddlewareServerFnArgs) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value>> + Send + 'static,
+    {
+        self.server = Arc::new(StateServer { state, f });
+        self
+    }
+
+    /// struct 形态的入口：**状态是字段，按引用使用**（tower `Service` 同款）。
+    ///
+    /// 带多个构造期参数、或想在 server 间复用状态的中间件写成 struct +
+    /// `impl MiddlewareServer`——`serve<'a>(&'a self)` 的返回 future 借 `&self`，
+    /// 字段零克隆零仪式（`server_state` 的克隆也省了）：
+    ///
+    /// ```ignore
+    /// struct InterimGoalsMw { get_events: Arc<GetEvents> }
+    /// impl MiddlewareServer for InterimGoalsMw {
+    ///     fn serve<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>> {
+    ///         Box::pin(async move {
+    ///             let events = (self.get_events)(&args.ctx.run_id)?;   // 借 &self，无 clone
+    ///             args.next(None).await
+    ///         })
+    ///     }
+    /// }
+    /// let mw = Middleware::from_impl(InterimGoalsMw { get_events });
+    /// ```
+    pub fn from_impl<M: MiddlewareServer + 'static>(m: M) -> Middleware {
+        Middleware { server: Arc::new(m) }
+    }
 }
+
 
 /// 类型已擦除的中间件 —— 对齐上游 `AnyMiddleware = Middleware<any, any>`。
 ///
 /// 因为 [`Middleware`] 已经没有类型参数，这就是它本身；保留别名是为了让
 /// `Vec<AnyMiddleware>` / `[AnyMiddleware; N]` 的调用点读起来与上游一致。
 pub type AnyMiddleware = Middleware;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::define::{CreateWorkflowConfig, StepCtx, WorkflowCtx, create_workflow};
+    use crate::{InMemoryStore, RunStatus, RunStore, RunWorkflowOptions, run_workflow};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 参数化中间件的**状态就是字段**：同一实例跨 drive 复用（不重新构造、
+    /// 不 per-call 克隆）——struct 形态与 server_state 形态都成立。
+    #[tokio::test]
+    async fn parameterized_middleware_state_persists_across_drives() {
+        struct CountingMw {
+            calls: Arc<AtomicUsize>,
+        }
+        impl MiddlewareServer for CountingMw {
+            fn serve<'a>(
+                &'a self,
+                args: MiddlewareServerFnArgs,
+            ) -> BoxFuture<'a, Result<Value>> {
+                Box::pin(async move {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    let mut sc = args;
+                    sc.next(None).await
+                })
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let wf = create_workflow(CreateWorkflowConfig::new("mw-count").input::<serde_json::Value>())
+            .middleware([Middleware::from_impl(CountingMw {
+                calls: Arc::clone(&calls),
+            })])
+            .handler(|ctx: WorkflowCtx| async move {
+                ctx.step("a", |_sc: StepCtx| async { Ok(serde_json::Value::Null) }).await
+            });
+        let run = |store: Arc<dyn RunStore>| {
+            run_workflow(
+                RunWorkflowOptions::new(wf.clone(), store)
+                    .input(serde_json::json!({}))
+                    .run_id("count:1"),
+            )
+            .outcome()
+        };
+        let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
+        run(Arc::clone(&store)).await.unwrap();
+        run(store).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "同一实例服务两次 drive");
+
+        // server_state 形态：state 由框架代克隆（同一 Arc 跨 drive 递增）
+        let state_calls = Arc::new(AtomicUsize::new(0));
+        let wf2 = create_workflow(CreateWorkflowConfig::new("mw-state").input::<serde_json::Value>())
+            .middleware([Middleware::new().server_state(Arc::clone(&state_calls), |calls, mut sc| {
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    sc.next(None).await
+                }
+            })])
+            .handler(|ctx: WorkflowCtx| async move {
+                ctx.step("a", |_sc: StepCtx| async { Ok(serde_json::Value::Null) }).await
+            });
+        let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
+        for _ in 0..2 {
+            run_workflow(
+                RunWorkflowOptions::new(wf2.clone(), Arc::clone(&store))
+                    .input(serde_json::json!({}))
+                    .run_id("count:2"),
+            )
+            .outcome()
+            .await
+            .unwrap();
+        }
+        assert_eq!(state_calls.load(Ordering::SeqCst), 2, "server_state 的 state 是同一 Arc");
+    }
+
+    /// 三种形态（struct / server_state / 闭包）混装进同一条链。
+    #[tokio::test]
+    async fn middleware_forms_compose_together() {
+        struct Nop;
+        impl MiddlewareServer for Nop {
+            fn serve<'a>(
+                &'a self,
+                args: MiddlewareServerFnArgs,
+            ) -> BoxFuture<'a, Result<Value>> {
+                Box::pin(async move { let mut args = args; args.next(None).await })
+            }
+        }
+        let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
+        let wf = create_workflow(CreateWorkflowConfig::new("mw-mix").input::<serde_json::Value>())
+            .middleware([Middleware::from_impl(Nop)])
+            .handler(|ctx: WorkflowCtx| async move {
+                ctx.step("a", |_sc: StepCtx| async { Ok(serde_json::Value::Null) }).await
+            });
+        let out = run_workflow(
+            RunWorkflowOptions::new(wf, store).input(serde_json::json!({})),
+        )
+        .outcome()
+        .await
+        .unwrap();
+        assert_eq!(out.status, RunStatus::Finished);
+    }
+}

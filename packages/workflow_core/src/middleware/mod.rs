@@ -5,7 +5,7 @@ pub mod step_layer;
 
 pub(crate) use create_middleware::StepLeaf;
 pub use create_middleware::{
-    AnyMiddleware, Middleware, MiddlewareServerFn, MiddlewareServerFnArgs, NextFn, StepRequest,
+    AnyMiddleware, Middleware, MiddlewareServer, MiddlewareServerFn, MiddlewareServerFnArgs, NextFn, StepRequest,
     StepFuture, StepService, StepServiceError,
 };
 pub use step_layer::{Decision, PolicyLayer, PolicyService, StepPolicy, step_layer};

@@ -168,6 +168,42 @@ memo 去重保证每节点恰好一个任务；节点函数收到 `(deps, input)
 **通用约束核对**：不涉及新开 run；不碰 store 契约；命名沿用 wf-demo
 （`dag_to_handler` / `DagSpec`）；「用户不写 handler 函数体」正是要消除的负担。
 
+## F8. 带参数中间件的零仪式捕获（scope-borrowed server）
+
+**状态**：已实现（ADR 0020）。
+
+**场景**：中间件在构造期捕获参数（日志读取器、图形状、配置、连接句柄），
+在每次 drive 的 server 调用里使用。参数化中间件是 tower/axum 生态的常态形态
+（`TimeoutLayer::new(dur)`、`from_fn_with_state(state, f)`）。
+
+**为什么现有手段不够**：server 合同是 `Fn(Args) -> Fut + 'static`，其中
+`Fut: 'static` 让返回的 future **不能借闭包状态**——非 Copy 捕获（`Arc<dyn Fn>`
+这类句柄）必须在 `async move` 前手动 clone 一份（`let get_events = get_events.clone();`）。
+这是三条件联立的必然（`Fn` 可重入 × future 自持 × 捕获非 Copy），tower 生态
+的作者写的是同一行；每带一个参数就多一行仪式，且容易被误写成在 async 块内
+clone（借不到，编不过）。
+
+**为什么不是 async 闭包能解的**：`AsyncFn*` 的语义（future 借 `&mut`/`&` 闭包
+状态）恰好是解药，但擦除位用不上——`AsyncFnMut`/`AsyncFn` 非 dyn compatible、
+`dyn AsyncFnOnce` 被 `CallOnceFuture` GAT 卡死（E0191）、GAT 投影写 Send bound
+撞 E0658（`async_fn_traits` 未稳定）。编译器实测，见 ADR 0020。
+
+**自然形态**（两层）：
+
+- **擦除 trait + lifetime-tied 返回**（tower `Service` 同款）：`MiddlewareServer`
+  trait 的 `fn server<'a>(&'a self, args) -> BoxFuture<'a, Result<Value>>`——
+  返回 future 借 `&self`，struct 形态的中间件状态是**字段**（tower 首选形态），
+  按引用使用、零克隆零仪式；
+- **state 适配器**（axum `from_fn_with_state` 同款）：`server_state(state, f)`——
+  框架每次调用 clone 一份 state（Arc 场景=引用计数）传作闭包首参，轻量闭包
+  形态的仪式收进框架。
+
+旧闭包形态（`Fn(Args) -> 'static future`）经 blanket impl 继续可用，现有
+调用点零改动；future 需要逃逸作用域（spawn）时 clone 回到语义上诚实的位置。
+
+**两侧状态**：Rust 已实现（`create_middleware.rs`）；上游 TS 无对应物
+（TS 闭包原生捕获、无此问题）。
+
 ## 通用约束（本轮明确过的，新增功能都要过）
 
 1. **隐式新开 run 默认禁止**。引擎在 resume 时内部创建新 run 而调用方不直接
