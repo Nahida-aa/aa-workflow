@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aa_workflow_core::{RunStore, RunStatus, WorkflowEvent, signal_run};
+use aa_workflow_core::{SignalDelivery, RunStore, RunStatus, WorkflowEvent, deliver_signal};
 use aa_workflow_runtime::run_store_adapter::{
     WorkflowExecutionStore, create_run_store_adapter,
 };
@@ -176,7 +176,7 @@ fn base_dir(tag: &str) -> PathBuf {
             "进程 B 不能重复 append SignalAwaited"
         );
 
-        aa_workflow_core::signal_approval(store2.as_ref(), "approve:r", "review", true, None)
+        aa_workflow_core::deliver_approval(store2.as_ref(), "approve:r", "review", true, None, 0)
             .unwrap();
         let (out, store2b) = t2.await.unwrap().unwrap();
         assert_eq!(out.status, RunStatus::Finished);
@@ -254,13 +254,7 @@ fn base_dir(tag: &str) -> PathBuf {
             let w = st.waiting_for.expect("sleep 挂起应投影 waiting_for");
             assert_eq!(w.signal_name, "__timer");
             let step_id = w.step_id.expect("timer 挂起应有 step_id");
-            signal_run(
-                store2.as_ref(),
-                "invoice:r",
-                &step_id,
-                serde_json::Value::Null,
-                None,
-            )
+            deliver_signal(store2.as_ref(), "invoice:r", SignalDelivery { signal_id: None, step_id: Some(step_id.to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None }, 0)
             .unwrap();
             out = Some(
                 drive(

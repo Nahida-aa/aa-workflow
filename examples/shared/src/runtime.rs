@@ -1,7 +1,7 @@
 //! Host 无关的薄壳辅助：把 start / resume 收成一个驱动入口
 //! （对齐 TanStack `runtime.ts` 的位置）。signals / pause 由引擎的
 //! [`ApprovalCtx`](aa_workflow_core::define::WorkflowCtx::approve) +
-//! [`signal_run`](aa_workflow_core::signal_run) 承担；示例 workflow 见
+//! [`deliver_signal`](aa_workflow_core::deliver_signal) 承担；示例 workflow 见
 //! [`approval_review`](crate::workflows::approval_review)。
 
 use std::sync::Arc;

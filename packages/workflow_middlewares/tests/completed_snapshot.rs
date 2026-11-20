@@ -12,7 +12,7 @@ use aa_workflow_core::middleware::{
     Middleware, MiddlewareServerFnArgs, StepRequest, StepService, StepServiceError, StepFuture,
 };
 use tower::{Layer, Service};
-use aa_workflow_core::{
+use aa_workflow_core::{SignalDelivery, 
     create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunWorkflowOptions,
     WorkflowCtx,
 };
@@ -189,7 +189,7 @@ async fn completed_snapshot_never_contains_self() {
 /// 泊车。这条锁定「策略无状态」改造后与改造前一致的行为。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn completed_accumulates_across_drives() {
-    use aa_workflow_core::{signal_event, RunStore};
+    use aa_workflow_core::{deliver_signal, RunStore};
     use aa_workflow_core::define::MetaBag;
     use aa_workflow_middlewares::{interim_goals, InterimGoalsKey, INTERIM_GOAL_SIGNAL};
 
@@ -235,14 +235,7 @@ async fn completed_accumulates_across_drives() {
     assert_eq!(ran.lock().unwrap().clone(), vec!["a".to_string()]);
 
     // 续驱：a 已在日志里 → goals_done_at_start 成立 → 不重复泊车，b/c 跑完
-    signal_event(
-        store.as_ref(),
-        "acc:1",
-        INTERIM_GOAL_SIGNAL,
-        None,
-        serde_json::Value::Null,
-        None,
-    )
+    deliver_signal(store.as_ref(), "acc:1", SignalDelivery { signal_id: None, step_id: None, name: INTERIM_GOAL_SIGNAL.to_string(), payload: serde_json::Value::Null, meta: None }, 0)
     .unwrap();
     run_workflow(
         RunWorkflowOptions::new(Arc::new(wf), store.clone())

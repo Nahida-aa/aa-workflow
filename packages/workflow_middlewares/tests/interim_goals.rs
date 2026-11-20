@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use aa_workflow_core::define::StepCtx;
 use aa_workflow_core::event::WorkflowEvent;
-use aa_workflow_core::{
-    create_workflow, run_workflow, signal_event, CreateWorkflowConfig, InMemoryStore,
+use aa_workflow_core::{SignalDelivery, 
+    create_workflow, run_workflow, deliver_signal, CreateWorkflowConfig, InMemoryStore,
     RunStore, RunWorkflowOptions, WorkflowCtx,
 };
 
@@ -83,14 +83,7 @@ async fn parks_at_the_goal_step_and_does_not_run_later_steps() {
     assert!(has_await, "应有 __interim-goal 的 SignalAwaited");
 
     // 续驱 → 跑完 c，且 a/b 不重跑
-    signal_event(
-        store.as_ref(),
-        "g:1",
-        INTERIM_GOAL_SIGNAL,
-        None,
-        serde_json::Value::Null,
-        None,
-    )
+    deliver_signal(store.as_ref(), "g:1", SignalDelivery { signal_id: None, step_id: None, name: INTERIM_GOAL_SIGNAL.to_string(), payload: serde_json::Value::Null, meta: None }, 0)
     .unwrap();
     let out2 = run_workflow(
         RunWorkflowOptions::new(Arc::new(wf), store.clone())

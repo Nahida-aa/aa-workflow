@@ -1,6 +1,6 @@
 //! 引擎驱动：代码即 DAG 的执行器。`EngineRuntime` 是共享驱动态（step 重放 /
 //! 结果缓存 / CAS 追加），`exec_step` 跑单个 durable step，
-//! `exec_pause` + `signal_run` 实现 durable 等待（approval / sleep）。
+//! `exec_pause` + `deliver_signal` 实现 durable 等待（approval / sleep）。
 //! 单次 invocation 的顶层编排（`run_workflow` / `run_workflow_sync` /
 //! `RunWorkflowOptions` / `RunOutcome`）在 `run_workflow` 子模块。
 
@@ -1224,7 +1224,7 @@ pub fn exec_uuid(engine: &Arc<EngineRuntime>, id: Option<&str>) -> anyhow::Resul
 /// **Then it parks**: the function returns [`WorkflowParked`] immediately — it
 /// does NOT block. The drive ends `Paused`, the process is free to exit, and an
 /// external driver is what delivers the wake-up (a `SignalResolved` via
-/// [`signal_run`] / [`signal_event`], or a timer sweep noticing `deadline`).
+/// [`deliver_signal`] / [`deliver_signal`], or a timer sweep noticing `deadline`).
 /// Mirrors TanStack, where the awaited primitive throws `WorkflowPaused` and
 /// the drive returns (`run-workflow.ts:970` / `:529`).
 pub async fn exec_pause(
@@ -1522,133 +1522,51 @@ fn project_run_wait(store: &Arc<dyn RunStore>, run_id: &str, kind: WaitKind) {
     }
 }
 
-/// Appends a `SignalResolved` for a parked run — the external side of
-/// [`WorkflowCtx::approve`](crate::define::WorkflowCtx::approve). Safe to call
-/// any time: nothing is parked *watching* the log (the drive already returned),
-/// so this takes effect on the **next** `run_workflow` invocation, which
-/// resolves the wait from the log and never re-appends its `SignalAwaited`.
-/// Delivering the resume is the caller's job — that is the runtime driver's
-/// whole reason to exist (see `aa_workflow_runtime`'s `deliver_signal`). The first
-/// append per `(run_id, step_id)` wins; duplicates drop via the store's CAS
-/// append. `payload` is what `approve` returns on the resumed drive.
-/// Appends a `SignalResolved` for `step_id` — the step_id-targeted form of
-/// [`signal_event`].
+/// 投递一个信号——对应上游 `deliverSignal`（`workflow-runtime/src/types.ts:340`）。
 ///
-/// **过闸**：只在该 step 确实泊在信号等待上时才落盘；否则报
-/// [`WorkflowError::SignalLost`]。对齐上游默认语义（没在等就 `not-waiting`，
-/// 不静默写日志）。「早到信号」由 runtime 的可选收件箱承接
-/// （`buffer_signal` + `buffer_signals` 开关），**不是**靠这里无条件 append。
+/// 一个函数覆盖两种定位方式（上游同样只有一个 `deliverSignal`）：
 ///
-/// 上游的幂等令牌不在这条路上：`signal_id` 记为 `None`，去重由 store 负责
-/// （`signal_deliveries`）。要把它记进日志，走带名的 [`signal_event`]。
-pub fn signal_run(
+/// | [`SignalDelivery::step_id`] | 行为 |
+/// | --- | --- |
+/// | `Some(id)` | 投给该 step；`name` 由 store 从日志取，调用方不必知道 |
+/// | `None` | 投给当前泊在 `name` 这个信号上的 step |
+///
+/// **返回四态而非 `Err`**：「没人在等」是正常结果（[`DeliveryOutcome::NotWaiting`]），
+/// 不是异常。只有 store 本身出错（IO / 冲突）才是 `Err`。
+pub fn deliver_signal(
     store: &dyn RunStore,
     run_id: &str,
-    step_id: &str,
-    payload: serde_json::Value,
-    meta: Option<serde_json::Value>,
-) -> Result<(), WorkflowError> {
-    // 走 store 的原子投递（对齐上游 `deliverSignal`）——查泊车、去重、追加
-    // 在 store 内部一次完成，不在这里 get_events + append_event
-    // （那是两次独立调用，中间会有竞态窗口）。
-    let outcome = store.deliver_signal(DeliverSignalArgs {
+    delivery: SignalDelivery,
+    now: i64,
+) -> Result<DeliveryOutcome, WorkflowError> {
+    Ok(store.deliver_signal(DeliverSignalArgs {
         run_id: run_id.to_string(),
-        delivery: SignalDelivery {
-            signal_id: None,
-            step_id: Some(step_id.to_string()),
-            // 按 step 定位时 name 由 store 从日志里取；这里给空串作占位，
-            // store 实现在定位到 step 后会用日志里的真实 name 覆盖。
-            name: String::new(),
-            payload,
-            meta,
-        },
-        now: now_ms(),
-    })?;
-    match outcome {
-        DeliveryOutcome::Delivered | DeliveryOutcome::Duplicate => Ok(()),
-        DeliveryOutcome::NotWaiting => Err(WorkflowError::SignalLost(format!(
-            "no step in run `{run_id}` is parked on a signal at step `{step_id}`"
-        ))),
-        DeliveryOutcome::NotFound => Err(WorkflowError::SignalLost(format!(
-            "run `{run_id}` does not exist"
-        ))),
-    }
+        delivery,
+        now,
+    })?)
 }
 
-/// Appends an `ApprovalResolved` for the run parked on approval `approval_id`
-/// — the external side of
-/// [`WorkflowCtx::approve`](crate::define::WorkflowCtx::approve).
+/// 投递一个审批决定——对应上游 `deliverApproval`。
 ///
-/// **过闸**：只在该审批确实泊着时才落盘；否则报
-/// [`WorkflowError::SignalLost`]（上游对应 `approval_lost`：run 没在等这个
-/// 审批）。事件形状逐字对齐上游 `APPROVAL_RESOLVED`——**没有 payload**，审批是
-/// 结构化决定（`approved` + `feedback`）。
-pub fn signal_approval(
+/// 返回四态，理由同 [`deliver_signal`]。审批是**结构化决定**（`approved` + `feedback`），
+/// 没有 payload——事件形状逐字对齐上游 `APPROVAL_RESOLVED`。
+pub fn deliver_approval(
     store: &dyn RunStore,
     run_id: &str,
     approval_id: &str,
     approved: bool,
     feedback: Option<&str>,
-) -> Result<(), WorkflowError> {
-    // 走 store 的原子投递（对齐上游 `deliverApproval`）。
-    let outcome = store.deliver_approval(DeliverApprovalArgs {
+    now: i64,
+) -> Result<DeliveryOutcome, WorkflowError> {
+    Ok(store.deliver_approval(DeliverApprovalArgs {
         run_id: run_id.to_string(),
         approval_id: approval_id.to_string(),
         approved,
         feedback: feedback.map(str::to_string),
-        now: now_ms(),
-    })?;
-    match outcome {
-        DeliveryOutcome::Delivered | DeliveryOutcome::Duplicate => Ok(()),
-        DeliveryOutcome::NotWaiting => Err(WorkflowError::SignalLost(format!(
-            "run `{run_id}` is not parked on approval `{approval_id}`"
-        ))),
-        DeliveryOutcome::NotFound => Err(WorkflowError::SignalLost(format!(
-            "run `{run_id}` does not exist"
-        ))),
-    }
+        now,
+    })?)
 }
 
-/// Appends a `SignalResolved` for the run currently parked waiting for the
-/// event `event_name` — the external side of
-/// [`WorkflowCtx::wait_for_event`](crate::define::WorkflowCtx::wait_for_event).
-/// Locates the paused step via its channel `name` (not the pause key), so a
-/// host needs only the event name. Fails with
-/// [`WorkflowError::SignalLost`] when nothing is parked on that name.
-///
-/// `signal_id` is the host-supplied idempotency token (upstream's rule: same
-/// id at the same step is a no-op, a different one is a lost race). It is
-/// recorded on the event **and** deduplicated by the store.
-pub fn signal_event(
-    store: &dyn RunStore,
-    run_id: &str,
-    event_name: &str,
-    signal_id: Option<&str>,
-    payload: serde_json::Value,
-    meta: Option<serde_json::Value>,
-) -> Result<(), WorkflowError> {
-    // 走 store 的原子投递（对齐上游 `deliverSignal`）。
-    let outcome = store.deliver_signal(DeliverSignalArgs {
-        run_id: run_id.to_string(),
-        delivery: SignalDelivery {
-            signal_id: signal_id.map(str::to_string),
-            step_id: None,
-            name: event_name.to_string(),
-            payload,
-            meta,
-        },
-        now: now_ms(),
-    })?;
-    match outcome {
-        DeliveryOutcome::Delivered | DeliveryOutcome::Duplicate => Ok(()),
-        DeliveryOutcome::NotWaiting => Err(WorkflowError::SignalLost(format!(
-            "no step in run `{run_id}` is parked on event `{event_name}`"
-        ))),
-        DeliveryOutcome::NotFound => Err(WorkflowError::SignalLost(format!(
-            "run `{run_id}` does not exist"
-        ))),
-    }
-}
 
 /// 测试脚手架，供 engine 各子模块（`mod` / `run_workflow`）的测试共享。
 #[cfg(test)]
@@ -1690,7 +1608,7 @@ mod tests {
     use super::*;
     use crate::define::{Backoff, BaseCtx, CreateWorkflowConfig, RetryPolicy, WorkflowDefinition, WorkflowCtx, create_workflow};
     use crate::engine::testkit::{TestLog, idx};
-    use crate::run_store::InMemoryStore;
+    use crate::run_store::{InMemoryStore, RunState};
     use serde::{Deserialize, Serialize};
     use std::sync::atomic::AtomicBool;
     use tokio::try_join;
@@ -2492,7 +2410,7 @@ mod tests {
         assert!(decided.lock().unwrap().is_none(), "挂起时 handler 未继续");
 
         // 外部投递（这是 runtime 的 `deliver_approval` 做的事）。
-        signal_approval(store.as_ref(), "r1", "release", true, None).unwrap();
+        deliver_approval(store.as_ref(), "r1", "release", true, None, now_ms()).unwrap();
 
         // Drive #2 —— 从日志短路 `charge`，pause 有 resume 直接放行。
         let out = run_workflow(
@@ -2537,17 +2455,37 @@ mod tests {
         )));
     }
 
-    /// `signal_run` **过闸**（对齐上游默认 `not-waiting`）：没泊在信号上就
+    /// `deliver_signal` **过闸**（对齐上游默认 `not-waiting`）：没泊在信号上就
     /// 拒绝，不静默写日志。早到信号由 runtime 的可选收件箱承接
     /// （`buffer_signal` + `buffer_signals`），不是靠 core 无条件 append。
     #[test]
-    fn signal_run_rejects_when_nothing_is_parked() {
+    fn deliver_signal_reports_not_waiting_when_nothing_is_parked() {
         let store = InMemoryStore::new();
-        let err = signal_run(&store, "r1", "gate", serde_json::json!({ "ok": true }), None)
-            .unwrap_err();
-        assert!(
-            matches!(err, WorkflowError::SignalLost(_)),
-            "没在等应报 SignalLost，实际 {err:?}"
+        // 需要一个存在的 run，否则下面验证的就是 NotFound 而不是 NotWaiting。
+        store
+            .set_run_state(
+                "r1",
+                &RunState {
+                    run_id: "r1".into(),
+                    workflow_id: "wf".into(),
+                    workflow_version: None,
+                    status: crate::event::RunStatus::Running,
+                    input: serde_json::Value::Null,
+                    output: None,
+                    error: None,
+                    waiting_for: None,
+                    pending_approval: None,
+                    awaiting: vec![],
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            )
+            .unwrap();
+        let outcome = deliver_signal(&store, "r1", SignalDelivery { signal_id: None, step_id: Some("gate".to_string()), name: String::new(), payload: serde_json::json!({ "ok": true }), meta: None }, now_ms())
+            .unwrap();
+        assert_eq!(
+            outcome, DeliveryOutcome::NotWaiting,
+            "没在等应报 NotWaiting（上游四态，不是异常）"
         );
         assert!(
             store.get_events("r1").unwrap().is_empty(),
@@ -2574,7 +2512,7 @@ mod tests {
         });
 
         // 直接往 store 写一条早于 pause 的 SignalResolved（模拟收件箱消费的
-        // 产物），不走 signal_run —— 那条路现在过闸。
+        // 产物），不走 deliver_signal —— 那条路现在过闸。
         store
             .append_event(
                 "r1",
@@ -2678,7 +2616,7 @@ mod tests {
             "replay must not re-append the pause checkpoint"
         );
 
-        signal_approval(store.as_ref(), "r2", "release", true, None).unwrap();
+        deliver_approval(store.as_ref(), "r2", "release", true, None, now_ms()).unwrap();
         let out = t2.await.unwrap().unwrap();
         assert_eq!(out.status, RunStatus::Finished);
         assert_eq!(
@@ -2749,7 +2687,7 @@ mod tests {
         assert!(w.deadline.is_some(), "sleep 的 due_at 应投影为 deadline");
 
         // 外部投递（runtime sweep 在 deadline 到点后做的事）。
-        signal_run(store.as_ref(), "s1", "cooldown", serde_json::Value::Null, None).unwrap();
+        deliver_signal(store.as_ref(), "s1", SignalDelivery { signal_id: None, step_id: Some("cooldown".to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None }, now_ms()).unwrap();
 
         // Drive #2：放行。
         let out = run_workflow(
@@ -2801,7 +2739,7 @@ mod tests {
         .outcome().await
         .unwrap();
         assert_eq!(out.status, RunStatus::Paused);
-        signal_approval(store.as_ref(), "r3", "gate", true, None).unwrap();
+        deliver_approval(store.as_ref(), "r3", "gate", true, None, now_ms()).unwrap();
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
@@ -2846,7 +2784,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_event_fulfilled_by_signal_event() {
+    async fn wait_for_event_fulfilled_by_deliver_signal() {
         let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
         let received = Arc::new(Mutex::new(None::<serde_json::Value>));
         let rx = received.clone();
@@ -2878,14 +2816,7 @@ mod tests {
         assert!(st.pending_approval.is_none(), "named event 不是 approval");
 
         // 外部投递 → Drive #2 放行。
-        signal_event(
-            store.as_ref(),
-            "ne1",
-            "review-approved",
-            None,
-            serde_json::json!({ "ok": true }),
-            None,
-        )
+        deliver_signal(store.as_ref(), "ne1", SignalDelivery { signal_id: None, step_id: None, name: "review-approved".to_string(), payload: serde_json::json!({ "ok": true }), meta: None }, now_ms())
         .unwrap();
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
@@ -2920,7 +2851,7 @@ mod tests {
         .outcome().await
         .unwrap();
         assert_eq!(out.status, RunStatus::Paused);
-        signal_event(store.as_ref(), "ne2", "go", None, serde_json::json!(42), None).unwrap();
+        deliver_signal(store.as_ref(), "ne2", SignalDelivery { signal_id: None, step_id: None, name: "go".to_string(), payload: serde_json::json!(42), meta: None }, now_ms()).unwrap();
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
@@ -2981,7 +2912,7 @@ mod tests {
             "过期的 due_at 照实投影——由 sweep 判断「已到点」"
         );
 
-        signal_run(store.as_ref(), &out.run_id, "cooldown", serde_json::Value::Null, None).unwrap();
+        deliver_signal(store.as_ref(), &out.run_id, SignalDelivery { signal_id: None, step_id: Some("cooldown".to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None }, now_ms()).unwrap();
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
@@ -3024,7 +2955,7 @@ mod tests {
         assert_eq!(w.signal_name, "__timer");
         assert_eq!(w.deadline, Some(due), "deadline 应是调用方给的时间戳");
 
-        signal_run(store.as_ref(), "stu1", "cooldown", serde_json::Value::Null, None).unwrap();
+        deliver_signal(store.as_ref(), "stu1", SignalDelivery { signal_id: None, step_id: Some("cooldown".to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None }, now_ms()).unwrap();
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
@@ -3075,11 +3006,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signal_event_without_awaiter_errors() {
+    async fn signal_to_unknown_run_reports_not_found() {
+        // run 不存在与「没人在等」是两种结果（上游四态里的 not-found / not-waiting）。
         let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
-        let err =
-            signal_event(store.as_ref(), "nowhere", "ghost", None, serde_json::Value::Null, None).unwrap_err();
-        assert!(matches!(err, crate::error::WorkflowError::SignalLost(_)));
+        let outcome = deliver_signal(store.as_ref(), "nowhere", SignalDelivery { signal_id: None, step_id: None, name: "ghost".to_string(), payload: serde_json::Value::Null, meta: None }, now_ms()).unwrap();
+        assert_eq!(outcome, DeliveryOutcome::NotFound);
         assert!(
             store.get_events("nowhere").unwrap().is_empty(),
             "失败时不 append SignalResolved"
@@ -3107,7 +3038,7 @@ mod tests {
         .outcome().await
         .unwrap();
         assert_eq!(out.status, RunStatus::Paused);
-        signal_approval(store.as_ref(), "det1", "gate", true, None).unwrap();
+        deliver_approval(store.as_ref(), "det1", "gate", true, None, now_ms()).unwrap();
         // Drive #2：`__now-0` / `__uuid-0` 从日志缓存取（deterministic replay）。
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
@@ -3194,7 +3125,7 @@ mod tests {
         .unwrap();
         assert_eq!(out.status, RunStatus::Paused);
 
-        signal_approval(store.as_ref(), "named1", "gate", true, None).unwrap();
+        deliver_approval(store.as_ref(), "named1", "gate", true, None, now_ms()).unwrap();
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
@@ -3476,7 +3407,7 @@ mod tests {
 
         // `Aborted` 是锁存终态：投递 resume 也唤不回来（上游 `resumeRun`
         // 对 aborted 直接 route 到 attach，`run-workflow.ts:275-282`）。
-        signal_run(store.as_ref(), "ca2", "hold", serde_json::Value::Null, None).unwrap();
+        deliver_signal(store.as_ref(), "ca2", SignalDelivery { signal_id: None, step_id: Some("hold".to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None }, now_ms()).unwrap();
         let out3 = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
@@ -3579,7 +3510,7 @@ mod tests {
         assert!(w.deadline.is_some(), "yield 的 target 应投影为 deadline");
 
         // host 重新唤起（延期预算）→ 投递 timer。
-        signal_run(store.as_ref(), "y1", "__yield-0", serde_json::Value::Null, None).unwrap();
+        deliver_signal(store.as_ref(), "y1", SignalDelivery { signal_id: None, step_id: Some("__yield-0".to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None }, now_ms()).unwrap();
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
@@ -3638,7 +3569,7 @@ mod tests {
             "yield_resume_at 应原样成为 deadline"
         );
 
-        signal_run(store.as_ref(), "y2", "__yield-0", serde_json::Value::Null, None).unwrap();
+        deliver_signal(store.as_ref(), "y2", SignalDelivery { signal_id: None, step_id: Some("__yield-0".to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None }, now_ms()).unwrap();
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
@@ -4015,7 +3946,7 @@ mod tests {
         assert_eq!(out.status, RunStatus::Paused);
 
         // 投递一个缺 `approved` 字段的 payload
-        signal_run(store.as_ref(), "sc1", "hold", serde_json::json!({ "ok": 1 }), None).unwrap();
+        deliver_signal(store.as_ref(), "sc1", SignalDelivery { signal_id: None, step_id: Some("hold".to_string()), name: String::new(), payload: serde_json::json!({ "ok": 1 }), meta: None }, now_ms()).unwrap();
         let out2 = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({}))
@@ -4052,13 +3983,7 @@ mod tests {
         )
         .outcome().await
         .unwrap();
-        signal_run(
-            store.as_ref(),
-            "sc2",
-            "hold",
-            serde_json::json!({ "approved": true }),
-            None,
-        )
+        deliver_signal(store.as_ref(), "sc2", SignalDelivery { signal_id: None, step_id: Some("hold".to_string()), name: String::new(), payload: serde_json::json!({ "approved": true }), meta: None }, now_ms())
         .unwrap();
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())

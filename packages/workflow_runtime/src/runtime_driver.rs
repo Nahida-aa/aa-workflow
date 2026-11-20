@@ -655,19 +655,23 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
             now,
         })?;
 
-        // 桥给 core：signal_event 按 pause 点的 name 追加 SignalResolved，
+        // 桥给 core：deliver_signal 按 pause 点的 name 追加 SignalResolved，
         // 并把投递的 signal_id 一并记进事件（上游幂等令牌）。
         let run_store = create_run_store_adapter(Arc::clone(&self.config.store));
         match &delivered {
             DeliverSignalResult::Delivered { run } => {
                 let workflow_id = run.workflow_id.clone();
-                aa_workflow_core::signal_event(
+                aa_workflow_core::deliver_signal(
                     run_store.as_ref(),
                     &args.run_id,
-                    &args.name,
-                    Some(args.signal_id.as_str()),
-                    args.payload.clone(),
-                    args.meta.clone(),
+                    aa_workflow_core::SignalDelivery {
+                        signal_id: Some(args.signal_id.clone()),
+                        step_id: None,
+                        name: args.name.clone(),
+                        payload: args.payload.clone(),
+                        meta: args.meta.clone(),
+                    },
+                    now,
                 )?;
                 let workflow = self.load_workflow(&workflow_id)?;
                 return self
@@ -772,14 +776,14 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
 
         let run_store = create_run_store_adapter(Arc::clone(&self.config.store));
         // 我们的 core：approve 的 pause key 即 approval_id。产出
-        // `ApprovalResolved`（对齐上游 `APPROVAL_RESOLVED`，无 payload）——
-        // 由 core 过闸：没泊在这个审批上就报 SignalLost（上游 approval_lost）。
-        aa_workflow_core::signal_approval(
+        // `ApprovalResolved`（对齐上游 `APPROVAL_RESOLVED`，无 payload）。
+        aa_workflow_core::deliver_approval(
             run_store.as_ref(),
             &args.run_id,
             &args.approval.approval_id,
             args.approval.approved,
             args.approval.feedback.as_deref(),
+            now,
         )?;
 
         let workflow = self.load_workflow(&workflow_id)?;

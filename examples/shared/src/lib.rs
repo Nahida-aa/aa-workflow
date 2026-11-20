@@ -20,7 +20,7 @@
 //!
 //! - 依赖只允许 `aa_workflow_core` + tokio，**不依赖 LocalDub**。落盘 store 在
 //!   `examples/store_file`，实现新契约 `WorkflowExecutionStore`。
-//! - 引擎已有 pause 语义（`ctx.approve` / `ctx.sleep`，唤醒走 `signal_run`）：
+//! - 引擎已有 pause 语义（`ctx.approve` / `ctx.sleep`，唤醒走 `deliver_signal`）：
 //!   事件等待用 `ctx.approve` 表达（reason 即事件名），
 //!   定时闸门用 `ctx.sleep`（引擎自动唤醒）。
 //! - 不做 serverless host 前端（Cloudflare / Netlify / Vercel 对 Rust 无意义）；

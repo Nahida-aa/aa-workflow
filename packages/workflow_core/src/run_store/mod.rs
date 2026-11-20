@@ -382,7 +382,7 @@ pub trait RunStore: Send + Sync {
     /// 这个信号上、追加 `SignalResolved`。三步放在一次调用里才能保证
     /// 「查到泊车」与「追加」之间没有竞态窗口。
     ///
-    /// 为什么不能像旧版 [`signal_event`](crate::engine::signal_event) 那样在自由函数里
+    /// 为什么不能像旧版 [`deliver_signal`](crate::engine::deliver_signal) 那样在自由函数里
     /// `get_events` + `append_event`：那是两次独立调用，中间可能被别的写入插进去。
     ///
     /// 默认实现返回 [`DeliveryOutcome::NotFound`]（对应上游的可选 `?`）——不支持投递的 store

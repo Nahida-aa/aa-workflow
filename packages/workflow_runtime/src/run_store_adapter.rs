@@ -505,7 +505,7 @@ impl RunStore for RunStoreAdapter {
     /// | 本方法 | 写 `SignalResolved` 事件 |
     ///
     /// runtime 的投递路径两个都调（`runtime_driver.rs` 先 `store.deliver_signal`
-    /// 再 `core::signal_event`）。若这里去转发底层同名方法，会导致
+    /// 再 `core::deliver_signal`）。若这里去转发底层同名方法，会导致
     /// 幂等判定被消耗两次、且**事件永远不落盘**。
     fn deliver_signal(&self, args: DeliverSignalArgs) -> Result<DeliveryOutcome, StoreError> {
         let events = self

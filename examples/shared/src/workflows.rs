@@ -13,7 +13,7 @@
 //! - [`fulfillment`]（id `fulfillment`）— 对齐官方 `fulfillmentWorkflow` / wf-demo：
 //!   `reserve-inventory` → `readyAt` 定时闸门（sleep）→ `payment-received` 事件等待 → `ship-order`。
 //! - [`approval_review`] — 人工审批：`ctx.approve` 持久化一个等待点，
-//!   外部用 [`aa_workflow_core::signal_run`] 交付决定后继续（signals 语义载体）。
+//!   外部用 [`aa_workflow_core::deliver_signal`] 交付决定后继续（signals 语义载体）。
 //! - [`approval_order`]（id `approval-order`）— 对齐 wf-demo：金额阈值决定是否人工
 //!   审批，拒绝分支；`email_digest` 是 resume 的行为载体。
 //! - [`invoice`]（id `invoice`）— 对齐 wf-demo：连续两个 `sleep`（双定时器，引擎自动唤醒）。
@@ -27,7 +27,7 @@
 //!   （与 TanStack 0.0.4 一致）。
 
 use std::time::Duration;
-use aa_workflow_core::{AnyWorkflowDefinition, Backoff, BaseCtx, CreateWorkflowConfig, RetryPolicy, StepCtx, StepOptions, WorkflowCtx, WorkflowDefinition, create_workflow};
+use aa_workflow_core::{SignalDelivery, AnyWorkflowDefinition, Backoff, BaseCtx, CreateWorkflowConfig, RetryPolicy, StepCtx, StepOptions, WorkflowCtx, WorkflowDefinition, create_workflow};
 
 // ========================================================================
 // 输入类型 = workflow 的「schema」（Rust 版 zod `inputSchema`）：serde
@@ -626,7 +626,7 @@ pub fn state_demo() -> WorkflowDefinition<StateDemoInput, serde_json::Value, Cou
 
 /// 事件闸门 demo（对齐 TanStack `waitForEvent` / `sleepUntil` / `emit`）：
 /// 1. `ctx.emit` 广播可观测事件（不进日志，publisher 可见）；
-/// 2. `ctx.wait_for_event` 按事件名挂起，外部 `signal_event` 按名投递；
+/// 2. `ctx.wait_for_event` 按事件名挂起，外部 `deliver_signal` 按名投递；
 /// 3. `ctx.sleep_until` 等绝对时间点（predictedAt 靠后成立，否则立即放行）。
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -673,7 +673,7 @@ mod tests {
     use super::*;
     use std::sync::{Arc, LazyLock};
     use std::time::Duration;
-    use aa_workflow_core::{InMemoryStore, RunStatus, RunStore, RunWorkflowOptions, WorkflowDefinition, WorkflowEvent, run_workflow, signal_approval, signal_event, signal_run};
+    use aa_workflow_core::{InMemoryStore, RunStatus, RunStore, RunWorkflowOptions, WorkflowDefinition, WorkflowEvent, run_workflow, deliver_approval, deliver_signal};
 
     /// 序列化共享全局网关状态的测试（tokio 各 test 默认并行跑）。
     static GATEWAY_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
@@ -726,8 +726,8 @@ mod tests {
             .run_id
             .clone()
             .expect("测试应显式指定 run_id");
-        // 按挂起类型分派：审批走 signal_approval（结构化决定，无 payload），
-        // 信号走 signal_run。两条路都过闸——没泊在该 step 上就报错。
+        // 按挂起类型分派：审批走 deliver_approval（结构化决定，无 payload），
+        // 信号走 deliver_signal。两条路都过闸——没泊在该 step 上就报错。
         let is_approval = store.get_events(&run_id).unwrap().iter().any(|e| {
             matches!(e, WorkflowEvent::ApprovalRequested { step_id: id, .. } if id == step_id)
         });
@@ -742,16 +742,10 @@ mod tests {
                 .get("feedback")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
-            signal_approval(
-                store.as_ref(),
-                &run_id,
-                step_id,
-                approved,
-                feedback.as_deref(),
-            )
+            deliver_approval(store.as_ref(), &run_id, step_id, approved, feedback.as_deref(), now_ms())
             .unwrap();
         } else {
-            signal_run(store.as_ref(), &run_id, step_id, payload, None).unwrap();
+            deliver_signal(store.as_ref(), &run_id, SignalDelivery { signal_id: None, step_id: Some(step_id.to_string()), name: String::new(), payload: payload, meta: None }, now_ms()).unwrap();
         }
         run_workflow(opts(wf.clone().into(), store.clone()))
             .outcome().await
@@ -794,13 +788,7 @@ mod tests {
             {
                 tokio::time::sleep(Duration::from_millis((due - now_ms()) as u64)).await;
             }
-            signal_run(
-                store.as_ref(),
-                &run_id,
-                w.step_id.as_deref().expect("timer 挂起应有 step_id"),
-                serde_json::Value::Null,
-                None,
-            )
+            deliver_signal(store.as_ref(), &run_id, SignalDelivery { signal_id: None, step_id: Some(w.step_id.as_deref().expect("timer 挂起应有 step_id").to_string()), name: String::new(), payload: serde_json::Value::Null, meta: None }, now_ms())
             .unwrap();
         }
     }
@@ -1125,11 +1113,11 @@ mod tests {
         .await;
         assert_eq!(out.status, RunStatus::Paused);
         // 此刻泊在 `refund-wait`（sleep）上——审批还没轮到，**不能提前投**
-        // （core 的 signal_approval 过闸：没泊在该审批上就报错）。先把 timer
+        // （core 的 deliver_approval 过闸：没泊在该审批上就报错）。先把 timer
         // 驱动到泊上 `refund-policy`。
         let out = drive_through_timers(&store, &wf, opts).await;
         assert_eq!(out.status, RunStatus::Paused, "timer 后应泊在 refund-policy");
-        signal_approval(store.as_ref(), "refund:q", "refund-policy", true, None).unwrap();
+        deliver_approval(store.as_ref(), "refund:q", "refund-policy", true, None, now_ms()).unwrap();
         let out = drive_through_timers(&store, &wf, opts).await;
         assert_eq!(out.status, RunStatus::Finished);
         assert_eq!(out.output.clone().unwrap()["status"], "refunded");
@@ -1448,7 +1436,7 @@ mod tests {
 
         // 进程 B：同 run_id 重跑 → state 从 initialize 重建为 5，`bump-inside`
         // 已被 checkpoint 记录 → 闭包跳过（+1 丢失），只剩闭包之外的 mutation。
-        signal_approval(store.as_ref(), "state:edge", "gate", true, None).unwrap();
+        deliver_approval(store.as_ref(), "state:edge", "gate", true, None, now_ms()).unwrap();
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({ "amount": 5 }))
@@ -1471,7 +1459,7 @@ mod tests {
     }
 
     /// Typed ctx 的完整基元组合：emit（publisher 可见、日志无）→ wait_for_event
-    /// （按名挂起 + signal_event 按名投递）→ sleep_until（绝对时间点）。
+    /// （按名挂起 + deliver_signal 按名投递）→ sleep_until（绝对时间点）。
     /// `emit` → `wait_for_event` 挂起 → 投递 → `sleep_until`（过去时间戳）。
     #[tokio::test]
     async fn event_gate_emit_wait_then_sleep_until() {
@@ -1503,14 +1491,7 @@ mod tests {
         assert_eq!(w.signal_name, "price-settled");
         assert!(st.pending_approval.is_none());
 
-        signal_event(
-            store.as_ref(),
-            "event:gate",
-            "price-settled",
-            None,
-            serde_json::json!({ "px": 62000 }),
-            None,
-        )
+        deliver_signal(store.as_ref(), "event:gate", SignalDelivery { signal_id: None, step_id: None, name: "price-settled".to_string(), payload: serde_json::json!({ "px": 62000 }), meta: None }, now_ms())
         .unwrap();
         // Drive #2 起：`sleep_until(0)` 会挂起，由 timer 投递推进。
         let out = drive_through_timers(&store, &wf, opts).await;
@@ -1550,14 +1531,7 @@ mod tests {
         };
         assert_eq!(drive_to_pause(&store, &wf, opts).await, RunStatus::Paused);
 
-        signal_event(
-            store.as_ref(),
-            "event:crash",
-            "price-settled",
-            None,
-            serde_json::json!({ "px": 3000 }),
-            None,
-        )
+        deliver_signal(store.as_ref(), "event:crash", SignalDelivery { signal_id: None, step_id: None, name: "price-settled".to_string(), payload: serde_json::json!({ "px": 3000 }), meta: None }, now_ms())
         .unwrap();
         // `sleep_until(0)` 也会挂起，由 timer 投递推进。
         let out = drive_through_timers(&store, &wf, opts).await;

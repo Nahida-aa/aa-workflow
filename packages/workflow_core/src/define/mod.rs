@@ -272,7 +272,7 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
         self.step_with(step_id, StepOptions::default(), run).await
     }
 
-    /// Durable approval wait: pauses the run until [`signal_run`](crate::engine::signal_run)
+    /// Durable approval wait: pauses the run until [`deliver_signal`](crate::engine::deliver_signal)
     /// delivers a decision for `key`. `reason` is persisted in the `SignalAwaited`
     /// checkpoint for approvers. Resolves to the signal's payload on success;
     /// on replay the already-recorded `SignalResolved` is served from the log.
@@ -313,7 +313,7 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
     /// Durable sleep: pauses the run until `dur` elapses. `key` is the
     /// deterministic pause identity. An external timer (the runtime's sweep,
     /// indexing on `RunState.waiting_for.deadline`) delivers the resume via
-    /// [`signal_run`](crate::engine::signal_run) once the deadline passes; on
+    /// [`deliver_signal`](crate::engine::deliver_signal) once the deadline passes; on
     /// replay, a previously delivered resume short-circuits immediately.
     pub async fn sleep(
         &self,
@@ -346,7 +346,7 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
         crate::engine::exec_pause(&self.engine, &key.into(), "__timer", "sleep", Some(ts_ms)).await
     }
 
-    /// Durable named wait: pauses the run until [`signal_event`](crate::engine::signal_event)
+    /// Durable named wait: pauses the run until [`deliver_signal`](crate::engine::deliver_signal)
     /// delivers a payload for `event_name`. `key` is the deterministic pause
     /// identity (must not collide with step ids); `event_name` is the channel
     /// a host signals on (`RunState.waiting_for.signal_name`). On replay a

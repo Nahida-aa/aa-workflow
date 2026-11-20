@@ -100,7 +100,7 @@ impl RunError {
 /// approval_lost | workflow_version_mismatch`。这里只留引擎真能产出的三个：
 ///
 /// - `run_lost` / `signal_lost` / `approval_lost` 对应他们「投递丢失」时把
-///   run 打 errored 的路径，我们的 `signal_run` / `signal_event` 是把错误
+///   run 打 errored 的路径，我们的 `deliver_signal` / `deliver_approval` 是把错误
 ///   **返回给调用方**，不往日志里写终态事件，没有发射点。
 /// - `workflow_version_mismatch` 我们是**回退到当前版本**而不是报错
 ///   （`select_workflow_version`），所以也产不出。
@@ -159,7 +159,7 @@ pub enum WorkflowError {
     /// No `RunState` exists for the requested run id.
     RunNotFound(String),
     /// A delivered signal could not be matched to a parked wait point (from
-    /// [`crate::engine::signal_event`]: nothing was paused on that event name).
+    /// [`crate::engine::deliver_signal`]: nothing was paused on that event name).
     SignalLost(String),
     /// An internal invariant was violated (deadlock guard, channel closed).
     Internal(String),

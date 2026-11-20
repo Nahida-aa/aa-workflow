@@ -1,6 +1,6 @@
 //! 单次 invocation 的驱动入口：把 workflow **跑起来 / 续跑** 的顶层编排。
 //!
-//! 引擎本体（`EngineRuntime` 驱动态、`exec_step` / `exec_pause` / `signal_run`）
+//! 引擎本体（`EngineRuntime` 驱动态、`exec_step` / `exec_pause` / `deliver_signal`）
 //! 在 [`super`](crate::engine) 中；这里只负责一次 `run_workflow` 调用内部：
 //! 从 store 构造 run state、算 per-invocation state、造 `EngineRuntime`、跑 handler、
 //! 收尾写终态事件与 RunState 信封。每次调用（start / resume）都独立走完整条路径。
@@ -67,7 +67,7 @@ pub type PublisherFn =
 /// | `workflow` / `runStore` | ✅ `workflow` / `run_store` | 必填 |
 /// | `input` / `runId` / `deadline` / `minYieldRemainingMs` / `yieldResumeAt` | ✅ | 同名同义 |
 /// | `publish` | ✅ `publish` | 位置从参数移进结构体 |
-/// | `signalDelivery` / `approval` | — | 我们走 `signal_run` / `signal_event` 先落盘再 drive（D3 的形态差异） |
+/// | `signalDelivery` / `approval` | — | 我们走 `deliver_signal` / `deliver_approval` 先落盘再 drive（D3 的形态差异） |
 /// | `attach` | ✅ `attach` | 只读回放，见 [`RunWorkflowOptions::attach`] |
 /// | `recover` / `signal` / `threadId` / `outputSink` / `telemetry` | — | **暂无**；未做，不是不做 |
 /// | — | ➕ `interimGoals` | **本地扩展**（对齐 TS f2-lite 泊车语义） |
@@ -453,7 +453,7 @@ where
     let run_id = opts
         .run_id
         .clone()
-        .unwrap_or_else(|| format!("run_{}", now_ms()));
+        .unwrap_or_else(|| format!("run_{}", 0));
     opts.run_id = Some(run_id.clone());
     let publish = opts.publish.clone();
     // `outcome()` 要在 drain 之后回 store 读状态，所以这条 clone 得活过引擎。
@@ -724,7 +724,7 @@ async fn drive(
     let workflow: &WorkflowDefinition = workflow_any;
     let store = Arc::clone(&opts.run_store);
 
-    let run_id = opts.run_id.clone().unwrap_or_else(|| format!("run_{}", now_ms()));
+    let run_id = opts.run_id.clone().unwrap_or_else(|| format!("run_{}", 0));
     let ts = now_ms();
 
     // A run that was cancelled while parked must not be resurrected by a drive:
