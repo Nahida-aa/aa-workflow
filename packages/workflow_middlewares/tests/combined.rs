@@ -13,7 +13,8 @@ use aa_workflow_core::{
     create_workflow, run_workflow,
 };
 use aa_workflow_middlewares::{
-    INTERIM_GOAL_SIGNAL, InterimGoalsKey, ReseedKey, ReseedPlan, SourceStep, interim_goals, reseed,
+    DagPlan, DagPlanKey, INTERIM_GOAL_SIGNAL, InterimGoalsKey, ReseedKey, ReseedPlan, SourceStep,
+    dag_policies, interim_goals, reseed,
 };
 
 /// 把源 run 的 STEP_FINISHED 收成 map（带日志下标）。
@@ -220,5 +221,121 @@ async fn outer_interim_goals_parks_before_reseed_short_circuits() {
         RunStatus::Paused,
         "反序（interim_goals 在外层）应能泊车；实际 err={:?}",
         store.get_run_state("d2").unwrap().unwrap().error
+    );
+}
+/// 两个**都能泊车**的中间件同时挂：外层先判定，内层被遮蔽。
+///
+/// 两者都用 `InterimGoalSignal` 停下来，但 park 时带的 `meta` 不同——
+/// 一个带 `{__interimGoals: ..}`、一个带 `{goals: ..}`，正好能看出来是谁触发。
+fn linear_shape() -> Arc<aa_workflow_dag::DagShape> {
+    let none: &[&str] = &[];
+    let a: &[&str] = &["a"];
+    let ab: &[&str] = &["a", "b"];
+    Arc::new(aa_workflow_dag::DagShape::build(&[("a", none), ("b", a), ("c", ab)]).unwrap())
+}
+
+/// 读出泊车事件的 meta（`None` = 没泊车）。
+fn park_meta(store: &InMemoryStore, run_id: &str) -> Option<serde_json::Value> {
+    store.get_events(run_id).ok()?.into_iter().find_map(|e| match e {
+        WorkflowEvent::SignalAwaited { name, meta, .. } if name == INTERIM_GOAL_SIGNAL => meta,
+        _ => None,
+    })
+}
+
+/// 外层 `interim_goals` 先看到 b 入口 → 它 park，`dag_policies` 没轮到。
+#[tokio::test]
+async fn outer_interim_goals_wins_the_park_race() {
+    let store = Arc::new(InMemoryStore::new());
+    let ran: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let wf = Arc::new(make_wf(
+        ran.clone(),
+        vec![
+            interim_goals({
+                let store = store.clone();
+                move |run_id| Ok(store.get_events(run_id)?)
+            }),
+            dag_policies(
+                linear_shape(),
+                Arc::new({
+                    let store = store.clone();
+                    move |run_id: &str| Ok(store.get_events(run_id)?)
+                }),
+            ),
+        ],
+    ));
+
+    let out = run_workflow(
+        RunWorkflowOptions::new(wf, store.clone())
+            .input(serde_json::json!({}))
+            .meta(
+                MetaBag::new()
+                    .with::<InterimGoalsKey>(vec!["a".to_string()])
+                    .with::<DagPlanKey>(DagPlan {
+                        goals: vec!["a".to_string()],
+                        ..Default::default()
+                    }),
+            )
+            .run_id("p1"),
+    )
+    .outcome()
+    .await
+    .unwrap();
+
+    assert_eq!(ran.lock().unwrap().clone(), vec!["a".to_string()]);
+    assert_eq!(out.status, RunStatus::Paused);
+    let m = park_meta(&store, "p1").expect("应泊车");
+    assert!(
+        m.get("__interimGoals").is_some(),
+        "应由 interim_goals 触发（meta 带 __interimGoals），实际 {m}"
+    );
+}
+
+/// 换过来：外层 `dag_policies` 先看到 b 入口 → 它 park，`interim_goals` 没轮到。
+#[tokio::test]
+async fn outer_dag_policies_wins_the_park_race() {
+    let store = Arc::new(InMemoryStore::new());
+    let ran: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let wf = Arc::new(make_wf(
+        ran.clone(),
+        vec![
+            dag_policies(
+                linear_shape(),
+                Arc::new({
+                    let store = store.clone();
+                    move |run_id: &str| Ok(store.get_events(run_id)?)
+                }),
+            ),
+            interim_goals({
+                let store = store.clone();
+                move |run_id| Ok(store.get_events(run_id)?)
+            }),
+        ],
+    ));
+
+    let out = run_workflow(
+        RunWorkflowOptions::new(wf, store.clone())
+            .input(serde_json::json!({}))
+            .meta(
+                MetaBag::new()
+                    .with::<DagPlanKey>(DagPlan {
+                        goals: vec!["a".to_string()],
+                        ..Default::default()
+                    })
+                    .with::<InterimGoalsKey>(vec!["a".to_string()]),
+            )
+            .run_id("q1"),
+    )
+    .outcome()
+    .await
+    .unwrap();
+
+    assert_eq!(ran.lock().unwrap().clone(), vec!["a".to_string()]);
+    assert_eq!(out.status, RunStatus::Paused);
+    let m = park_meta(&store, "q1").expect("应泊车");
+    assert!(
+        m.get("goals").is_some() && m.get("__interimGoals").is_none(),
+        "应由 dag_policies 触发（meta 带 goals），实际 {m}"
     );
 }
