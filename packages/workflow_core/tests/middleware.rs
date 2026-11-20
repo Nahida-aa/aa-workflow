@@ -63,17 +63,15 @@ aa_workflow_core::impl_ext_accessors!(ExtraNs => ExtraAccess, extra, try_extra);
 
 /// 直接返回 `Middleware<(), Ext>` 的写法（中间件作者固定扩展类型）。
 fn require_user() -> Middleware {
-    Middleware::new().server(|mut sc: MiddlewareServerFnArgs| {
-        Box::pin(async move {
-            sc.next(Some(
-                DefExt::<UserNs>::new(User {
-                    id: "u-1".into(),
-                    name: "Alice".into(),
-                })
-                .into_value(),
-            ))
-            .await
-        })
+    Middleware::new().server(|mut sc: MiddlewareServerFnArgs| async move {
+        sc.next(Some(
+            DefExt::<UserNs>::new(User {
+                id: "u-1".into(),
+                name: "Alice".into(),
+            })
+            .into_value(),
+        ))
+        .await
     })
 }
 
@@ -114,24 +112,20 @@ async fn extends_ctx_with_middleware_added_fields() {
 #[tokio::test]
 async fn composes_multiple_middlewares_in_order_accumulating_ctx_fields() {
     // m1 写 counts = { a: 1, b: 0 }
-    let m1 = Middleware::new().server(|mut sc: MiddlewareServerFnArgs| {
-        Box::pin(async move {
-            sc.next(Some(
-                DefExt::<CountsNs>::new(Counts { a: 1, b: 0 }).into_value(),
-            ))
-            .await
-        })
+    let m1 = Middleware::new().server(|mut sc: MiddlewareServerFnArgs| async move {
+        sc.next(Some(
+            DefExt::<CountsNs>::new(Counts { a: 1, b: 0 }).into_value(),
+        ))
+        .await
     });
 
     // m2 写自己的 extra = { b: 10 }（独立命名空间，来自另一个开发者）
     // 与上游用例 2 的差异：上游 m2 读前序 `ctx.a`；本仓 `sc.ctx.ext` 是最早构造的
     // 快照，读不到 m1 经 next(ext) 写进 engine.ext_extra 的值——只有 handler 的
     // ctx 会在调用时重读 ext_extra。故 m2 不读前序扩展（见 ADR 0015 的能力边界）。
-    let m2 = Middleware::new().server(|mut sc: MiddlewareServerFnArgs| {
-        Box::pin(async move {
-            sc.next(Some(DefExt::<ExtraNs>::new(Extra { b: 10 }).into_value()))
-                .await
-        })
+    let m2 = Middleware::new().server(|mut sc: MiddlewareServerFnArgs| async move {
+        sc.next(Some(DefExt::<ExtraNs>::new(Extra { b: 10 }).into_value()))
+            .await
     });
 
     let wf = create_workflow(CreateWorkflowConfig::new("mw-chain").input::<Value>())
@@ -160,12 +154,12 @@ async fn wraps_the_handler_so_middleware_can_run_code_before_and_after() {
 
     let m1 = Middleware::new().server(move |mut sc: MiddlewareServerFnArgs| {
         let log = log.clone();
-        Box::pin(async move {
+        async move {
             log.lock().unwrap().push("m1-before".into());
             let out = sc.next(None).await;
             log.lock().unwrap().push("m1-after".into());
             out
-        })
+        }
     });
 
     let log2 = events.clone();
@@ -198,11 +192,9 @@ async fn wraps_the_handler_so_middleware_can_run_code_before_and_after() {
 /// run 变 `Errored` 且 message 含同样的字串。
 #[tokio::test]
 async fn rejects_calling_next_more_than_once_in_a_middleware() {
-    let broken = Middleware::new().server(|mut sc: MiddlewareServerFnArgs| {
-        Box::pin(async move {
-            sc.next(None).await?;
-            sc.next(None).await // second call — should error
-        })
+    let broken = Middleware::new().server(|mut sc: MiddlewareServerFnArgs| async move {
+        sc.next(None).await?;
+        sc.next(None).await // second call — should error
     });
 
     let wf = create_workflow(CreateWorkflowConfig::new("mw-broken").input::<Value>())

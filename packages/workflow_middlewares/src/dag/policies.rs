@@ -106,7 +106,7 @@ pub fn dag_policies(shape: Arc<DagShape>, get_events: Arc<GetEvents>) -> Middlew
         let get_events = get_events.clone();
         let shape = shape.clone();
 
-        Box::pin(async move {
+        async move {
             // 前置：解析 RunWorkflowOptions.meta 里的 DagPlan → PlanState。
             // 缺失 = 本次 run 不做任何策略（与另两个中间件一致）。
             let Some(plan) = sc.ctx.meta.try_get::<DagPlanKey>() else {
@@ -182,6 +182,6 @@ pub fn dag_policies(shape: Arc<DagShape>, get_events: Arc<GetEvents>) -> Middlew
             }));
 
             sc.next(None).await
-        })
+        }
     })
 }

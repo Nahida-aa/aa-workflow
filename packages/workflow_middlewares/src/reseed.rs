@@ -103,7 +103,7 @@ where
     Middleware::new().server(move |mut sc: MiddlewareServerFnArgs| {
         let load_results = load_results.clone();
 
-        Box::pin(async move {
+        async move {
             // 计划只在 meta 里；缺失 = 本次 run 不做播种。
             let Some(plan) = sc.ctx.meta.try_get::<ReseedKey>() else {
                 return sc.next(None).await;
@@ -146,6 +146,6 @@ where
             }
 
             sc.next(None).await
-        })
+        }
     })
 }

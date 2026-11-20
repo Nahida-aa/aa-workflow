@@ -84,7 +84,7 @@ where
     Middleware::new().server(move |mut sc: MiddlewareServerFnArgs| {
         let get_events = get_events.clone();
 
-        Box::pin(async move {
+        async move {
             // 目标只在 meta 里；缺失 = 本次 drive 不设临时目标。
             let goals: Vec<String> = match sc.ctx.meta.try_get::<InterimGoalsKey>() {
                 Some(g) if !g.is_empty() => g,
@@ -127,6 +127,6 @@ where
             }));
 
             sc.next(None).await
-        })
+        }
     })
 }

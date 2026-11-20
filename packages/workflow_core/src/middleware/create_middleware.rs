@@ -6,11 +6,9 @@
 //! Rust 是**同一个形状**：
 //!
 //! ```ignore
-//! let mw = Middleware::new().server(|mut sc: MiddlewareServerFnArgs| {
-//!     Box::pin(async move {
-//!         sc.wrap_step(TimeoutLayer::new(d));                              // ① 给 step 加层
-//!         sc.next(Some(DefExt::<AuthNs>::new(auth).into_value())).await    // ② 扩展 + 推进
-//!     })
+//! let mw = Middleware::new().server(|mut sc: MiddlewareServerFnArgs| async move {
+//!     sc.wrap_step(TimeoutLayer::new(d));                              // ① 给 step 加层
+//!     sc.next(Some(DefExt::<AuthNs>::new(auth).into_value())).await    // ② 扩展 + 推进
 //! });
 //! ```
 //!
@@ -38,6 +36,7 @@
 //!   **不需要任何合并类型**——使用者不必定义 `Combined`。
 //!
 //! 详细论证见 `docs/decisions/0015`。
+use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -321,16 +320,21 @@ impl Middleware {
 
     /// Set the server function（对齐 TS 的 `createMiddleware().server(fn)`）。
     ///
+    /// 接受返回任意 `Future` 的闭包，内部统一 `Box::pin` 擦除成 [`BoxFuture`]——
+    /// 调用方直接写 `async move { .. }`，不必自己装箱（对齐 `ctx.step` 的写法）。
+    /// 旧的 `Box::pin(..)` 写法仍然兼容（`Pin<Box<dyn Future>>` 本身也是 `Future`）。
+    ///
     /// ```ignore
     /// let mw = Middleware::new().server(|mut sc: MiddlewareServerFnArgs| {
-    ///     Box::pin(async move { sc.next(None).await })
+    ///     async move { sc.next(None).await }
     /// });
     /// ```
-    pub fn server<F>(mut self, f: F) -> Self
+    pub fn server<F, Fut>(mut self, f: F) -> Self
     where
-        F: Fn(MiddlewareServerFnArgs) -> BoxFuture<'static, Result<Value>> + Send + Sync + 'static,
+        F: Fn(MiddlewareServerFnArgs) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Value>> + Send + 'static,
     {
-        self.server = Arc::new(f);
+        self.server = Arc::new(move |sc| Box::pin(f(sc)));
         self
     }
 }

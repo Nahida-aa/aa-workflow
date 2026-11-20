@@ -1184,10 +1184,10 @@ mod tests {
         let ran_mw = ran.clone();
 
         let wf = create_workflow(CreateWorkflowConfig::new("mw-interceptor").input::<Value>())
-            .middleware([Middleware::new().server(move |mut sc: MiddlewareServerFnArgs| {
+            .middleware([Middleware::new().server(move |mut sc: MiddlewareServerFnArgs| async move {
                 // 用 tower 的 Layer：对 "b" 短路、对 "c" 泊车。
                 sc.wrap_step(TestPolicyLayer);
-                Box::pin(async move { sc.next(None).await })
+                sc.next(None).await
             })])
             .handler({
                 let ran = ran_mw.clone();
