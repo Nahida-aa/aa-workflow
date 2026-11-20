@@ -14,12 +14,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::define::{RetryPolicy, StepCtx, StepOptions};
 #[cfg(test)]
 use crate::define::AnyWorkflowDefinition;
-use crate::error::{RunError, WorkflowError};
+use crate::error::{RunError, StoreError, WorkflowError};
 use crate::event::{RunStatus, StepAttempt, WorkflowEvent};
 use crate::resource::Gate;
-use crate::run_store::{
-    DeliverApprovalArgs, DeliverSignalArgs, DeliveryOutcome, RunStore, SignalDelivery,
-};
+use crate::run_store::{DeliveryOutcome, RunStore, SignalDelivery};
 
 mod run_workflow;
 pub mod state_diff;
@@ -1522,36 +1520,84 @@ fn project_run_wait(store: &Arc<dyn RunStore>, run_id: &str, kind: WaitKind) {
     }
 }
 
-/// 投递一个信号——对应上游 `deliverSignal`（`workflow-runtime/src/types.ts:340`）。
+/// 投递一个信号：定位泊车点 → 去重 → 把 `SignalResolved` 追加进日志。
 ///
-/// 一个函数覆盖两种定位方式（上游同样只有一个 `deliverSignal`）：
+/// **本仓独有，不是上游 API**。上游的 `deliverSignal` 在 `workflow-runtime` 的
+/// `WorkflowExecutionStore` 上（`types.ts:340`），`workflow-core` 的 `RunStore`
+/// 只有 `appendEvent` / `getEvents`——core 根本不知道「信号」为何物。
+///
+/// 本仓之所以需要它：engine 的重放短路靠扫日志找 `SignalResolved`
+/// （[`find_resume`]），所以**信号必须在 drive 之前就落进日志**；上游则把这个
+/// 动作放在 store 的 `deliverSignal` 内部（它改 run 状态，事件由引擎 drive 时写）。
+///
+/// 一个函数覆盖上游那种定位方式的两种取值：
 ///
 /// | [`SignalDelivery::step_id`] | 行为 |
 /// | --- | --- |
-/// | `Some(id)` | 投给该 step；`name` 由 store 从日志取，调用方不必知道 |
+/// | `Some(id)` | 投给该 step；`name` 从日志取，调用方不必知道 |
 /// | `None` | 投给当前泊在 `name` 这个信号上的 step |
 ///
-/// **返回四态而非 `Err`**：「没人在等」是正常结果（[`DeliveryOutcome::NotWaiting`]），
-/// 不是异常。只有 store 本身出错（IO / 冲突）才是 `Err`。
-///
-/// 时间戳取调用时刻（上游 `args.now ?? Date.now()` 的默认分支）；需要注入
-/// 固定时间的场景（重放测试）直接调 [`RunStore::deliver_signal`] 并显式给 `now`。
+/// **返回四态而非 `Err`**：「没人在等」是正常结果
+/// （[`DeliveryOutcome::NotWaiting`]），不是异常。只有 store 本身出错
+/// （IO / 冲突）才是 `Err`。
 pub fn deliver_signal(
     store: &dyn RunStore,
     run_id: &str,
     delivery: SignalDelivery,
 ) -> Result<DeliveryOutcome, WorkflowError> {
-    Ok(store.deliver_signal(DeliverSignalArgs {
+    let events = store.get_events(run_id)?;
+    // run 不存在 = 从没有过事件（store 不区分「空日志」与「无此 run」）。
+    // NotFound 与 NotWaiting 分开报，调用方才能区分「打错 run_id」与「投早了」。
+    if events.is_empty() && store.get_run_state(run_id)?.is_none() {
+        return Ok(DeliveryOutcome::NotFound);
+    }
+
+    // 幂等：同一 signal_id 已投递过就不重复写。
+    if let Some(sid) = &delivery.signal_id
+        && events.iter().any(|ev| {
+            matches!(ev, WorkflowEvent::SignalResolved { signal_id: Some(x), .. } if x == sid)
+        })
+    {
+        return Ok(DeliveryOutcome::Duplicate);
+    }
+
+    // 定位目标 step：显式给了 step_id 就按它，否则按等待的 name 找。
+    let target = match &delivery.step_id {
+        Some(step_id) => events.iter().rev().find_map(|ev| match ev {
+            WorkflowEvent::SignalAwaited { step_id: id, name, .. } if id == step_id => {
+                Some((id.clone(), name.clone()))
+            }
+            _ => None,
+        }),
+        None => events.iter().rev().find_map(|ev| match ev {
+            WorkflowEvent::SignalAwaited { step_id, name: n, .. } if n == &delivery.name => {
+                Some((step_id.clone(), n.clone()))
+            }
+            _ => None,
+        }),
+    };
+    let Some((step_id, name)) = target else {
+        return Ok(DeliveryOutcome::NotWaiting);
+    };
+
+    let ev = WorkflowEvent::SignalResolved {
+        ts: now_ms(),
         run_id: run_id.to_string(),
-        delivery,
-        now: now_ms(),
-    })?)
+        step_id,
+        name,
+        signal_id: delivery.signal_id,
+        payload: delivery.payload,
+        meta: delivery.meta,
+    };
+    append_with_cas(store, run_id, ev)?;
+    Ok(DeliveryOutcome::Delivered)
 }
 
-/// 投递一个审批决定——对应上游 `deliverApproval`。
+/// 投递一个审批决定。
 ///
-/// 返回四态，理由同 [`deliver_signal`]。审批是**结构化决定**（`approved` + `feedback`），
-/// 没有 payload——事件形状逐字对齐上游 `APPROVAL_RESOLVED`。
+/// 同 [`deliver_signal`]：本仓独有（上游在 runtime 层的 `deliverApproval`）。
+/// 审批是**结构化决定**（`approved` + `feedback`），没有 payload——事件形状
+/// 逐字对齐上游 `APPROVAL_RESOLVED`。
 pub fn deliver_approval(
     store: &dyn RunStore,
     run_id: &str,
@@ -1559,17 +1605,53 @@ pub fn deliver_approval(
     approved: bool,
     feedback: Option<&str>,
 ) -> Result<DeliveryOutcome, WorkflowError> {
-    Ok(store.deliver_approval(DeliverApprovalArgs {
+    let events = store.get_events(run_id)?;
+    if events.is_empty() && store.get_run_state(run_id)?.is_none() {
+        return Ok(DeliveryOutcome::NotFound);
+    }
+    let parked = events.iter().rev().any(|ev| {
+        matches!(
+            ev,
+            WorkflowEvent::ApprovalRequested { approval_id: id, .. } if id == approval_id
+        )
+    });
+    if !parked {
+        return Ok(DeliveryOutcome::NotWaiting);
+    }
+    let ev = WorkflowEvent::ApprovalResolved {
+        ts: now_ms(),
         run_id: run_id.to_string(),
+        step_id: approval_id.to_string(),
         approval_id: approval_id.to_string(),
         approved,
         feedback: feedback.map(str::to_string),
-        now: now_ms(),
-    })?)
+        meta: None,
+    };
+    append_with_cas(store, run_id, ev)?;
+    Ok(DeliveryOutcome::Delivered)
+}
+
+/// 追加一条事件，索引冲突时重定基重试。
+///
+/// 这是 [`emit_and_append`] 去掉 `emit` 的版本：runtime 层没有 `EngineRuntime`
+/// （拿不到那个扇出通道），它只需要「把事件写进日志」——事件本身由
+/// [`run_workflow`] 之后的 drive 从日志读出来再广播。
+fn append_with_cas(
+    store: &dyn RunStore,
+    run_id: &str,
+    event: WorkflowEvent,
+) -> Result<(), StoreError> {
+    loop {
+        let n = store.get_events(run_id)?.len();
+        match store.append_event(run_id, n, &event) {
+            Ok(()) => return Ok(()),
+            Err(StoreError::Conflict { .. }) => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 
-/// 测试脚手架，供 engine 各子模块（`mod` / `run_workflow`）的测试共享。
 #[cfg(test)]
 pub(crate) mod testkit {
     /// 记录 step 的起止与并发峰值，用来断言执行次数与拓扑。

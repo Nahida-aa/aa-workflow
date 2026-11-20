@@ -86,10 +86,7 @@
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, Receiver};
 
-use aa_workflow_core::{
-    DeliverApprovalArgs, DeliverSignalArgs, DeliveryOutcome, DeleteReason, RunState, RunStore,
-    StoreError, WorkflowEvent,
-};
+use aa_workflow_core::{DeleteReason, RunState, RunStore, StoreError, WorkflowEvent};
 
 use crate::types::{AppendEventsArgs, AppendEventsResult, LoadedExecution, ReadEventsArgs, SaveRunStateArgs, StoredWorkflowEvent, WorkflowExecution};
 
@@ -494,104 +491,6 @@ impl RunStore for RunStoreAdapter {
     }
 
     /// 往日志里追加 `SignalResolved`（对齐 core 上游 `deliverSignal`）。
-    ///
-    /// **不转发到底层的 `deliver_signal`**：那个方法改的是
-    /// `WorkflowExecution` 投影（`status = Queued`、清 `waiting_for`），**不写事件日志**。
-    /// 两层分工：
-    ///
-    /// | 层 | 职责 |
-    /// | --- | --- |
-    /// | `WorkflowExecutionStore::deliver_signal` | 四态判定 + 改 run 状态 |
-    /// | 本方法 | 写 `SignalResolved` 事件 |
-    ///
-    /// runtime 的投递路径两个都调（`runtime_driver.rs` 先 `store.deliver_signal`
-    /// 再 `core::deliver_signal`）。若这里去转发底层同名方法，会导致
-    /// 幂等判定被消耗两次、且**事件永远不落盘**。
-    fn deliver_signal(&self, args: DeliverSignalArgs) -> Result<DeliveryOutcome, StoreError> {
-        let events = self
-            .inner
-            .read_events(ReadEventsArgs {
-                run_id: args.run_id.clone(),
-                from_index: None,
-            })
-            .map_err(to_store_error)?;
-
-        // 定位目标：显式给了 step_id 就按它，否则按等待的 name 找。
-        let target = match &args.delivery.step_id {
-            Some(step_id) => events.iter().rev().find_map(|e| match &e.event {
-                WorkflowEvent::SignalAwaited { step_id: id, name, .. } if id == step_id => {
-                    Some((id.clone(), name.clone()))
-                }
-                _ => None,
-            }),
-            None => events.iter().rev().find_map(|e| match &e.event {
-                WorkflowEvent::SignalAwaited { step_id, name, .. }
-                    if name == &args.delivery.name =>
-                {
-                    Some((step_id.clone(), name.clone()))
-                }
-                _ => None,
-            }),
-        };
-        let Some((step_id, name)) = target else {
-            return Ok(DeliveryOutcome::NotWaiting);
-        };
-
-        let next = events.last().map_or(0, |e| e.event_index.saturating_add(1));
-        self.inner
-            .append_events(AppendEventsArgs {
-                run_id: args.run_id.clone(),
-                expected_next_index: next,
-                events: vec![WorkflowEvent::SignalResolved {
-                    ts: args.now,
-                    run_id: args.run_id.clone(),
-                    step_id,
-                    name,
-                    signal_id: args.delivery.signal_id.clone(),
-                    payload: args.delivery.payload.clone(),
-                    meta: args.delivery.meta.clone(),
-                }],
-            })
-            .map_err(to_store_error)?;
-        Ok(DeliveryOutcome::Delivered)
-    }
-
-    fn deliver_approval(
-        &self,
-        args: DeliverApprovalArgs,
-    ) -> Result<DeliveryOutcome, StoreError> {
-        let events = self
-            .inner
-            .read_events(ReadEventsArgs {
-                run_id: args.run_id.clone(),
-                from_index: None,
-            })
-            .map_err(to_store_error)?;
-        let parked = events.iter().rev().any(|e| matches!(&e.event,
-            WorkflowEvent::ApprovalRequested { approval_id: id, .. } if id == &args.approval_id
-        ));
-        if !parked {
-            return Ok(DeliveryOutcome::NotWaiting);
-        }
-        let next = events.last().map_or(0, |e| e.event_index.saturating_add(1));
-        self.inner
-            .append_events(AppendEventsArgs {
-                run_id: args.run_id.clone(),
-                expected_next_index: next,
-                events: vec![WorkflowEvent::ApprovalResolved {
-                    ts: args.now,
-                    run_id: args.run_id.clone(),
-                    step_id: args.approval_id.clone(),
-                    approval_id: args.approval_id.clone(),
-                    approved: args.approved,
-                    feedback: args.feedback.clone(),
-                    meta: None,
-                }],
-            })
-            .map_err(to_store_error)?;
-        Ok(DeliveryOutcome::Delivered)
-    }
-
     fn subscribe(&self, run_id: &str) -> Option<Receiver<WorkflowEvent>> {
         // 底层 `subscribe_events` 是回调式（`Box<dyn Fn>`）+ 返回退订句柄，core
         // 要的是 `mpsc::Receiver`。用一条转发链弥合：

@@ -376,29 +376,6 @@ pub trait RunStore: Send + Sync {
         Ok(None)
     }
 
-    /// 投递一个信号（对齐上游 `WorkflowExecutionStore.deliverSignal`。`workflow-runtime/src/types.ts:340`）。
-    ///
-    /// **必须在实现内部原子完成三件事**：用 `signal_id` 去重、确认 run确实泊在
-    /// 这个信号上、追加 `SignalResolved`。三步放在一次调用里才能保证
-    /// 「查到泊车」与「追加」之间没有竞态窗口。
-    ///
-    /// 为什么不能像旧版 [`deliver_signal`](crate::engine::deliver_signal) 那样在自由函数里
-    /// `get_events` + `append_event`：那是两次独立调用，中间可能被别的写入插进去。
-    ///
-    /// 默认实现返回 [`DeliveryOutcome::NotFound`]（对应上游的可选 `?`）——不支持投递的 store
-    /// 不需改代码，函数上层会回落到旧行为。
-    fn deliver_signal(&self, _args: DeliverSignalArgs) -> Result<DeliveryOutcome, StoreError> {
-        Ok(DeliveryOutcome::NotFound)
-    }
-
-    /// 投递一个审批结果（对齐 `deliverApproval`）。原子性要求同
-    /// [`deliver_signal`](Self::deliver_signal)。
-    fn deliver_approval(
-        &self,
-        _args: DeliverApprovalArgs,
-    ) -> Result<DeliveryOutcome, StoreError> {
-        Ok(DeliveryOutcome::NotFound)
-    }
 }
 
 #[cfg(test)]
