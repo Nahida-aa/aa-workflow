@@ -47,35 +47,31 @@ pub struct PendingApproval {
 
 /// 一次信号投递的载荷（对齐 TanStack `SignalDelivery`，`workflow-runtime/src/types.ts:148`）。
 ///
-/// 由调用方构造，交给 [`RunStore::deliver_signal`]。`step_id` 为 `None` 时由 storeに按等待的 `name` 定位。
+/// 作为 [`RunWorkflowOptions::signal_delivery`](crate::engine::RunWorkflowOptions::signal_delivery)
+/// 传给 `run_workflow`——**不是**独立写日志的入口。引擎在 drive 开头用它定位
+/// 等待点、去重、追加 `SignalResolved`（上游 `appendSeed`，`run-workflow.ts:1755`）。
+///
+/// `step_id` 为 `None` 时按 `name` 找当前泊车的 step。
 #[derive(Debug, Clone)]
 pub struct SignalDelivery {
-    /// 幂等令牌：同一个 `signal_id` 重复投递应当是 `duplicate` 而非新建事件。
+    /// 幂等令牌：同一个 `signal_id` 重复投递不重复写事件。
     pub signal_id: Option<String>,
-    /// 指定的 step（`ctx.wait_for_event` 的暂停键）；`None` = 按 `name` 找当前泊车的 step。
+    /// 指定的 step（`ctx.wait_for_event` 的暂停键）；`None` = 按 `name` 找。
     pub step_id: Option<String>,
     pub name: String,
     pub payload: serde_json::Value,
     pub meta: Option<serde_json::Value>,
 }
 
-/// [`RunStore::deliver_signal`] 的参数（对齐 `DeliverSignalArgs`，同文件 `:164`）。
+/// 一次审批决定（对齐上游 `ApprovalResult`，`workflow-core/src/types.ts:312`）。
+///
+/// 同 [`SignalDelivery`]：作为 [`RunWorkflowOptions::approval`](crate::engine::RunWorkflowOptions::approval)
+/// 随 drive 一起投递。审批是**结构化决定**，没有 payload。
 #[derive(Debug, Clone)]
-pub struct DeliverSignalArgs {
-    pub run_id: String,
-    pub delivery: SignalDelivery,
-    /// 写入事件的时间戳（幂等重试时应保持不变）。
-    pub now: i64,
-}
-
-/// [`RunStore::deliver_approval`] 的参数（对齐 `DeliverApprovalArgs`）。
-#[derive(Debug, Clone)]
-pub struct DeliverApprovalArgs {
-    pub run_id: String,
+pub struct ApprovalDecision {
     pub approval_id: String,
     pub approved: bool,
     pub feedback: Option<String>,
-    pub now: i64,
 }
 
 /// 投递结果（对齐 `DeliverSignalResult` / `DeliverApprovalResult`）。

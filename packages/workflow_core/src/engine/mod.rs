@@ -1636,7 +1636,7 @@ pub fn deliver_approval(
 /// 这是 [`emit_and_append`] 去掉 `emit` 的版本：runtime 层没有 `EngineRuntime`
 /// （拿不到那个扇出通道），它只需要「把事件写进日志」——事件本身由
 /// [`run_workflow`] 之后的 drive 从日志读出来再广播。
-fn append_with_cas(
+pub(crate) fn append_with_cas(
     store: &dyn RunStore,
     run_id: &str,
     event: WorkflowEvent,
@@ -2916,6 +2916,92 @@ mod tests {
         );
     }
 
+
+    /// 一步投递：`signal_delivery` 随 drive 一起给（上游 `signalDelivery`）。
+    ///
+    /// 与上面那条两步写法（先 `deliver_signal` 再 `run_workflow`）对照：
+    /// 这里引擎在 `drive` 开头自己定位等待点、去重、落 `SignalResolved`，
+    /// 调用方不需要知道「先写日志」这回事。
+    #[tokio::test]
+    async fn signal_delivery_option_resumes_in_one_step() {
+        let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
+        let wf = WorkflowDefinition::new("one-step").handler(|ctx: WorkflowCtx| async move {
+            ctx.wait_for_event("gate", "approved").await
+        });
+        // Drive #1：挂起。
+        let out = run_workflow(
+            RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
+                .input(serde_json::json!({}))
+                .run_id("os1"),
+        )
+        .outcome()
+        .await
+        .unwrap();
+        assert_eq!(out.status, RunStatus::Paused);
+
+        // Drive #2：载荷随 drive 给，一步完成。
+        let out = run_workflow(
+            RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
+                .input(serde_json::json!({}))
+                .run_id("os1")
+                .signal_delivery(SignalDelivery {
+                    signal_id: Some("sig-1".into()),
+                    step_id: None,
+                    name: "approved".into(),
+                    payload: serde_json::json!({ "by": "alice" }),
+                    meta: None,
+                }),
+        )
+        .outcome()
+        .await
+        .unwrap();
+        assert_eq!(out.status, RunStatus::Finished);
+        assert_eq!(out.output, Some(serde_json::json!({ "by": "alice" })));
+
+        // 事件只落一条（重放不重复 append）。
+        let n = store
+            .get_events("os1")
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, WorkflowEvent::SignalResolved { .. }))
+            .count();
+        assert_eq!(n, 1, "一次投递只落一条 SignalResolved");
+    }
+
+    /// `signal_delivery` 投给一个没在等的 run → `RunErrored`，不是静默 Paused。
+    #[tokio::test]
+    async fn signal_delivery_to_a_non_waiting_run_errors() {
+        let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
+        let wf = WorkflowDefinition::new("nw").handler(|ctx: WorkflowCtx| async move {
+            ctx.wait_for_event("gate", "approved").await
+        });
+        run_workflow(
+            RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
+                .input(serde_json::json!({}))
+                .run_id("nw1"),
+        )
+        .outcome()
+        .await
+        .unwrap();
+
+        // run 在等 `approved`，这里投 `wrong-name`。
+        let out = run_workflow(
+            RunWorkflowOptions::new(Arc::new(wf), store.clone())
+                .input(serde_json::json!({}))
+                .run_id("nw1")
+                .signal_delivery(SignalDelivery {
+                    signal_id: None,
+                    step_id: None,
+                    name: "wrong-name".into(),
+                    payload: serde_json::Value::Null,
+                    meta: None,
+                }),
+        )
+        .outcome()
+        .await
+        .unwrap();
+        assert_eq!(out.status, RunStatus::Errored, "投错名字应报错而非静默挂起");
+    }
     #[tokio::test]
     async fn wait_for_event_resolves_from_log_on_replay() {
         let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());

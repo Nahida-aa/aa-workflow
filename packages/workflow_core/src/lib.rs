@@ -67,6 +67,6 @@ pub use middleware::{
 };
 pub use resource::{Gate, GateGuard, ResourceKey};
 pub use run_store::{
-    DeliverApprovalArgs, DeliverSignalArgs, DeliveryOutcome, DeleteReason, InMemoryStore,
-    PendingApproval, RunAwaitable, RunState, RunStore, SignalDelivery, WaitForState,
+    ApprovalDecision, DeliveryOutcome, DeleteReason, InMemoryStore, PendingApproval, RunAwaitable,
+    RunState, RunStore, SignalDelivery, WaitForState,
 };

@@ -14,7 +14,10 @@ use crate::engine::{DEFAULT_MIN_YIELD_REMAINING_MS, EngineRuntime, WorkflowCance
 use crate::error::{RunError, RunErrorCode, WorkflowError};
 use crate::event::{RunStatus, WorkflowEvent};
 use crate::resource::Gate;
-use crate::run_store::{RunState, RunStore};
+use crate::run_store::{
+    ApprovalDecision, DeliveryOutcome, PendingApproval, RunState, RunStore, SignalDelivery,
+    WaitForState,
+};
 
 /// 事件回调的**已擦除**类型：返回 future 而非直接调用，所以宿主可以给异步实现。
 /// 参数与上游 `publish?: (runId, event) => void | Promise<void>`
@@ -149,6 +152,22 @@ where
     /// 只写进 `RUN_STARTED` 事件，**不落 store**、不参与 resume 判定。上游
     /// 把它当纯客户端关联（"Thread ID for client-side correlation"）。
     pub thread_id: Option<String>,
+
+    /// **随本次 drive 一起投递的信号**（上游 `RunWorkflowOptions.signalDelivery`，
+    /// `run-workflow.ts:50`）。
+    ///
+    /// 为什么要放进 options 而不是单独写日志：`SIGNAL_RESOLVED` 该落在哪个
+    /// `SIGNAL_AWAITED` 后面、要不要复用已有的一条、`signal_id` 是否重复——
+    /// 这些判定属于引擎（只有它知道日志里等待点的配对规则）。暴露成独立函数
+    /// 就是把内部逻辑泄露给调用方，还得让调用方自己保证「先写日志再 drive」
+    /// 的顺序。
+    ///
+    /// 设置后 `drive` 的开头会先跑 `append_seed`：定位等待点、去重、追加
+    /// `SignalResolved`，然后照常重放 handler。
+    pub signal_delivery: Option<crate::run_store::SignalDelivery>,
+    /// **随本次 drive 一起投递的审批决定**（上游 `approval`，
+    /// `run-workflow.ts:51`）。语义同 [`Self::signal_delivery`]。
+    pub approval: Option<crate::run_store::ApprovalDecision>,
     /// 每个事件都会回调（上游 `publish`）——host 可以接到 Redis / Durable Streams
     /// 之类的扇出通道，让别的节点能 tail 这个 run。
     ///
@@ -231,6 +250,8 @@ where
             min_yield_remaining_ms: self.min_yield_remaining_ms,
             yield_resume_at: self.yield_resume_at,
             thread_id: self.thread_id.clone(),
+            signal_delivery: self.signal_delivery.clone(),
+            approval: self.approval.clone(),
             publish: self.publish.clone(),
         }
     }
@@ -259,6 +280,8 @@ where
             min_yield_remaining_ms: None,
             yield_resume_at: None,
             thread_id: None,
+            signal_delivery: None,
+            approval: None,
             publish: None,
         }
     }
@@ -294,6 +317,22 @@ where
     /// 复用该 run_id ⇒ resume。
     pub fn run_id(mut self, v: impl Into<String>) -> Self {
         self.run_id = Some(v.into());
+        self
+    }
+
+    /// 随本次 drive 投递一个信号（上游 `signalDelivery`）。
+    ///
+    /// `deliver_signal` 是「先写日志、之后某次 drive 才看到」的两步写法；
+    /// 这里是**一步**：drive 开头定位等待点、去重、追加 `SignalResolved`，
+    /// 然后照常重放。上游只有这一种写法（`appendSeed` 在 `runWorkflow` 内部）。
+    pub fn signal_delivery(mut self, v: crate::run_store::SignalDelivery) -> Self {
+        self.signal_delivery = Some(v);
+        self
+    }
+
+    /// 随本次 drive 投递一个审批决定（上游 `approval`）。
+    pub fn approval(mut self, v: crate::run_store::ApprovalDecision) -> Self {
+        self.approval = Some(v);
         self
     }
 
@@ -475,6 +514,8 @@ where
         min_yield_remaining_ms: opts.min_yield_remaining_ms,
         yield_resume_at: opts.yield_resume_at,
         thread_id: opts.thread_id.clone(),
+        signal_delivery: opts.signal_delivery.clone(),
+        approval: opts.approval.clone(),
         publish: opts.publish.clone(),
     };
     let _ = &mut opts;
@@ -708,6 +749,100 @@ impl futures_core::Stream for RunEventStream {
     }
 }
 
+/// 把本次 drive 随行投递的信号 / 审批落成事件（上游 appendSeed，
+/// run-workflow.ts:1755）。
+///
+/// 放在 drive 开头、**重放 handler 之前**：ctx.wait_for_event 的重放短路是
+/// 「扫日志找 SignalResolved」，事件必须先落盘，重放才看得到。
+///
+/// `waiting` / `pending` 是**清除前**的 run 状态快照——判「是不是真的在等」
+/// 只能看它；日志里出现过 SIGNAL_AWAITED 不代表当前还在等（可能已经投过）。
+fn append_seed(
+    store: &dyn RunStore,
+    run_id: &str,
+    waiting: Option<&WaitForState>,
+    pending: Option<&PendingApproval>,
+    signal_delivery: Option<&SignalDelivery>,
+    approval: Option<&ApprovalDecision>,
+) -> Result<DeliveryOutcome, WorkflowError> {
+    let events = store.get_events(run_id)?;
+
+    if let Some(d) = signal_delivery {
+        let waiting_ok = waiting.is_some_and(|w| {
+            w.signal_name == d.name
+                && d.step_id
+                    .as_ref()
+                    .is_none_or(|sid| w.step_id.as_deref() == Some(sid.as_str()))
+        });
+        if !waiting_ok {
+            return Ok(DeliveryOutcome::NotWaiting);
+        }
+        // 幂等：同一 signal_id 已投递过就不重复写。
+        if let Some(sid) = &d.signal_id
+            && events.iter().any(|ev| {
+                matches!(ev, WorkflowEvent::SignalResolved { signal_id: Some(x), .. } if x == sid)
+            })
+        {
+            return Ok(DeliveryOutcome::Duplicate);
+        }
+        // 定位等待点：显式给了 step_id 就按它，否则按 name 找最近一条。
+        let target = match &d.step_id {
+            Some(step_id) => events.iter().rev().find_map(|ev| match ev {
+                WorkflowEvent::SignalAwaited { step_id: id, name, .. } if id == step_id => {
+                    Some((id.clone(), name.clone()))
+                }
+                _ => None,
+            }),
+            None => events.iter().rev().find_map(|ev| match ev {
+                WorkflowEvent::SignalAwaited { step_id, name: n, .. } if n == &d.name => {
+                    Some((step_id.clone(), n.clone()))
+                }
+                _ => None,
+            }),
+        };
+        let Some((step_id, name)) = target else {
+            return Ok(DeliveryOutcome::NotWaiting);
+        };
+        crate::engine::append_with_cas(
+            store,
+            run_id,
+            WorkflowEvent::SignalResolved {
+                ts: now_ms(),
+                run_id: run_id.to_string(),
+                step_id,
+                name,
+                signal_id: d.signal_id.clone(),
+                payload: d.payload.clone(),
+                meta: d.meta.clone(),
+            },
+        )?;
+        return Ok(DeliveryOutcome::Delivered);
+    }
+
+    if let Some(a) = approval {
+        let waiting_ok = pending.is_some_and(|p| p.approval_id == a.approval_id);
+        if !waiting_ok {
+            return Ok(DeliveryOutcome::NotWaiting);
+        }
+        crate::engine::append_with_cas(
+            store,
+            run_id,
+            WorkflowEvent::ApprovalResolved {
+                ts: now_ms(),
+                run_id: run_id.to_string(),
+                step_id: a.approval_id.clone(),
+                approval_id: a.approval_id.clone(),
+                approved: a.approved,
+                feedback: a.feedback.clone(),
+                meta: None,
+            },
+        )?;
+        return Ok(DeliveryOutcome::Delivered);
+    }
+
+    Ok(DeliveryOutcome::NotWaiting)
+}
+
 /// run_workflow 的内部驱动：**只吐事件，不返回错误**。
 ///
 /// 每条失败路径都 `Err(RunErrored{..})` 出去，由 [`run_workflow`] 转成事件投递。
@@ -757,6 +892,12 @@ async fn drive(
         });
     }
 
+    // append_seed 要判「run 现在是不是真的在等这个信号/审批」——那是清除前的
+    // 事实，所以先快照（下面的 run_state 会把这两个投影清空）。
+    let waiting_before: Option<WaitForState> = persisted.as_ref().and_then(|st| st.waiting_for.clone());
+    let pending_before: Option<PendingApproval> =
+        persisted.as_ref().and_then(|st| st.pending_approval.clone());
+
     let run_state = match persisted {
         Some(mut st) => {
             st.status = RunStatus::Running;
@@ -787,6 +928,50 @@ async fn drive(
     };
     if let Err(e) = store.set_run_state(&run_id, &run_state) {
         return Err(err_event(&run_id, e, RunErrorCode::Error));
+    }
+
+    // 随本次 drive 投递的信号 / 审批（上游 appendSeed，run-workflow.ts:409）。
+    // 必须在重放 handler 之前：waitForEvent 的重放短路靠扫日志找 SignalResolved。
+    // 「没人在等」在这里变成 RunErrored——与其它引擎失败同一条通道，
+    // 而不是静默什么都不做（那样调用方会看到 run 停在 Paused 却不知道为什么）。
+    if opts.signal_delivery.is_some() || opts.approval.is_some() {
+        match append_seed(
+            store.as_ref(),
+            &run_id,
+            waiting_before.as_ref(),
+            pending_before.as_ref(),
+            opts.signal_delivery.as_ref(),
+            opts.approval.as_ref(),
+        ) {
+            Ok(DeliveryOutcome::Delivered | DeliveryOutcome::Duplicate) => {}
+            Ok(DeliveryOutcome::NotWaiting) => {
+                let what = match (&opts.signal_delivery, &opts.approval) {
+                    (Some(d), _) => format!("signal `{}`", d.name),
+                    (_, Some(a)) => format!("approval `{}`", a.approval_id),
+                    _ => unreachable!("上面已判二者至少有一个"),
+                };
+                // 走 error_persisted：它会把 RunState 置为 Errored 再回事件。
+                // 直接构造 RunErrored 只会 emit，state 仍停在 Running——调用方
+                // 从 store 读到的状态与事件流对不上。
+                return Err(error_persisted(
+                    &store,
+                    run_state,
+                    &run_id,
+                    &anyhow::anyhow!("run `{run_id}` is not waiting for {what} (delivery lost)"),
+                    RunErrorCode::Error,
+                ));
+            }
+            Ok(DeliveryOutcome::NotFound) => {
+                return Err(error_persisted(
+                    &store,
+                    run_state,
+                    &run_id,
+                    &anyhow::anyhow!("run `{run_id}` does not exist"),
+                    RunErrorCode::Error,
+                ));
+            }
+            Err(e) => return Err(err_event(&run_id, e, RunErrorCode::Error)),
+        }
     }
 
     // Version routing: resume against the definition whose `version` the run
