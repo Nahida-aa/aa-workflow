@@ -10,7 +10,7 @@ use aa_workflow_core::{
     RunWorkflowOptions, WorkflowCtx,
 };
 use aa_workflow_middlewares::{
-    DagPlan, DagPlanKey, DagShape, DagSpec, INTERIM_GOAL_SIGNAL, dag_policies, dag_scheduler,
+    DagPlan, DagPlanKey, DagShape, DagSpec, INTERIM_GOAL_SIGNAL, dag_policies, dag_to_handler,
     define_dag,
 };
 use serde_json::json;
@@ -46,7 +46,7 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
     let exec: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
     // **一个 definition 跑多次 run**——plan 走 meta，中间件不含它。
-    // 调度按图自动进行：handler 只是空壳（dag 中间件 take_over 后不会执行）。
+    // 调度按图自动进行：dag_to_handler 生成 handler 函数体，用户不写 handler。
     // 常规流式写法：每个节点直接把闭包写进 .node()，无需 recording_node 之类的工厂。
     // 闭包是 `Fn`（重试会多次调用），所以 exec 在闭包体内 clone 一份交给 async move。
     let spec = define_dag(
@@ -105,9 +105,9 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
     .unwrap();
     let wf = Arc::new(
         create_workflow(CreateWorkflowConfig::new("dag-pol").input::<serde_json::Value>())
-            // dag 必须最后（最内层）：策略的 wrap_step 要先注册。
-            .middleware([dag_policies(shape(), loader(store.clone())), dag_scheduler(spec)])
-            .handler(|_ctx: WorkflowCtx| async move { Ok(serde_json::json!(null)) }),
+            // handler 天然最内层：策略的 wrap_step 先注册，顺序约束自动满足。
+            .middleware([dag_policies(shape(), loader(store.clone()))])
+            .handler(dag_to_handler(spec)),
     );
 
     // r1：不给 plan → 全跑

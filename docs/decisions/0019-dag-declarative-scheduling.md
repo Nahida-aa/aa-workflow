@@ -1,6 +1,6 @@
-# 0019 — DAG 声明式调度：`dag_scheduler(spec)` / `dag_to_handler(spec)`
+# 0019 — DAG 声明式调度：`dag_to_handler(spec)` 自动生成 handler 函数体
 
-**状态**：已接受（2026-11-21）
+**状态**：已接受（2026-11-21；2026-11-21 订正：去掉接管式中间件，统一为 handler 工厂）
 **关联**：[0006](0006-dag-dual-drive-and-middleware.md)、
 [0007](0007-middleware-compose-order.md)、[0016](0016-step-onion.md)、
 `feature-requirements.md` F7、
@@ -21,10 +21,12 @@
 
 ## 决策
 
-在 `aa_workflow_dag` 加声明与调度核心，在 `aa_workflow_middlewares` 加接管式
-中间件，两者共用同一个 `run_dag` 调度器：
+把声明与调度核心放进 `aa_workflow_middlewares::dag::core`（从 `aa_workflow_dag`
+复制而来，那个包暂留待删），对外只暴露一个入口：`dag_to_handler(spec)` 生成
+handler 函数体，用户挂到 `.handler(dag_to_handler(spec))`：
 
 ```rust
+// dag::core::declare
 pub type DagRunFn = Arc<
     dyn Fn(BTreeMap<String, Value>, Value) -> BoxFuture<'static, Result<Value>>
         + Send + Sync,
@@ -32,15 +34,30 @@ pub type DagRunFn = Arc<
 pub struct DagNode { pub deps: Vec<String>, pub run: DagRunFn }
 pub struct DagSpec { pub id: String, pub nodes: BTreeMap<String, DagNode> }
 
-// 调度核心：每个节点一个任务，依赖全 resolve 后立即执行；memo 去重。
+// dag::core::scheduler
 async fn run_dag(ctx: &WorkflowCtx, spec: &DagSpec) -> Result<BTreeMap<String, Value>>;
-
-// ① 中间件：接管 handler（Rust 一等能力）
-pub fn dag_scheduler(spec: Arc<DagSpec>) -> Middleware;   // server 里 take_over()
-
-// ② 工厂：用户自己控制 id/input/meta 元数据
 pub fn dag_to_handler(spec: Arc<DagSpec>) -> /* impl Fn(WorkflowCtx) -> BoxFuture */;
 ```
+
+```rust
+create_workflow(config)
+    .middleware([dag_policies(shape, get_events)])  // 策略照旧挂
+    .handler(dag_to_handler(spec));                  // 调度：handler 天然最内层
+```
+
+**为什么不保留接管式中间件**：曾做过 `dag_scheduler(spec)` 中间件（`take_over()`
+接管 handler），实测证明它与 handler 工厂语义等价但更差——
+
+- `take_over()` 是冗余的：推进到内层的唯一入口是 `sc.next()`，不调它 handler
+  自然不执行；去掉 `take_over()` 后 `does_not_run_user_handler` 测试照样通过。
+  所谓「Rust 可接管 handler、TS 不行」在本场景没有意义。
+- 中间件方案要求用户写空壳 handler，且 `dag_scheduler` 必须排在策略之后
+  （[0007](0007-middleware-compose-order.md) 的组合顺序约束），写反了复用静默失效。
+- handler 方案里 handler 天然最内层，顺序约束自动满足，更短也更不易错。
+
+删掉中间件后，「Rust 用 `take_over` 接管 vs TS 经 `ctx.dagResults` 转手」的
+机制差异不再有实际使用者；两侧统一为 handler 工厂（TS `dagToHandler` ↔ Rust
+`dag_to_handler`），反而消除了一个分歧点。
 
 - **调度语义**对齐 TS 参考：每个节点对应一个 future，内部等自己的依赖
   `ensure(dep)` 全部完成，再调 `ctx.step(id, ..)`；依赖结果按 id 装进 `deps`
@@ -50,8 +67,8 @@ pub fn dag_to_handler(spec: Arc<DagSpec>) -> /* impl Fn(WorkflowCtx) -> BoxFutur
   `{ "results": { 节点 id → 结果 } }`，与 `dagToHandler` 的 `{ results }` 同形。
 - **声明期校验**由 `define_dag` 调 `DagShape::build` 完成：重复节点 / 未知依赖 /
   环全部在构建时报错；`__dag*` 前缀的节点 id 保留。
-- **组合顺序**：`dag_scheduler(spec)` 必须是 `.middleware([...policies, dag_scheduler(spec)])` 的
-  最后一个——委托 [0007](0007-middleware-compose-order.md)，库不自动重排。
+- **组合顺序**：用 `dag_to_handler` 时 handler 天然最内层，[0007](0007-middleware-compose-order.md)
+  的顺序约束自动满足——策略中间件照常挂 `.middleware([...])`，无需担心调度器排在哪。
 
 ## 被否决的选项
 
@@ -68,7 +85,9 @@ pub fn dag_to_handler(spec: Arc<DagSpec>) -> /* impl Fn(WorkflowCtx) -> BoxFutur
   策略对预发 step 静默失效，重开一个 [0007](0007-middleware-compose-order.md)
   踩过的坑。
 
-要同时满足「全部节点都经过统一包装」只能不调 `next()`、完全接管——即本决策。
+要同时满足「全部节点都经过统一包装」，正解是让调度本身跑在 handler 里
+（`dag_to_handler`）——handler 天然是洋葱最内层，所有策略的 `wrap_step` 都已注册。
+用中间件接管是另一条等价但更绕的路（见「决策」里被否的理由）。
 
 ### 2. 按拓扑波（Kahn 层）逐波 `try_join!`
 
@@ -87,27 +106,23 @@ store 契约，违反 [0001](0001-strategy-vs-mechanism.md) 的策略/机制分�
 
 ## 代价
 
-- **`take_over()` 是 Rust 独有**：TS 的 `composeMiddlewares` 丢弃 middleware
-  返回值，必须调 `next()` 并经 `ctx.dagResults` 转手，用户 handler 一定执行
-  （只是空壳）。Rust 可直接接管、run output 就是调度结果。两侧行为同构但
-  机制不同，须记入 `tanstack-alignment.md`。
+- **两侧统一为 handler 工厂**：TS `dagToHandler` ↔ Rust `dag_to_handler`，都不依赖
+  中间件接管，行为同构。曾尝试的 `take_over()` 中间件方案已删（等价但更绕，
+  见「决策」）。
 - **只支持静态图**：运行时分支 / 动态子图 / 循环不可表达，与 TS `DagSpec`
   的边界一致（见 `wf-demo/workflow-dag/src/index.ts:91-96`）。需要这些时用
   原生 handler。
-- **组合顺序成为用户约束**：顺序写错静默失效（ADR 0007 已详述），库只写清楚
-  规则、不重排。
-- **output 形状固定为 `{ results }`**：想要别的形状需在 `dag_to_handler`
+- **输出形状固定为 `{ results }`**：想要别的形状需在 `dag_to_handler`
   路径外包一层，或用原生 handler。
 - **取消语义**：第一个节点失败时 `JoinSet::abort_all()`，避免孤儿任务继续写
   checkpoint。
 
 ## 证据
 
-- 探针（已删）：中间件在 `next()` 前后均可发 `ctx.step`，`exec = ["pre",
-  "handler", "post"]`、`status = Finished`；记录层只看到 `handler`，证明
-  `next()` 前发的 step 绕过内层包装。
-- TS 参考：`wf-demo/packages/workflow-middlewares/src/dag.ts:34-62`（接管 /
-  传值）、`wf-demo/packages/workflow-dag/src/index.ts:167-196`（memo 化
-  `ensure` 按依赖调度）。
+- 探针（已删）：去掉 `dag_scheduler` 中间件的 `take_over()` 后，`does_not_run_user_handler`
+  测试照样通过——证明不调 `next()` 就足以跳过 handler，`take_over` 冗余；
+  另一探针证明 `next()` 前发的 step 绕过内层包装（记录层只看到 `handler`）。
+- TS 参考：`wf-demo/packages/workflow-dag/src/index.ts:167-196`（memo 化
+  `ensure` 按依赖调度，`dagToHandler` 入口）。
 - ADR 0006 已记录 Rust/TS 中间件返回值差异（`:63-66`）；ADR 0007 已实测
-  顺序错误的静默后果（`:30-39`）。
+  顺序错误的静默后果（`:30-39`），本决策改用 handler 工厂后该约束自动满足。

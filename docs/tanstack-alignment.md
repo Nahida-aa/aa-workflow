@@ -199,16 +199,14 @@ sleep 的保留信号名。
    上游对齐的写法仍然是 `ctx.emit` → `WorkflowEvent::Custom`；
    需要 step 归因时用 `progress`。示例见 `examples/store_file/src/progress_report.rs`。
    背景见 `docs/concepts/ctx-state.md`「那 step 内部的进度呢？」。
-7. **DAG 声明式调度（`dag_scheduler` / `dag_to_handler`）**：**主线 TanStack 没有**——
+7. **DAG 声明式调度（`dag_to_handler`）**：**主线 TanStack 没有**——
    core 的 engine "has no list of them and no graph"
    （`run-workflow.ts:126-129`），release/docs 也只展示 code-as-DAG
    （`docs/dag-strategies.md` §1 强信号 #2）。本能力来自 f2-lite/wf-demo
-   实验线，[0006](decisions/0006-dag-dual-drive-and-middleware.md) 已接受；
-   Rust 用 `take_over()` 直接接管 handler，**TS 没有这个能力**：上游
-   `composeMiddlewares` 丢弃 `m.server()` 返回值，只能调 `next()` 并经
-   `ctx.dagResults` 由空壳 handler 转手（`run-workflow.ts:1553,1582`）。
-   两侧行为同构、机制不同；细节见
-   [0019](decisions/0019-dag-declarative-scheduling.md)。
+   实验线，[0006](decisions/0006-dag-dual-drive-and-middleware.md) 已接受。
+   两侧统一为 handler 工厂（TS `dagToHandler` ↔ Rust `dag_to_handler`），
+   不依赖中间件接管；曾经试过的 Rust `take_over()` 中间件方案已删（等价但更绕）。
+   细节见 [0019](decisions/0019-dag-declarative-scheduling.md)。
 
 ## 完整分歧清单（逐符号实测，2026-09-30）
 

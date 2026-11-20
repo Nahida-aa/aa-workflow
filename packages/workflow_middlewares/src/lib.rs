@@ -23,11 +23,12 @@
 //!    `T` 的推导留在方法签名上。所以「拦截」是 `wrap_step` +
 //!    不调 `next()`，**不是**赋值覆盖。
 //!
-//! Rust 侧还**多**两项能力：包装层能 `park`（在 step 边界停下整条 drive），
-//! `server` 也能 `take_over`（跳过 handler 直接出结果）。见
-//! `docs/decisions/0016-step-onion.md`。`take_over` 的首个实际用户是
-//! [`dag`](crate::dag)：它据此**发起** step、按图调度全部节点，用户不写 handler
-//! （TS 没有这个能力，只能经 `ctx.dagResults` 转手）。见 `docs/decisions/0019`。
+//! Rust 侧还**多**一项能力：包装层能 `park`（在 step 边界停下整条 drive），见
+//! `docs/decisions/0016-step-onion.md`。
+//!
+//! DAG 调度走 [`dag_to_handler`](crate::dag_to_handler)（handler 工厂），不是
+//! 中间件：handler 天然最内层，所有策略的 `wrap_step` 都已注册；TS 侧同构
+//! （`dagToHandler`）。见 `docs/decisions/0019`。
 //!
 //! # 使用者不用写 `<Ext>`（内置中间件固定 `Middleware<(), ()>`）
 //!
@@ -40,13 +41,20 @@
 //! .middleware([interim_goals(get_events)])
 //! .middleware([reseed(load_results)])
 //! .middleware([dag_policies(shape, get_events)])   // shape 是静态图，不是 run 级参数
-//! .middleware([dag_scheduler(spec)])               // 调度器最后（最内层，ADR 0007）
 //!
 //! // run 级参数：每次 drive 各自给
 //! RunWorkflowOptions::new(wf, store)
 //!     .meta(MetaBag::new()
 //!         .with::<InterimGoalsKey>(vec!["b".into()])
 //!         .with::<ReseedKey>(ReseedPlan { .. }))
+//! ```
+//!
+//! DAG 调度不用中间件，直接用 [`dag_to_handler`] 作 handler：
+//!
+//! ```rust,ignore
+//! create_workflow(config)
+//!     .middleware([dag_policies(shape, get_events)])  // 策略照旧挂
+//!     .handler(dag_to_handler(spec));                  // handler 天然最内层
 //! ```
 //!
 //! **给中间件作者的建议**：如果你的中间件不写 `ctx.ext`，函数返回值就写成
@@ -66,7 +74,6 @@
 //! （`InterimGoalsKey` / `ReseedKey` / `DagPlan`）。
 mod dag;
 mod dag_policies;
-mod dag_scheduler;
 mod step_layer;
 mod interim_goals;
 mod reseed;
@@ -80,7 +87,6 @@ pub use dag::core::{
 pub use dag_policies::{
     DagPlan, DagPlanAccess, DagPlanKey, GetEvents, INTERIM_GOAL_SIGNAL, dag_policies,
 };
-pub use dag_scheduler::dag_scheduler;
 pub use interim_goals::{InterimGoalsAccess, InterimGoalsKey, interim_goals};
 pub use reseed::{LoadResults, ReseedAccess, ReseedKey, ReseedPlan, SourceStep, reseed};
 
