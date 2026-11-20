@@ -10,17 +10,13 @@ headless replay 引擎 + `RunStore` 契约，无调度器、无 host adapter、�
 分支  = if / else
 并行  = tokio::try_join!
 顺序  = 词法 .await
-耐久  = ctx.step(...).await   // 唯一会被 checkpoint 的副作用
+持久  = ctx.step(...).await   // 唯一会被 checkpoint 的副作用
 ```
 
 DAG 不是预先声明的，是 handler 跑出来的 per-run 涌现产物。每次 drive 从头重放
 handler，引擎按 `step_id` 短路已成功的 checkpoint。
 
 > **状态**：实验阶段（edition 2024）。尚未接回 LocalDub，core 里只有 phase-0 的
-> `InMemoryStore`，没有可执行 binary —— 示例通过 `cargo test` 驱动。
->
-> 对标范围是 TanStack 的 core engine，**不含**它的 `@tanstack/workflow-runtime`
-> 层（lease / sweep / timer 索引 / schedules）——见[已知边界](#已知边界)。
 
 ---
 
