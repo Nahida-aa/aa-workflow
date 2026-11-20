@@ -1,20 +1,19 @@
 //! 验证 DAG 策略中间件：redo 复用 + 临时目标泊车，计划走 `meta` 的 `DagPlanKey`。
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use aa_workflow_core::event::WorkflowEvent;
 use aa_workflow_core::StepCtx;
+use aa_workflow_core::event::WorkflowEvent;
 use aa_workflow_core::{
     create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunStatus, RunStore,
     RunWorkflowOptions, WorkflowCtx,
 };
-use aa_workflow_dag::{DagNode, DagShape, DagSpec, define_dag};
+use aa_workflow_dag::{DagShape, DagSpec, define_dag};
 use aa_workflow_middlewares::{
     DagPlan, DagPlanKey, INTERIM_GOAL_SIGNAL, dag_policies, dag_scheduler,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 
 fn shape() -> Arc<DagShape> {
     // 菱形：load → (enrich, translate) → merge → publish
@@ -41,18 +40,6 @@ fn loader(store: Arc<InMemoryStore>) -> Arc<aa_workflow_middlewares::GetEvents> 
     })
 }
 
-/// 每个节点把 id 记进 `exec`——不再由 handler 手写 step 列表。
-fn recording_node(exec: &Arc<Mutex<Vec<String>>>, deps: &[&str], id: &'static str) -> DagNode {
-    let exec = exec.clone();
-    DagNode::new(deps.iter().copied(), move |_deps, _input: Value| {
-        let exec = exec.clone();
-        async move {
-            exec.lock().unwrap().push(id.to_string());
-            Ok(json!({ "id": id }))
-        }
-    })
-}
-
 #[tokio::test]
 async fn redo_reuse_and_goal_park_via_dag_plan() {
     let store = Arc::new(InMemoryStore::new());
@@ -60,19 +47,61 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
 
     // **一个 definition 跑多次 run**——plan 走 meta，中间件不含它。
     // 调度按图自动进行：handler 只是空壳（dag 中间件 take_over 后不会执行）。
-    let spec = define_dag(DagSpec {
-        id: "dag-pol".into(),
-        nodes: BTreeMap::from([
-            ("load".into(), recording_node(&exec, &[], "load")),
-            ("enrich".into(), recording_node(&exec, &["load"], "enrich")),
-            ("translate".into(), recording_node(&exec, &["load"], "translate")),
-            (
-                "merge".into(),
-                recording_node(&exec, &["enrich", "translate"], "merge"),
-            ),
-            ("publish".into(), recording_node(&exec, &["merge"], "publish")),
-        ]),
-    })
+    // 常规流式写法：每个节点直接把闭包写进 .node()，无需 recording_node 之类的工厂。
+    // 闭包是 `Fn`（重试会多次调用），所以 exec 在闭包体内 clone 一份交给 async move。
+    let spec = define_dag(
+        DagSpec::new("dag-pol")
+            .node("load", Vec::<&str>::new(), {
+                let exec = exec.clone();
+                move |_deps, _input| {
+                    let exec = exec.clone();
+                    async move {
+                        exec.lock().unwrap().push("load".to_string());
+                        Ok(json!({ "id": "load" }))
+                    }
+                }
+            })
+            .node("enrich", ["load"], {
+                let exec = exec.clone();
+                move |_deps, _input| {
+                    let exec = exec.clone();
+                    async move {
+                        exec.lock().unwrap().push("enrich".to_string());
+                        Ok(json!({ "id": "enrich" }))
+                    }
+                }
+            })
+            .node("translate", ["load"], {
+                let exec = exec.clone();
+                move |_deps, _input| {
+                    let exec = exec.clone();
+                    async move {
+                        exec.lock().unwrap().push("translate".to_string());
+                        Ok(json!({ "id": "translate" }))
+                    }
+                }
+            })
+            .node("merge", ["enrich", "translate"], {
+                let exec = exec.clone();
+                move |_deps, _input| {
+                    let exec = exec.clone();
+                    async move {
+                        exec.lock().unwrap().push("merge".to_string());
+                        Ok(json!({ "id": "merge" }))
+                    }
+                }
+            })
+            .node("publish", ["merge"], {
+                let exec = exec.clone();
+                move |_deps, _input| {
+                    let exec = exec.clone();
+                    async move {
+                        exec.lock().unwrap().push("publish".to_string());
+                        Ok(json!({ "id": "publish" }))
+                    }
+                }
+            }),
+    )
     .unwrap();
     let wf = Arc::new(
         create_workflow(CreateWorkflowConfig::new("dag-pol").input::<serde_json::Value>())
