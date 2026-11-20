@@ -43,39 +43,35 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
     let store = Arc::new(InMemoryStore::new());
     let exec: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let mk = {
-        let store = store.clone();
-        let exec = exec.clone();
-        move || {
-            let exec = exec.clone();
-            let store = store.clone();
-            create_workflow(CreateWorkflowConfig::new("dag-pol").input::<serde_json::Value>())
-                .middleware([dag_policies(shape(), loader(store))])
-                .handler(move |ctx: WorkflowCtx| {
-                    let exec = exec.clone();
-                    async move {
-                        for id in ["load", "enrich", "translate", "merge", "publish"] {
+    // **一个 definition 跑两次 run**——plan 走 meta，中间件不含它。
+    let exec_in_wf = exec.clone();
+    let wf = Arc::new(
+        create_workflow(CreateWorkflowConfig::new("dag-pol").input::<serde_json::Value>())
+            .middleware([dag_policies(shape(), loader(store.clone()))])
+            .handler(move |ctx: WorkflowCtx| {
+                let exec = exec_in_wf.clone();
+                async move {
+                    for id in ["load", "enrich", "translate", "merge", "publish"] {
+                        let exec = exec.clone();
+                        let sid = id.to_string();
+                        ctx.step(id, move |_sc: StepCtx| {
                             let exec = exec.clone();
-                            let sid = id.to_string();
-                            ctx.step(id, move |_sc: StepCtx| {
-                                let exec = exec.clone();
-                                let sid = sid.clone();
-                                async move {
-                                    exec.lock().unwrap().push(sid.clone());
-                                    Ok(serde_json::json!({ "id": sid }))
-                                }
-                            })
-                            .await?;
-                        }
-                        Ok(serde_json::json!({ "ok": true }))
+                            let sid = sid.clone();
+                            async move {
+                                exec.lock().unwrap().push(sid.clone());
+                                Ok(serde_json::json!({ "id": sid }))
+                            }
+                        })
+                        .await?;
                     }
-                })
-        }
-    };
+                    Ok(serde_json::json!({ "ok": true }))
+                }
+            }),
+    );
 
-    // rev1：无 plan，全跑
+    // r1：不给 plan → 全跑
     run_workflow(
-        RunWorkflowOptions::new(Arc::new(mk()), store.clone())
+        RunWorkflowOptions::new(wf.clone(), store.clone())
             .input(serde_json::json!({}))
             .run_id("r1"),
     )
@@ -98,7 +94,7 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
     //（publish 不执行）。
     exec.lock().unwrap().clear();
     let out = run_workflow(
-        RunWorkflowOptions::new(Arc::new(mk()), store.clone())
+        RunWorkflowOptions::new(wf.clone(), store.clone())
             .input(serde_json::json!({}))
             .meta(
                 aa_workflow_core::define::MetaBag::new().with::<DagPlanKey>(DagPlan {
@@ -157,7 +153,7 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
     // 续驱：publish 补跑（load/enrich/translate/merge 短路）
     exec.lock().unwrap().clear();
     let out3 = run_workflow(
-        RunWorkflowOptions::new(Arc::new(mk()), store.clone())
+        RunWorkflowOptions::new(wf, store.clone())
             .input(serde_json::json!({}))
             .run_id("r2"),
     )
