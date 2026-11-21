@@ -88,3 +88,51 @@ CPS 侧用真实 `MiddlewareServer`（RPITIT）并跑进真实引擎端到端；
 3. **Box::pin 总账不变**：CPS 的 N 箱（pipeline，结构性）+ tower 静态
    零箱/dyn 每请求一箱——两协议在「擦除 vs 静态」上的取舍与 ADR 0020/0021
    一致。
+
+
+## 7. 追问（同日）：axum 会不会有更短的写法？
+
+**有，且我们现行的 `server_state` 就是同款机制**——axum 的短不来自协议
+（`from_fn` 底下仍是 tower Service），来自**「状态作参数」而非「状态作捕获」**：
+独立 `async fn` 的签名里带上状态参数，捕获仪式从根上消失，连 struct/impl 块
+都不需要。
+
+实测（`protocol_experiment.rs` 的 `interim_goals_flat`，与 struct 形态
+`InterimGoalsMw` 同逻辑）：
+
+| 形态 | 作者侧行数 | 结构单元 | 注册 |
+| --- | --- | --- | --- |
+| struct + `impl MiddlewareServer`（RPITIT） | ~54 行 | struct + impl + 构造器 | `.middleware(interim_goals(ge))` |
+| **独立 async fn + `server_state`** | **~36 行** | **一个 fn** | `.server_state(ge, fn)` |
+
+```rust
+// 最短形态：状态是首参，args 次参，body 平铺一层
+async fn interim_goals_flat(get_events: Arc<GetEvents>, args: MiddlewareServerFnArgs)
+    -> Result<Value> {
+    let mut sc = args;
+    let goals = sc.ctx.meta.try_get::<InterimGoalsKey>()?.clone();
+    let finished = (get_events)(&sc.ctx.run_id)?;   // 状态参数直接用，无克隆仪式
+    ...
+    sc.next(None).await
+}
+// 注册：Middleware::new().server_state(get_events, interim_goals_flat)
+```
+
+**为什么可行**：`server_state` 的适配器每次调用 clone 一份 state 传作首参，
+独立 `async fn` item 天然实现 `Fn((S, Args)) -> impl Future`——不需要闭包
+捕获，因此没有 per-call clone 仪式。**这消灭了 struct 形态存在的最常见理由**
+（「要带参数所以得写 struct」）。
+
+**三分形态定稿**（谁该用哪个）：
+
+| 需求 | 形态 |
+| --- | --- |
+| 简单策略（一个状态句柄 + meta 判定） | **独立 async fn + `server_state`**（最短） |
+| 多状态字段 / 想单元测试的复杂中间件 | struct + `impl MiddlewareServer` |
+| 运行时动态集合（低代码） | 暂缓（ADR 0021 修订注）——出现需求再加 |
+
+**逻辑结论的最终修正**：写起来方便的总排序——`async fn + server_state`
+（最短）≥ struct 形态 ≥ tower `Service` 手写 impl——而「协议」之争（next vs
+tower）在这个维度上被「状态注入方式」之争取代了：**axum 式的短，本质是
+「参数化状态」的短，与 CPS/tower 的协议选择正交**。我们的 next 协议 +
+`server_state` 已经拿到这份短。

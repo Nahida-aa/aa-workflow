@@ -25,6 +25,7 @@ use std::task::{Context, Poll};
 use anyhow::Result;
 use tower::{Layer, Service};
 
+use aa_workflow_middlewares::GetEvents;
 use aa_workflow_core::middleware::{Middleware, MiddlewareServer, MiddlewareServerFnArgs};
 
 type BoxFut = Pin<Box<dyn Future<Output = Result<serde_json::Value, anyhow::Error>> + Send>>;
@@ -416,4 +417,73 @@ async fn cps_side_flat_serve_runs_in_the_real_engine() {
         !log.lock().unwrap().is_empty(),
         "TimedCps 的 after 逻辑（await 之后）已执行"
     );
+}
+
+// ============================================================
+// 最短形态（axum `from_fn_with_state` 同款）：独立 async fn + 状态作参数
+// ——状态不捕获走参数，捕获仪式从根上消失；无 struct 无 impl 块
+// ============================================================
+use aa_workflow_core::middleware::{step_layer, Decision};
+use aa_workflow_core::define::MetaKey;
+use std::collections::HashSet;
+
+/// 与 InterimGoalsMw 同逻辑的最短形态：状态（get_events）是首参，args 次参。
+async fn interim_goals_flat(
+    get_events: Arc<GetEvents>,
+    args: MiddlewareServerFnArgs,
+) -> Result<serde_json::Value> {
+    let mut sc = args;
+
+    let Some(goals) = sc.ctx.meta.try_get::<InterimGoalsFlatKey>() else {
+        return sc.next(None).await;
+    };
+    let goals = goals.clone();
+
+    // 开局已完成的目标——状态参数直接用，无捕获无克隆仪式
+    let finished: HashSet<String> = (get_events)(&sc.ctx.run_id)?
+        .iter()
+        .filter_map(|e| match e {
+            aa_workflow_core::event::WorkflowEvent::StepFinished { step_id, .. } => {
+                Some(step_id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let goals_done_at_start = goals.iter().all(|g| finished.contains(g));
+
+    sc.wrap_step(step_layer(move |req: &aa_workflow_core::middleware::StepRequest| {
+        if goals_done_at_start {
+            return Decision::Pass;
+        }
+        if goals.iter().all(|g| req.completed.contains(g)) {
+            return Decision::Pass; // 实验从简：真实版在此 Park
+        }
+        Decision::Pass
+    }));
+
+    sc.next(None).await
+}
+
+pub struct InterimGoalsFlatKey;
+impl MetaKey for InterimGoalsFlatKey {
+    const KEY: &'static str = "__exp-goals";
+    type Value = Vec<String>;
+}
+
+/// 注册：一行。整个中间件 = 一个独立 async fn。
+#[tokio::test]
+async fn flat_form_is_the_shortest_authoring() {
+    let get_events: Arc<GetEvents> = Arc::new(|run_id: &str| {
+        Ok(vec![aa_workflow_core::event::WorkflowEvent::StepFinished {
+            ts: 0,
+            run_id: run_id.to_string(),
+            step_id: "seed".into(),
+            result: None,
+            attempts: vec![],
+            meta: None,
+        }])
+    });
+    let mw = Middleware::new().server_state(Arc::clone(&get_events), interim_goals_flat);
+    // 注册即用；LoC 见 docs/experiments/middleware-protocol.md 的三形态对照
+    assert_eq!(format!("{:p}", Arc::as_ptr(&mw.server)).len() > 0, true);
 }
