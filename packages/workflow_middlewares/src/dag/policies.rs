@@ -116,8 +116,11 @@ struct DagPoliciesMw {
 }
 
 impl MiddlewareServer for DagPoliciesMw {
-    fn serve<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>> {
-        Box::pin(async move {
+    fn serve<'a>(
+        &'a self,
+        args: MiddlewareServerFnArgs,
+    ) -> impl Future<Output = Result<Value>> + Send + 'a {
+        async move {
             let mut sc = args;
             // 前置：解析 RunWorkflowOptions.meta 里的 DagPlan → PlanState。
             // 缺失 = 本次 run 不做任何策略（与另两个中间件一致）。
@@ -194,6 +197,6 @@ impl MiddlewareServer for DagPoliciesMw {
             }));
 
             sc.next(None).await
-        })
+        }
     }
 }
