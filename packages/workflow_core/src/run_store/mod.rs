@@ -378,13 +378,13 @@ pub trait RunStore: Send + Sync {
 mod tests {
     use super::*;
 
-    #[derive(serde::Deserialize, serde::Serialize, Debug, PartialEq)]
+    #[derive(serde::Deserialize, Clone, serde::Serialize, Debug, PartialEq)]
     #[serde(rename_all = "camelCase")]
     struct OrderIn {
         order_id: String,
     }
 
-    #[derive(serde::Deserialize, serde::Serialize, Debug, PartialEq)]
+    #[derive(serde::Deserialize, Clone, serde::Serialize, Debug, PartialEq)]
     struct OrderOut {
         ok: bool,
     }

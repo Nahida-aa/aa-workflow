@@ -39,7 +39,7 @@ use aa_workflow_core::{
 // ========================================================================
 
 /// 履约 saga 输入。
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct FulfillmentSagaInput {
     pub order_id: String,
@@ -48,14 +48,14 @@ pub struct FulfillmentSagaInput {
 }
 
 /// 邮件 digest 输入。
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EmailDigestInput {
     pub days: i64,
 }
 
 /// 履约流输入（对齐 wf-demo `FulfillmentInput`）。
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct FulfillmentInput {
     pub order_id: String,
@@ -63,7 +63,7 @@ pub struct FulfillmentInput {
 }
 
 /// 审批流输入。
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalOrderInput {
     pub order_id: String,
@@ -73,7 +73,7 @@ pub struct ApprovalOrderInput {
 }
 
 /// 发票输入。
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct InvoiceInput {
     pub order_id: String,
@@ -84,14 +84,14 @@ pub struct InvoiceInput {
 }
 
 /// 合规归档输入。
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ComplianceInput {
     pub subject_id: String,
 }
 
 /// 退款输入。
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct RefundInput {
     pub order_id: String,
@@ -179,7 +179,7 @@ pub fn fulfillment_saga() -> WorkflowDefinition<FulfillmentSagaInput, serde_json
             let (pdf, charged) = tokio::try_join!(
                 {
                     let order_id = order_id.clone();
-                    ctx.step("gen-pdf", move |_sc: StepCtx| {
+                    ctx.step("gen-pdf", move |_sc| {
                         let order_id = order_id.clone();
                         async move {
                             tracing::info!(target: "examples", "render pdf for {order_id}");
@@ -193,7 +193,7 @@ pub fn fulfillment_saga() -> WorkflowDefinition<FulfillmentSagaInput, serde_json
                         "charge",
                         StepOptions::new()
                             .retry(RetryPolicy::new(3, Backoff::Fixed { base_ms: 1 })),
-                        move |_sc: StepCtx| {
+                        move |_sc| {
                             let order_id = order_id.clone();
                             async move {
                                 payment_gateway::charge(&order_id)?;
@@ -206,7 +206,7 @@ pub fn fulfillment_saga() -> WorkflowDefinition<FulfillmentSagaInput, serde_json
 
             if expedited {
                 let order_id = order_id.clone();
-                ctx.step("notify", move |_sc: StepCtx| {
+                ctx.step("notify", move |_sc| {
                     let order_id = order_id.clone();
                     async move {
                         tracing::info!(target: "examples", "expedited notify for {order_id}");
@@ -232,14 +232,14 @@ pub fn email_digest() -> WorkflowDefinition<EmailDigestInput, serde_json::Value>
             let days = ctx.input.days;
 
             let scanned = ctx
-                .step("scan-events", move |_sc: StepCtx| async move {
+                .step("scan-events", move |_sc| async move {
                     tracing::info!(target: "examples", "scan events for {days} days");
                     Ok(serde_json::json!({ "count": days * 3 }))
                 })
                 .await?;
 
             let rendered = ctx
-                .step("render", move |_sc: StepCtx| {
+                .step("render", move |_sc| {
                     let scanned = scanned.clone();
                     async move {
                         tracing::info!(target: "examples", "render digest");
@@ -251,7 +251,7 @@ pub fn email_digest() -> WorkflowDefinition<EmailDigestInput, serde_json::Value>
                 .await?;
 
             let sent = ctx
-                .step("send", move |_sc: StepCtx| {
+                .step("send", move |_sc| {
                     let rendered = rendered.clone();
                     async move {
                         tracing::info!(target: "examples", "send digest email");
@@ -269,7 +269,7 @@ pub fn email_digest() -> WorkflowDefinition<EmailDigestInput, serde_json::Value>
 /// 审批决定（signal 的 payload）就是 `approve` 的返回值，最后作为 run 输出。
 pub fn approval_review() -> WorkflowDefinition {
     create_workflow(CreateWorkflowConfig::new("approval-review").input::<serde_json::Value>()).handler(|ctx: WorkflowCtx| async move {
-        ctx.step("draft", move |_sc: StepCtx| async move {
+        ctx.step("draft", move |_sc| async move {
             tracing::info!(target: "examples", "draft the proposal");
             Ok(serde_json::json!({ "draft": true }))
         })
@@ -278,7 +278,7 @@ pub fn approval_review() -> WorkflowDefinition {
         let decision = ctx.approve("review", "这份提案是否放行发布？").await?;
         let decision_out = decision.clone();
 
-        ctx.step("publish", move |_sc: StepCtx| {
+        ctx.step("publish", move |_sc| {
             let decision = decision.clone();
             async move {
                 tracing::info!(target: "examples", "publish with decision");
@@ -312,7 +312,7 @@ pub fn fulfillment() -> WorkflowDefinition<FulfillmentInput, serde_json::Value> 
             let order_id_ship = order_id.clone();
 
             let reservation = ctx
-                .step("reserve-inventory", move |_sc: StepCtx| {
+                .step("reserve-inventory", move |_sc| {
                     let order_id = order_id_reserve;
                     async move {
                         tracing::info!(target: "examples", "reserve inventory for {order_id}");
@@ -334,7 +334,7 @@ pub fn fulfillment() -> WorkflowDefinition<FulfillmentInput, serde_json::Value> 
                 .await?;
 
             let shipment = ctx
-                .step("ship-order", move |_sc: StepCtx| {
+                .step("ship-order", move |_sc| {
                     let order_id = order_id_ship;
                     async move {
                         tracing::info!(target: "examples", "ship {order_id}");
@@ -371,7 +371,7 @@ pub fn approval_order() -> WorkflowDefinition<ApprovalOrderInput, serde_json::Va
             let order_id_check = order_id.clone();
             let currency_check = currency.clone();
 
-            ctx.step("check-order", move |_sc: StepCtx| {
+            ctx.step("check-order", move |_sc| {
                 let order_id = order_id_check;
                 let currency = currency_check;
                 async move { Ok(serde_json::json!({ "orderId": order_id, "currency": currency })) }
@@ -392,7 +392,7 @@ pub fn approval_order() -> WorkflowDefinition<ApprovalOrderInput, serde_json::Va
                         .and_then(|v| v.as_str())
                         .map(String::from)
                         .unwrap_or_else(|| "declined".to_string());
-                    ctx.step("notify-rejected", move |_sc: StepCtx| async move {
+                    ctx.step("notify-rejected", move |_sc| async move {
                         Ok(serde_json::json!({ "notifiedAt": now_ms() }))
                     })
                     .await?;
@@ -407,7 +407,7 @@ pub fn approval_order() -> WorkflowDefinition<ApprovalOrderInput, serde_json::Va
             }
 
             let order_id_charge = order_id.clone();
-            ctx.step("charge-payment", move |_sc: StepCtx| {
+            ctx.step("charge-payment", move |_sc| {
                 let order_id = order_id_charge;
                 async move {
                     tracing::info!(target: "examples", "charge {order_id}");
@@ -439,7 +439,7 @@ pub fn invoice() -> WorkflowDefinition<InvoiceInput, serde_json::Value> {
             let order_id_prepare = order_id.clone();
             let order_id_settle = order_id.clone();
 
-            ctx.step("prepare-invoice", move |_sc: StepCtx| {
+            ctx.step("prepare-invoice", move |_sc| {
                 let order_id = order_id_prepare;
                 async move {
                     Ok(serde_json::json!({ "orderId": order_id, "preparedAt": now_ms() }))
@@ -450,7 +450,7 @@ pub fn invoice() -> WorkflowDefinition<InvoiceInput, serde_json::Value> {
             ctx.sleep("settle-due-1", Duration::from_millis(t1)).await?;
             ctx.sleep("settle-due-2", Duration::from_millis(t2)).await?;
 
-            ctx.step("settle-invoice", move |_sc: StepCtx| {
+            ctx.step("settle-invoice", move |_sc| {
                 let order_id = order_id_settle;
                 async move { Ok(serde_json::json!({ "orderId": order_id, "settledAt": now_ms() })) }
             })
@@ -479,7 +479,7 @@ pub fn compliance() -> WorkflowDefinition<ComplianceInput, serde_json::Value> {
 
             let subject_id_archive = subject_id.clone();
             let record = ctx
-                .step("archive-record", move |_sc: StepCtx| {
+                .step("archive-record", move |_sc| {
                     let subject_id = subject_id_archive;
                     async move {
                         Ok(serde_json::json!({
@@ -537,7 +537,7 @@ pub fn refund() -> WorkflowDefinition<RefundInput, serde_json::Value> {
             }
 
             let order_id_disburse = order_id.clone();
-            ctx.step("disburse-refund", move |_sc: StepCtx| {
+            ctx.step("disburse-refund", move |_sc| {
                 let order_id = order_id_disburse;
                 async move {
                     tracing::info!(target: "examples", "disburse refund for {order_id}");
@@ -558,7 +558,7 @@ pub fn refund() -> WorkflowDefinition<RefundInput, serde_json::Value> {
 }
 
 /// 状态机 demo 输入。
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct StateDemoInput {
     pub order_id: String,
@@ -601,7 +601,7 @@ pub fn state_demo() -> WorkflowDefinition<StateDemoInput, serde_json::Value, Cou
 
             let order_id_prepare = order_id.clone();
             let prepared = ctx
-                .step("prepare", move |_sc: StepCtx| {
+                .step("prepare", move |_sc| {
                     let order_id = order_id_prepare;
                     async move {
                         Ok(serde_json::json!({ "orderId": order_id, "preparedAt": now_ms() }))
@@ -631,7 +631,7 @@ pub fn state_demo() -> WorkflowDefinition<StateDemoInput, serde_json::Value, Cou
 /// 1. `ctx.emit` 广播可观测事件（不进日志，publisher 可见）；
 /// 2. `ctx.wait_for_event` 按事件名挂起，外部 `deliver_signal` 按名投递；
 /// 3. `ctx.sleep_until` 等绝对时间点（predictedAt 靠后成立，否则立即放行）。
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(serde::Deserialize, serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EventGateInput {
     pub market: String,
@@ -656,7 +656,7 @@ pub fn event_gate() -> WorkflowDefinition<EventGateInput, serde_json::Value> {
             ctx.sleep_until("settle-wait", predicted_at).await?;
 
             let market_finalize = market.clone();
-            ctx.step("finalize", move |_sc: StepCtx| {
+            ctx.step("finalize", move |_sc| {
                 let market = market_finalize;
                 async move { Ok(serde_json::json!({ "market": market })) }
             })
@@ -1285,7 +1285,7 @@ mod tests {
                 ctx.state.total = 99;
                 ctx.state.settle_events.push("mutated".into());
                 // durable 边界：flush 执行（镜像写回，per-invocation 语义）。
-                ctx.step("flush-check", |_sc: StepCtx| async move {
+                ctx.step("flush-check", |_sc| async move {
                     Ok(serde_json::json!({ "flushed": true }))
                 })
                 .await?;
@@ -1392,17 +1392,17 @@ mod tests {
                 // clone 发生在 step 创建时 = state 快照；闭包内看到的都与 driver
                 // 无关，3 个并发等待互不锁（state 是字段，不经过 RwLock）。
                 let qa = ctx.clone();
-                let fa = ctx.step("a", move |_sc: StepCtx| {
+                let fa = ctx.step("a", move |_sc| {
                     let qa = qa;
                     async move { Ok(qa.state["total"].clone()) }
                 });
                 let qb = ctx.clone();
-                let fb = ctx.step("b", move |_sc: StepCtx| {
+                let fb = ctx.step("b", move |_sc| {
                     let qb = qb;
                     async move { Ok(qb.state["total"].clone()) }
                 });
                 let qc = ctx.clone();
-                let fc = ctx.step("c", move |_sc: StepCtx| {
+                let fc = ctx.step("c", move |_sc| {
                     let qc = qc;
                     async move { Ok(qc.state["total"].clone()) }
                 });
@@ -1459,7 +1459,7 @@ mod tests {
                 // mutation 在 step 闭包内：重放时整个闭包被跳过 → 修改丢失；
                 // 且闭包持 clone 快照，首个 drive 内也不写 driver 的字段。
                 let inner = ctx.clone();
-                ctx.step("bump-inside", move |_sc: StepCtx| {
+                ctx.step("bump-inside", move |_sc| {
                     let mut ctx = inner;
                     async move {
                         let mut st: CounterState = serde_json::from_value(ctx.state.snapshot())?;

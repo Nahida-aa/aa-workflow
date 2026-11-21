@@ -1611,7 +1611,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
-    #[derive(serde::Deserialize, serde::Serialize)]
+    #[derive(serde::Deserialize, Clone, serde::Serialize)]
     struct StrictState {
         n: i64,
     }

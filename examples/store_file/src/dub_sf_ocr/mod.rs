@@ -497,9 +497,11 @@ fn dub_builder() -> WorkflowBuilder<DubSfOcrInput, (), DubSfOcrState> {
 /// ——handler 由 [`dag_to_handler`] 从它生成，形状由 [`DagSpec::shape`]
 /// 从它派生，没有任何第二份编码。
 ///
-/// 节点闭包的形状：`deps[节点 id]` 反序列化上游产物 + [`DubSfOcrState::from_input`]
-/// 重建 state → 调「外部服务」（模型类节点经 [`DubEnv`]）或本地处理（ffmpeg
-/// 类节点直接调自由函数）→ typed 产物序列化进 checkpoint。
+/// 节点闭包的形状：`(sc, deps)`——`sc.ctx.input` 是 **typed** run input
+/// （`RunCtx<DubSfOcrInput>`，不过 JSON），`deps[节点 id]` 反序列化上游产物，
+/// [`DubSfOcrState::from_input`] 重建 state → 调「外部服务」（模型类节点经
+/// [`DubEnv`]）或本地处理（ffmpeg 类节点直接调自由函数）→ typed 产物序列化
+/// 进 checkpoint。
 ///
 /// env 的捕获仪式（[`DagRunFn`][aa_workflow_middlewares::DagSpec] 是
 /// `Arc<dyn Fn>`，`'static` future 不许借用）：闭包外预克隆一份 handle、
@@ -516,53 +518,53 @@ fn dub_spec(env: DubEnv) -> DagSpec<DubSfOcrInput> {
 
     DagSpec::new("dub-sf-ocr")
         // 分支 A：分离人声 + 伴奏。
-        .node("separate", Vec::<&str>::new(), move |_deps, input| {
+        .node("separate", Vec::<&str>::new(), move |sc, _deps| {
             let env = env_sep.clone();
             async move {
-                let st = DubSfOcrState::from_input(&input);
+                let st = DubSfOcrState::from_input(&sc.ctx.input);
                 let out = env.separate(&st).await?;
                 Ok(serde_json::to_value(out)?)
             }
         })
-        .node("separate_after", ["separate"], move |deps, input| {
+        .node("separate_after", ["separate"], move |sc, deps| {
             let env = env_sep2.clone();
             async move {
-                let st = DubSfOcrState::from_input(&input);
+                let st = DubSfOcrState::from_input(&sc.ctx.input);
                 let prev: Separated = serde_json::from_value(deps["separate"].clone())?;
                 let out = env.separate_after(&st, &prev).await?;
                 Ok(serde_json::to_value(out)?)
             }
         })
         // 分支 B：抽关键帧 → OCR → 校正 → 翻译（抽帧是本地处理）。
-        .node("sf_ocr_pre", Vec::<&str>::new(), move |_deps, input| {
+        .node("sf_ocr_pre", Vec::<&str>::new(), move |sc, _deps| {
             async move {
-                let st = DubSfOcrState::from_input(&input);
+                let st = DubSfOcrState::from_input(&sc.ctx.input);
                 let out = sf_ocr_pre(&st).await?;
                 Ok(serde_json::to_value(out)?)
             }
         })
-        .node("sf_ocr", ["sf_ocr_pre"], move |deps, input| {
+        .node("sf_ocr", ["sf_ocr_pre"], move |sc, deps| {
             let env = env_ocr.clone();
             async move {
-                let st = DubSfOcrState::from_input(&input);
+                let st = DubSfOcrState::from_input(&sc.ctx.input);
                 let frames: Keyframes = serde_json::from_value(deps["sf_ocr_pre"].clone())?;
                 let out = env.sf_ocr(&st, &frames).await?;
                 Ok(serde_json::to_value(out)?)
             }
         })
-        .node("sf_ocr_fix", ["sf_ocr"], move |deps, input| {
+        .node("sf_ocr_fix", ["sf_ocr"], move |sc, deps| {
             let env = env_fix.clone();
             async move {
-                let st = DubSfOcrState::from_input(&input);
+                let st = DubSfOcrState::from_input(&sc.ctx.input);
                 let raw: RawSubtitle = serde_json::from_value(deps["sf_ocr"].clone())?;
                 let out = env.sf_ocr_fix(&st, &raw).await?;
                 Ok(serde_json::to_value(out)?)
             }
         })
-        .node("translate", ["sf_ocr_fix"], move |deps, input| {
+        .node("translate", ["sf_ocr_fix"], move |sc, deps| {
             let env = env_tr.clone();
             async move {
-                let st = DubSfOcrState::from_input(&input);
+                let st = DubSfOcrState::from_input(&sc.ctx.input);
                 let fixed: FixedSubtitle = serde_json::from_value(deps["sf_ocr_fix"].clone())?;
                 let out = env.translate(&st, &fixed).await?;
                 Ok(serde_json::to_value(out)?)
@@ -572,9 +574,9 @@ fn dub_spec(env: DubEnv) -> DagSpec<DubSfOcrInput> {
         .node(
             "split_audio",
             ["separate_after", "translate"],
-            move |deps, input| {
+            move |sc, deps| {
                 async move {
-                    let st = DubSfOcrState::from_input(&input);
+                    let st = DubSfOcrState::from_input(&sc.ctx.input);
                     let vocals: Separated =
                         serde_json::from_value(deps["separate_after"].clone())?;
                     let translated: Translated =
@@ -584,18 +586,18 @@ fn dub_spec(env: DubEnv) -> DagSpec<DubSfOcrInput> {
                 }
             },
         )
-        .node("tts", ["split_audio"], move |deps, input| {
+        .node("tts", ["split_audio"], move |sc, deps| {
             let env = env_tts.clone();
             async move {
-                let st = DubSfOcrState::from_input(&input);
+                let st = DubSfOcrState::from_input(&sc.ctx.input);
                 let timings: Timings = serde_json::from_value(deps["split_audio"].clone())?;
                 let out = env.tts(&st, &timings).await?;
                 Ok(serde_json::to_value(out)?)
             }
         })
-        .node("mix_audio", ["separate_after", "tts"], move |deps, input| {
+        .node("mix_audio", ["separate_after", "tts"], move |sc, deps| {
             async move {
-                let st = DubSfOcrState::from_input(&input);
+                let st = DubSfOcrState::from_input(&sc.ctx.input);
                 let vocals: Separated = serde_json::from_value(deps["separate_after"].clone())?;
                 let batch: TtsBatch = serde_json::from_value(deps["tts"].clone())?;
                 let out = mix_audio(&st, &vocals, &batch).await?;
@@ -605,9 +607,9 @@ fn dub_spec(env: DubEnv) -> DagSpec<DubSfOcrInput> {
         .node(
             "mix_video",
             ["separate_after", "mix_audio"],
-            move |deps, input| {
+            move |sc, deps| {
                 async move {
-                    let st = DubSfOcrState::from_input(&input);
+                    let st = DubSfOcrState::from_input(&sc.ctx.input);
                     let separated: Separated =
                         serde_json::from_value(deps["separate_after"].clone())?;
                     let audio: MixedAudio = serde_json::from_value(deps["mix_audio"].clone())?;

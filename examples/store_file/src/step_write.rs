@@ -157,7 +157,7 @@ pub fn step_write() -> WorkflowDefinition<StepWriteInput, serde_json::Value, Ste
             let s1_arc = Arc::clone(&arc_counter);
             // ④ 闭包内：写 via_closure（断链）+ 写 arc（链通）
             let s1 = ctx
-                .step("s1", move |_sc: StepCtx| {
+                .step("s1", move |_sc| {
                     let mut st = s1_inner; // DerefMut 需要 mut
                     let arc = s1_arc;
                     async move {
@@ -193,7 +193,7 @@ pub fn step_write() -> WorkflowDefinition<StepWriteInput, serde_json::Value, Ste
             let s2_arc = Arc::clone(&arc_counter);
             // ④ 闭包内读写
             let s2 = ctx
-                .step("s2", move |_sc: StepCtx| {
+                .step("s2", move |_sc| {
                     let mut st = s2_inner;
                     let arc = s2_arc;
                     async move {
@@ -227,7 +227,7 @@ pub fn step_write() -> WorkflowDefinition<StepWriteInput, serde_json::Value, Ste
             let s3_arc = Arc::clone(&arc_counter);
             // ④ 闭包内读写
             let s3 = ctx
-                .step("s3", move |_sc: StepCtx| {
+                .step("s3", move |_sc| {
                     let mut st = s3_inner;
                     let arc = s3_arc;
                     async move {

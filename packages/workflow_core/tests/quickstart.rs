@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use aa_workflow_core::{CreateWorkflowConfig, InMemoryStore, RunStatus, RunStore, RunWorkflowOptions, StepCtx, WorkflowDefinition, create_workflow, run_workflow};
 
-#[derive(serde::Deserialize, serde::Serialize, Debug, PartialEq)]
+#[derive(serde::Deserialize, Clone, serde::Serialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct ChargeInput {
     amount: i64,
@@ -24,7 +24,7 @@ fn charge_workflow() -> WorkflowDefinition<ChargeInput, serde_json::Value> {
     .handler(|ctx| async move {
         let amount = ctx.input.amount;
         let user_id = ctx.input.user_id.clone();
-        ctx.step("stripe-charge", move |sc: StepCtx| async move {
+        ctx.step("stripe-charge", move |sc| async move {
             Ok(serde_json::json!({
                 "chargeId": format!("ch_{}", sc.id),
                 "amount": amount,

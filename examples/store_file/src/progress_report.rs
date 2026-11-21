@@ -113,7 +113,7 @@ pub fn progress_report() -> WorkflowDefinition<ProgressInput, serde_json::Value,
         // ① 长 step：循环里逐次上报。这是 `progress` 唯一的正确用法——
         //    报「到哪了」，不是报「结果是什么」（结果该用返回值）。
         let slow = ctx
-            .step("slow", move |sc: StepCtx| {
+            .step("slow", move |sc| {
                 let rounds = ctx.input.rounds;
                 let tick = Duration::from_millis(ctx.input.tick_ms);
                 async move {
@@ -136,7 +136,7 @@ pub fn progress_report() -> WorkflowDefinition<ProgressInput, serde_json::Value,
         //    这就是「拆 step」和「报 progress」的分工——前者的粒度是耐久的，
         //    后者的粒度是尽力而为的。
         let phase = ctx
-            .step("phase", move |_sc: StepCtx| async move {
+            .step("phase", move |_sc| async move {
                 Ok(slow.rounds)
             })
             .await?;

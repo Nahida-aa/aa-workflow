@@ -53,7 +53,7 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
         DagSpec::new("dag-pol")
             .node("load", Vec::<&str>::new(), {
                 let debug_exec_log = debug_exec_log.clone();
-                move |_deps, _input| {
+                move |_sc, _deps| {
                     let debug_exec_log = debug_exec_log.clone();
                     async move {
                         debug_exec_log.lock().unwrap().push("load".to_string());
@@ -63,7 +63,7 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
             })
             .node("enrich", ["load"], {
                 let debug_exec_log = debug_exec_log.clone();
-                move |_deps, _input| {
+                move |_sc, _deps| {
                     let debug_exec_log = debug_exec_log.clone();
                     async move {
                         debug_exec_log.lock().unwrap().push("enrich".to_string());
@@ -73,7 +73,7 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
             })
             .node("translate", ["load"], {
                 let debug_exec_log = debug_exec_log.clone();
-                move |_deps, _input| {
+                move |_sc, _deps| {
                     let debug_exec_log = debug_exec_log.clone();
                     async move {
                         debug_exec_log.lock().unwrap().push("translate".to_string());
@@ -83,7 +83,7 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
             })
             .node("merge", ["enrich", "translate"], {
                 let debug_exec_log = debug_exec_log.clone();
-                move |_deps, _input| {
+                move |_sc, _deps| {
                     let debug_exec_log = debug_exec_log.clone();
                     async move {
                         debug_exec_log.lock().unwrap().push("merge".to_string());
@@ -93,7 +93,7 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
             })
             .node("publish", ["merge"], {
                 let debug_exec_log = debug_exec_log.clone();
-                move |_deps, _input| {
+                move |_sc, _deps| {
                     let debug_exec_log = debug_exec_log.clone();
                     async move {
                         debug_exec_log.lock().unwrap().push("publish".to_string());

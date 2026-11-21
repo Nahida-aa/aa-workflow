@@ -24,14 +24,14 @@ async fn dag_schedules_by_dependency_order_and_fans_out() {
 
     let spec = define_dag(
         DagSpec::<Value>::new("pipe")
-            .node("a", Vec::<&str>::new(), move |_deps, input| {
+            .node("a", Vec::<&str>::new(), move |sc, _deps| {
                 let exec = e_a.clone();
                 async move {
                     exec.lock().unwrap().push("a");
-                    Ok(json!({ "v": input["base"] }))
+                    Ok(json!({ "v": sc.ctx.input["base"] }))
                 }
             })
-            .node("b", ["a"], move |deps, _input| {
+            .node("b", ["a"], move |_sc, deps| {
                 let exec = e_b.clone();
                 let barrier = bar_b.clone();
                 async move {
@@ -43,7 +43,7 @@ async fn dag_schedules_by_dependency_order_and_fans_out() {
                     Ok(json!(deps["a"]["v"].as_i64().unwrap() * 2))
                 }
             })
-            .node("c", ["a"], move |deps, _input| {
+            .node("c", ["a"], move |_sc, deps| {
                 let exec = e_c.clone();
                 let barrier = bar_c.clone();
                 async move {
@@ -54,7 +54,7 @@ async fn dag_schedules_by_dependency_order_and_fans_out() {
                     Ok(json!(deps["a"]["v"].as_i64().unwrap() * 3))
                 }
             })
-            .node("d", ["b", "c"], move |deps, _input| {
+            .node("d", ["b", "c"], move |_sc, deps| {
                 let exec = e_d.clone();
                 async move {
                     exec.lock().unwrap().push("d");
@@ -104,7 +104,7 @@ async fn dag_replay_short_circuits_checkpointed_nodes() {
                         Ok(json!(1))
                     }
                 })
-                .node("b", ["a"], move |_deps, _| {
+                .node("b", ["a"], move |_sc, _deps| {
                     let runs = runs_b.clone();
                     async move {
                         *runs.lock().unwrap().entry("b".into()).or_insert(0) += 1;

@@ -49,17 +49,21 @@ pub type WorkflowHandler =
 /// 成员对齐 middleware 侧 `StepRequest` 能拿到的 run 级事实：
 /// `run_id` / `input` / `meta`（run 级参数，擦除值）/ `ext`（middleware
 /// 贡献的扩展）/ `emit`（观测出口，`CUSTOM`）/ `is_cancelled`。
+///
+/// `I` = run input 的**精确类型**：input 是 run 级事实，run 级视图不擦除它
+/// （对比 `meta`——动态键值才擦除）。擦除面（引擎内部 / 补偿存储）用缺省
+/// `RunCtx<Value>`；typed 工作流的 step 闭包拿到的 `sc.ctx.input` 是 `I`
+/// 本身（[`BaseCtx::step`] 在擦除边界重建，见其文档）。
 #[derive(Clone)]
-pub struct RunCtx {
+pub struct RunCtx<I = serde_json::Value> {
     pub(crate) engine: Arc<EngineRuntime>,
+    /// Run 级 frozen input（与 handler 入口的 `ctx.input` 同值同型）。
+    pub input: I,
 }
 
-impl RunCtx {
+impl<I> RunCtx<I> {
     pub fn run_id(&self) -> &str {
         &self.engine.run_id
-    }
-    pub fn input(&self) -> &serde_json::Value {
-        &self.engine.input
     }
     /// Run 级参数（`RunWorkflowOptions.meta` 的擦除值）。类型化读取在
     /// handler 侧（`ctx.meta.<ns>()`，TMeta 泛型）；step 闭包读擦除值，
@@ -115,13 +119,16 @@ impl RunCtx {
 
 /// `signal` exposed as a cooperative [`RunCtx::is_cancelled`] poll (via
 /// `sc.ctx`).
+///
+/// `I` = 工作流 input 的精确类型（透传给 `ctx` 的 [`RunCtx`]）；擦除面
+/// （引擎内部 / 补偿存储）用缺省 `StepCtx<Value>`。
 #[derive(Clone)]
-pub struct StepCtx {
-    /// Run 级视图（run_id / input / meta / ext / emit / is_cancelled）——
-    /// middleware 侧 `sc.ctx` 同名同位（那边是完整 `WorkflowCtx`，编排者
-    /// 全能力；这边是只读视图 [`RunCtx`]：**无 durable 原语**，嵌套 step
-    /// 在 step 闭包内类型不可表达，闸门保持）。
-    pub ctx: RunCtx,
+pub struct StepCtx<I = serde_json::Value> {
+    /// Run 级视图（run_id / **typed input** / meta / ext / emit /
+    /// is_cancelled）——middleware 侧 `sc.ctx` 同名同位（那边是完整
+    /// `WorkflowCtx`，编排者全能力；这边是只读视图 [`RunCtx`]：**无
+    /// durable 原语**，嵌套 step 在 step 闭包内类型不可表达，闸门保持）。
+    pub ctx: RunCtx<I>,
     /// Deterministic step ID. Stable across retries *and* replays of the same
     /// run — the idempotency-key candidate for external systems (`id`).
     pub id: String,
@@ -129,7 +136,7 @@ pub struct StepCtx {
     pub attempt: usize,
 }
 
-impl StepCtx {
+impl<I> StepCtx<I> {
     /// Whether this run was cancelled via [`cancel_run`](crate::engine::cancel_run).
     /// Cooperative poll counterpart to TanStack's per-attempt `signal` — Rust
     /// cannot interrupt an in-flight future, so long steps must self-check on
@@ -276,13 +283,16 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
     pub fn compensate(
         &self,
         id: impl Into<String>,
-        undo: impl Fn(StepCtx) -> std::pin::Pin<
+        undo: impl Fn(StepCtx<TInput>) -> std::pin::Pin<
                 Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>,
             > + Send
             + Sync
             + 'static,
         retry: RetryPolicy,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        TInput: Clone + Send + Sync + 'static,
+    {
         let id = id.into();
         if id.starts_with("__compensation:") || id.starts_with("__retry:") {
             return Err(anyhow::anyhow!(
@@ -301,9 +311,24 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
             if list.iter().any(|c| c.id == id) {
                 return Err(anyhow::anyhow!("Duplicate compensation id \"{id}\"."));
             }
+            // 擦除边界：补偿存储不知道工作流的 typed input——包装一层，执行时
+            // 用**登记时的 typed 快照**重建 `StepCtx<TInput>`（input 跨 run
+            // 不可变 = ADR 0022，快照即真相）。引擎侧只见擦除 `StepCtx<Value>`。
+            let input = self.input.clone();
+            let undo_erased = std::sync::Arc::new(move |sc: StepCtx| {
+                let sc = StepCtx {
+                    ctx: crate::define::RunCtx {
+                        engine: sc.ctx.engine,
+                        input: input.clone(),
+                    },
+                    id: sc.id,
+                    attempt: sc.attempt,
+                };
+                undo(sc)
+            });
             list.push(crate::engine::Compensation {
                 id: id.clone(),
-                undo: std::sync::Arc::new(undo),
+                undo: undo_erased,
                 retry,
             });
         }
@@ -316,7 +341,10 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
     pub async fn step<T, F, Fut>(&self, step_id: &str, run: F) -> anyhow::Result<T>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
-        F: FnOnce(StepCtx) -> Fut + Clone + Send + 'static,
+        // TInput: step 闭包的 `sc.ctx.input` 是**精确类型**（run 级事实不擦除
+        // ——`RunCtx<I>`）。Clone：每个 attempt 各持一份快照。
+        TInput: Clone + Send + Sync + 'static,
+        F: FnOnce(StepCtx<TInput>) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = anyhow::Result<T>> + Send + 'static,
         TState: serde::Serialize,
     {
@@ -551,12 +579,15 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
     ) -> anyhow::Result<T>
     where
         T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
-        F: FnOnce(StepCtx) -> Fut + Clone + Send + 'static,
+        TInput: Clone + Send + Sync + 'static,
+        F: FnOnce(StepCtx<TInput>) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = anyhow::Result<T>> + Send + 'static,
         TState: serde::Serialize,
     {
         self.flush_state()?;
-        crate::engine::exec_step(&self.engine, step_id, &opts, run).await
+        // typed input 在这里交给引擎：`sc.ctx.input` 是精确类型（run 级视图
+        // 不擦除 input），擦除只发生在更深的补偿存储（见 `compensate`）。
+        crate::engine::exec_step(&self.engine, step_id, &opts, self.input.clone(), run).await
     }
 }
 

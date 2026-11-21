@@ -260,7 +260,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[derive(serde::Deserialize, serde::Serialize, Debug, PartialEq)]
+    #[derive(serde::Deserialize, Clone, serde::Serialize, Debug, PartialEq)]
     pub struct DagPlan {
         goals: Vec<String>,
     }

@@ -33,7 +33,7 @@ use aa_workflow_runtime::{InMemoryExecutionStore, WorkflowRuntimeRunResultKind, 
 // （`.input::<TInput>()`），handler 的 `ctx.input` 直接是强类型字段访问。
 
 /// 对齐 guide 的 `FulfillmentInput { orderId, delayMs }`。
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(serde::Deserialize, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FulfillmentInput {
     pub order_id: String,
@@ -59,7 +59,7 @@ pub fn fulfillment_workflow() -> WorkflowDefinition<FulfillmentInput, serde_json
             let _reservation = ctx
                 .step(
                     "reserve-inventory",
-                    move |step: aa_workflow_core::StepCtx| async move {
+                    move |step| async move {
                         let order_id = reserve_order_id;
                         // 真实场景这里调库存服务。
                         Ok(serde_json::json!({
@@ -83,7 +83,7 @@ pub fn fulfillment_workflow() -> WorkflowDefinition<FulfillmentInput, serde_json
                 .unwrap_or_default()
                 .to_string();
 
-            ctx.step("ship-order", move |step: aa_workflow_core::StepCtx| {
+            ctx.step("ship-order", move |step| {
                 let order_id = ship_order_id.clone();
                 async move {
                     Ok(serde_json::json!({

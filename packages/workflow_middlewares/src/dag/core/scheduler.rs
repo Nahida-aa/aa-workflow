@@ -25,9 +25,9 @@ use super::declare::DagSpec;
 /// 使 diamond 里被多条路径依赖的节点只执行一次 `ctx.step`。
 /// 首个失败会 `abort_all()`，避免孤儿任务继续写 checkpoint。
 ///
-/// 泛型约束的来历：ctx 要 clone 进每个节点任务（`Clone + Send + Sync`）；
-/// `I` 直通给节点闭包（[`DagRunFn`](super::declare::DagRunFn) 收精确类型，
-/// 不过 JSON）——typed 工作流（如 dub 的 `DubSfOcrInput`）与 Value 工作流
+/// 泛型约束的来历：ctx 要 clone 进每个节点任务（`Clone + Send + Sync`）。
+/// 节点闭包经 `sc.ctx.input` 拿 **typed** run input（`RunCtx<I>`，run 级
+/// 视图不擦除）——typed 工作流（如 dub 的 `DubSfOcrInput`）与 Value 工作流
 /// 都满足。`S: Serialize` 是 `BaseCtx::step` 序列化 state 的既有要求。
 pub async fn run_dag<I, S>(ctx: &BaseCtx<I, S>, spec: &DagSpec<I>) -> Result<BTreeMap<String, Value>>
 where
@@ -40,7 +40,6 @@ where
         .map(|id| (id.clone(), Arc::new(OnceCell::new())))
         .collect();
     let ctx = ctx.clone();
-    let input = ctx.input.clone();
 
     let mut set = JoinSet::new();
     for id in spec.nodes.keys() {
@@ -48,9 +47,8 @@ where
         let spec = spec.clone();
         let cells = cells.clone();
         let ctx = ctx.clone();
-        let input = input.clone();
         set.spawn(async move {
-            let value = ensure(&id, &spec, &cells, &ctx, &input).await?;
+            let value = ensure(&id, &spec, &cells, &ctx).await?;
             Ok::<_, anyhow::Error>((id, value))
         });
     }
@@ -80,7 +78,6 @@ fn ensure<'a, I, S>(
     spec: &'a DagSpec<I>,
     cells: &'a BTreeMap<String, Arc<OnceCell<Value>>>,
     ctx: &'a BaseCtx<I, S>,
-    input: &'a I,
 ) -> BoxFuture<'a, Result<Value>>
 where
     I: Clone + Send + Sync + 'static,
@@ -97,17 +94,15 @@ where
                 .ok_or_else(|| anyhow!("unknown dag node: {id}"))?;
             let mut deps = BTreeMap::new();
             for dep in &node.deps {
-                let value = ensure(dep, spec, cells, ctx, input).await?;
+                let value = ensure(dep, spec, cells, ctx).await?;
                 deps.insert(dep.clone(), value);
             }
             let run = node.run.clone();
-            let input = input.clone();
             let step_id = id.to_string();
-            ctx.step(&step_id, move |_sc: StepCtx| {
+            ctx.step(&step_id, move |sc: StepCtx<I>| {
                 let run = run.clone();
                 let deps = deps.clone();
-                let input = input.clone();
-                async move { run(deps, input).await }
+                async move { run(sc, deps).await }
             })
             .await
         })

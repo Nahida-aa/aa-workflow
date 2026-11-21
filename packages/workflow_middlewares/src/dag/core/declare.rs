@@ -17,16 +17,21 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 
-use aa_workflow_core::define::BoxFuture;
+use aa_workflow_core::define::{BoxFuture, StepCtx};
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 
 use super::DagShape;
 
-/// 节点执行体：收到「直接依赖的结果（键 = 节点 id，JSON）」与 **typed run
-/// input**，返回 JSON 结果（进 checkpoint）。
+/// 节点执行体：收到 step 上下文（[`StepCtx`]——`sc.ctx.input` 是 **typed**
+/// run input：input 是 run 级事实，run 级视图不擦除；`sc.ctx` 同时给出
+/// emit / is_cancelled / attempt / 预算探针）与直接依赖的结果（键 = 节点
+/// id，JSON），返回 JSON 结果（进 checkpoint）。
+///
+/// input **没有参数**——经 `sc.ctx.input` 读；deps 仍是 `Value`（异构上游
+/// 产物 + 耐久边界的公共形状，理由见模块文档）。
 pub type DagRunFn<I> = Arc<
-    dyn Fn(BTreeMap<String, Value>, I) -> BoxFuture<'static, Result<Value>> + Send + Sync,
+    dyn Fn(StepCtx<I>, BTreeMap<String, Value>) -> BoxFuture<'static, Result<Value>> + Send + Sync,
 >;
 
 /// 一个 DAG 节点：直接依赖列表 + 执行体。
@@ -41,12 +46,12 @@ impl<I: Clone + Send + Sync + 'static> DagNode<I> {
     where
         D: IntoIterator<Item = S>,
         S: Into<String>,
-        F: Fn(BTreeMap<String, Value>, I) -> Fut + Send + Sync + 'static,
+        F: Fn(StepCtx<I>, BTreeMap<String, Value>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Value>> + Send + 'static,
     {
         Self {
             deps: deps.into_iter().map(Into::into).collect(),
-            run: Arc::new(move |deps, input| Box::pin(run(deps, input))),
+            run: Arc::new(move |sc, deps| Box::pin(run(sc, deps))),
         }
     }
 }
@@ -71,7 +76,7 @@ impl<I: Clone + Send + Sync + 'static> DagSpec<I> {
     where
         D: IntoIterator<Item = S>,
         S: Into<String>,
-        F: Fn(BTreeMap<String, Value>, I) -> Fut + Send + Sync + 'static,
+        F: Fn(StepCtx<I>, BTreeMap<String, Value>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Value>> + Send + 'static,
     {
         self.nodes.insert(id.into(), DagNode::new(deps, run));
