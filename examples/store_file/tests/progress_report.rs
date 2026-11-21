@@ -6,7 +6,7 @@
 //!
 //! | 事件 | publisher 看到 | 事件日志里有 |
 //! | --- | --- | --- |
-//! | `STEP_PROGRESS` × N | ✅ | ❌ |
+//! | `CUSTOM`(name="progress") × N | ✅ | ❌ |
 //! | `STEP_FINISHED` | ✅ | ✅ |
 //!
 //! 差在 `StepProgress` 的定义上——`/// Observability only (not persisted)`，
@@ -67,7 +67,9 @@ fn progress_values(events: &[WorkflowEvent]) -> Vec<f64> {
     events
         .iter()
         .filter_map(|e| match e {
-            WorkflowEvent::StepProgress { step_id, value, .. } if step_id == "slow" => Some(*value),
+            WorkflowEvent::Custom { name, value, .. } if name == "progress" => {
+                value.get("ratio").and_then(|v| v.as_f64())
+            }
             _ => None,
         })
         .collect()
@@ -93,8 +95,8 @@ async fn publisher_receives_incremental_progress() {
     let types: Vec<&str> = seen.iter().map(|e| e.type_name()).collect();
     let started = types.iter().position(|t| *t == "STEP_STARTED").expect("有 Started");
     let finished = types.iter().position(|t| *t == "STEP_FINISHED").expect("有 Finished");
-    let first_p = types.iter().position(|t| *t == "STEP_PROGRESS").expect("有 Progress");
-    let last_p = types.iter().rposition(|t| *t == "STEP_PROGRESS").expect("有 Progress");
+    let first_p = types.iter().position(|t| *t == "CUSTOM").expect("有 CUSTOM(progress)");
+    let last_p = types.iter().rposition(|t| *t == "CUSTOM").expect("有 CUSTOM(progress)");
     assert!(
         started < first_p && last_p < finished,
         "progress 应夹在 Started({started}) 与 Finished({finished}) 之间，实际序列 {types:?}"

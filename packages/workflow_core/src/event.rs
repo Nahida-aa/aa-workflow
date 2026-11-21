@@ -223,13 +223,6 @@ pub enum WorkflowEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         meta: Option<serde_json::Value>,
     },
-    /// Observability only (not persisted): 0.0..=1.0 progress signal.
-    StepProgress {
-        ts: i64,
-        run_id: String,
-        step_id: String,
-        value: f64,
-    },
     /// Observability only (not persisted): `ctx.emit` fan-out. Reaches only
     /// the publisher, never the log — so it never becomes part of replay
     /// (mirrors TanStack's `CUSTOM` event).
@@ -351,7 +344,6 @@ impl WorkflowEvent {
             | WorkflowEvent::ApprovalRequested { step_id, .. }
             | WorkflowEvent::SignalResolved { step_id, .. }
             | WorkflowEvent::ApprovalResolved { step_id, .. }
-            | WorkflowEvent::StepProgress { step_id, .. }
             | WorkflowEvent::NowRecorded { step_id, .. }
             | WorkflowEvent::UuidRecorded { step_id, .. } => Some(step_id),
         }
@@ -370,7 +362,6 @@ impl WorkflowEvent {
             | WorkflowEvent::ApprovalRequested { ts, .. }
             | WorkflowEvent::SignalResolved { ts, .. }
             | WorkflowEvent::ApprovalResolved { ts, .. }
-            | WorkflowEvent::StepProgress { ts, .. }
             | WorkflowEvent::Custom { ts, .. }
             | WorkflowEvent::NowRecorded { ts, .. }
             | WorkflowEvent::UuidRecorded { ts, .. }
@@ -397,7 +388,6 @@ impl WorkflowEvent {
             WorkflowEvent::ApprovalRequested { .. } => "APPROVAL_REQUESTED",
             WorkflowEvent::SignalResolved { .. } => "SIGNAL_RESOLVED",
             WorkflowEvent::ApprovalResolved { .. } => "APPROVAL_RESOLVED",
-            WorkflowEvent::StepProgress { .. } => "STEP_PROGRESS",
             WorkflowEvent::Custom { .. } => "CUSTOM",
             WorkflowEvent::NowRecorded { .. } => "NOW_RECORDED",
             WorkflowEvent::UuidRecorded { .. } => "UUID_RECORDED",

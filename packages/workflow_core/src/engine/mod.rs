@@ -660,14 +660,6 @@ impl EngineRuntime {
         }
     }
 
-    pub fn publish_progress(&self, step_id: &str, value: f64) {
-        self.publish(&WorkflowEvent::StepProgress {
-            ts: now_ms(),
-            run_id: self.run_id.clone(),
-            step_id: step_id.to_string(),
-            value,
-        });
-    }
 
     /// 本 drive 内**已成功**的 step 快照（`history` + `appended`）。
     ///
@@ -2243,7 +2235,7 @@ mod tests {
         let sink = events.clone();
         let wf = WorkflowDefinition::new("w").handler(|ctx: WorkflowCtx| async move {
             ctx.step("a", move |sc: StepCtx| async move {
-                sc.progress(0.5);
+                sc.emit("progress", serde_json::json!(0.5));
                 Ok(serde_json::Value::Null)
             })
             .await
@@ -2264,7 +2256,8 @@ mod tests {
         let evs = events.lock().unwrap();
         assert!(
             evs.iter()
-                .any(|e| matches!(e, WorkflowEvent::StepProgress { value: 0.5, .. }))
+                .any(|e| matches!(e, WorkflowEvent::Custom { name, value, .. }
+                    if name == "progress" && *value == serde_json::json!(0.5)))
         );
         assert!(
             evs.iter()
@@ -2286,7 +2279,7 @@ mod tests {
         while let Ok(e) = rx.try_recv() {
             match e {
                 WorkflowEvent::StepFinished { .. } => saw_finish = true,
-                WorkflowEvent::StepProgress { .. } | WorkflowEvent::StepStarted { .. } => {
+                WorkflowEvent::Custom { .. } | WorkflowEvent::StepStarted { .. } => {
                     saw_shared = true
                 }
                 _ => {}

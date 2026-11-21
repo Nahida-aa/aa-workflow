@@ -33,7 +33,7 @@
 
 - 序列化**字段名是 snake_case**：`rename_all` 只作用于类型 tag。本仓不做 TS 互操作，
   按 Rust 实践；代价是逐字段对照上游时键名对不上（`signal_id` vs `signalId`）。
-- 保留本仓独有事件：`StepProgress`、`CompensationCompleted` / `CompensationFailed`
+- 保留本仓独有事件：`StepProgress`（**2026-11-21 后移除**——观测统一走 `Custom`，见 ADR 0021 修订与 F 表）、`CompensationCompleted` / `CompensationFailed`
   （可观测功能，删除是净损失）。
 
 ## 后果

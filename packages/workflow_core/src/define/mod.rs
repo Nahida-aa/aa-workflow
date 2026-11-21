@@ -61,8 +61,19 @@ impl StepCtx {
     pub fn input(&self) -> &serde_json::Value {
         &self.engine.input
     }
-    pub fn progress(&self, value: f64) {
-        self.engine.publish_progress(&self.id, value);
+    /// Emit an observability event (`CUSTOM`) from inside a step attempt.
+    /// Never appended to the log — outside replay. The step-level channel for
+    /// arbitrary activity reporting（agent loop 的「干到哪了」、分轮比例、
+    /// 状态文本——形状由使用者定；引擎不理解也不落盘）。
+    /// **不是耐久机制**：resume 后闭包被跳过，中途报的进度不会恢复——
+    /// 要耐久请拆 step（见 `docs/concepts/ctx-state.md` 三通道表）。
+    pub fn emit(&self, name: impl AsRef<str>, value: serde_json::Value) {
+        self.engine.publish(&WorkflowEvent::Custom {
+            ts: crate::engine::now_ms(),
+            run_id: self.engine.run_id.clone(),
+            name: name.as_ref().to_string(),
+            value,
+        });
     }
     /// Whether this run was cancelled via [`cancel_run`](crate::engine::cancel_run).
     /// Cooperative poll counterpart to TanStack's per-attempt `signal` — Rust

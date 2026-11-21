@@ -183,8 +183,10 @@ where
     ///
     /// ```ignore
     /// .publish(Some(Arc::new(move |run_id: &str, e: WorkflowEvent| {
-    ///     if let WorkflowEvent::StepProgress { step_id, value, .. } = e {
-    ///         my_db.insert_progress(run_id, step_id, *value);
+    ///     if let WorkflowEvent::Custom { name, value, .. } = e {
+    ///         if name == "progress" {
+    ///             my_db.insert_progress(run_id, value.clone());
+    ///         }
     ///     }
     /// })))
     /// ```

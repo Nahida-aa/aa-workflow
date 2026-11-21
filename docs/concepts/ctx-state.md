@@ -165,12 +165,12 @@ step 闭包**不是**严格意义上的纯函数 —— 上游自己的例子就
 2. **就算有 flush 点也写不进去。** 闭包拿到的是 `ctx` 的引用（TS）或克隆的
    `StateHandle`（Rust），改不到 driver 那份 —— 就是本文前面讲的那件事。
 
-所以「step 内进度」有个专门的第三条通道：`StepCtx::progress(f64)`
-（`engine/mod.rs:60`），发 `WorkflowEvent::StepProgress`。它和上面两个都不同：
+所以「step 内进度」有个专门的第三条通道：`StepCtx::emit(name, value)`
+（发 `WorkflowEvent::Custom`，emit-only）。它和上面两个都不同：
 
 | | 即时 | 耐久 |
 | --- | --- | --- |
-| `StepCtx::progress` | ✅ | ❌ |
+| `StepCtx::emit`（如 name="progress"） | ✅ | ❌ |
 | step 内写 `ctx.state` | ❌ | ❌ |
 | 把子阶段拆成独立 step | ✅ | ✅ |
 

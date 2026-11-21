@@ -96,7 +96,7 @@ grep 日志、对照 TS 源码读事件序列时是直接对应的。
 
 - `ApprovalResolved` **不带 `payload`**——与上游一致：审批是结构化决定
   （`approved` + `feedback`），任意 payload 只属于 `SignalResolved`。
-- `StepProgress`（可观测进度）、`CompensationCompleted` / `CompensationFailed`
+- ~~`StepProgress`~~（可观测进度，**已移除**——观测统一走 `Custom`）、`CompensationCompleted` / `CompensationFailed`
   （补偿结果）是本仓独有事件，上游无对应物，保留并在本表标注。
 - 序列化的**字段名是 snake_case**：`WorkflowEvent` 的 `rename_all` 只作用于
   类型 tag（`#[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]`）。
@@ -133,7 +133,7 @@ sleep 的保留信号名。
 
 事件分两层：
 
-- **observability-only（不进日志，走 publisher）**：`RunStarted`、`StepStarted`、`StepProgress`；
+- **observability-only（不进日志，走 publisher）**：`RunStarted`、`StepStarted`、`Custom`；
 - **checkpoint（进日志，CAS append）**：`StepFinished`、`StepFailed`、`RunFinished`、`RunErrored`。
 
 「进日志」不等于「持久化」：日志怎么存由 [`RunStore`](packages/workflow_core/src/run_store/mod.rs)
@@ -191,7 +191,7 @@ sleep 的保留信号名。
    `rg "progress" packages/workflow-core/src/` 零命中。上游表达这件事的唯一
    方式是通用的 `ctx.emit(name, value)`，而 `primitives.md:118` 里
    `ctx.emit('progress', { step: 3, of: 10 })` 只是给 `emit` 起的**举例名字**，
-   不是专用原语。我们把它做成了独立事件变体 `WorkflowEvent::StepProgress`
+   不是专用原语。我们曾把它做成独立事件变体 `WorkflowEvent::StepProgress`（已移除——观测统一走 `ctx.emit` / `CUSTOM`）
    （带 `step_id`、值域收成 `0.0..=1.0`），好处是消费方不必按 name 过滤。
    **不持久化这一点两边一致**，且上游写得更明确（`primitives.md:113`）：
    "non-durable observability event… **Don't use for** anything the engine
@@ -226,7 +226,7 @@ sleep 的保留信号名。
 | ~~`signal_run` / `signal_event`~~ → `deliver_signal` / `deliver_approval` | 上游已补投递面：store 契约 `deliverSignal`（四态）+ `RunWorkflowOptions.signalDelivery`/`approval`（`appendSeed` 在 drive 内落账，`run-workflow.ts:50/:409`） | 本仓同形态（2026-11 对齐；三函数合并为二，见 `docs/decisions/0004-signal-inbox.md`） |
 | `select_workflow_version` + `previous_versions` + `WorkflowVersionMismatch` | = **0** | **正确性保护**，非便利功能（见下） |
 | `StepState` + `fold_step_states` | `StepState` = **0 文件** | 事件折叠成 per-step 状态投影；上游有 `StepAttempt` 但无 `StepState` |
-| `StepProgress` + `StepCtx::progress` | = **0** | 见上节 6 |
+| ~~`StepProgress` + `StepCtx::progress`~~ → `StepCtx::emit`（`CUSTOM`） | `emit`/`CUSTOM` = 上游同款 | **已移除专用事件**——观测统一走 `CUSTOM` 一元出口（对齐上游 `ctx.emit`） |
 | `run_workflow_sync` | = **0** | 阻塞入口；上游纯 async |
 
 `select_workflow_version` 值得单独强调：它**不是便利功能**。版本化 run 的 handler

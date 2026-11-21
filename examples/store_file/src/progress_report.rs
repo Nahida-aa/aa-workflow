@@ -45,7 +45,8 @@
 //!
 //! 所以本示例刻意把两件事并排放：
 //!
-//! - `slow` step 循环 5 次调 `sc.progress(..)` —— 观察者实时收到 5 条 `STEP_PROGRESS`
+//! - `slow` step 循环 5 次调 `sc.emit("progress", ..)` —— 观察者实时收到 5 条
+//!   `CUSTOM`（name == "progress"）
 //! - `phase` step 不调 —— 它的状态变化只能等 `STEP_FINISHED`
 //!
 //! `tests/progress_report.rs` 断言的重点是那条**对比**：publisher 看到了 5 条
@@ -119,8 +120,11 @@ pub fn progress_report() -> WorkflowDefinition<ProgressInput, serde_json::Value,
                     let mut reported = 0u32;
                     for i in 1..=rounds {
                         tokio::time::sleep(tick).await;
-                        // 0.0..=1.0。观察者立刻收到，引擎不落盘。
-                        sc.progress(i as f64 / rounds as f64);
+                        // 观察者立刻收到，引擎不落盘（emit-only）。
+                        sc.emit(
+                            "progress",
+                            serde_json::json!({ "stepId": sc.id, "ratio": i as f64 / rounds as f64 }),
+                        );
                         reported += 1;
                     }
                     Ok(SlowOutcome { rounds, reported })
