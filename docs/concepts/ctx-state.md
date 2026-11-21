@@ -488,6 +488,30 @@ ctx.state.via_body = v;        // 体内写，会被重跑 → 副作用重新�
 上游的 smoke 测试额外加了一个空 step 造边界（`engine.smoke.test.ts:44-46`）——
 若删掉那个 `noop` step，尾段 flush 仍能发出 delta，但上游选择显式制造边界。
 
+## 手写形态的累积模式（agent loop）
+
+动态控制流（下一步取决于上一步结果）写在手写 handler 里——上游的规范示例是
+`examples.kyle-durable-agent.test.ts`（虚拟 FS 跨迭代累积）。三件套：
+
+1. **循环计数器不进 state** —— `for (let i = 0; …)` 是 handler 的局部变量。
+   resume 时 handler 重跑循环：已完成的步**短路**（廉价返回日志结果，不调模型），
+   循环变量从重放的返回值重新推导，自然推进到第一个未 checkpoint 的 step。
+   **迭代位置就是重放位置本身**——不需要持久化任何推进量；
+2. **每步返回增量** —— step 的返回值进 checkpoint（耐久），这是步间的数据通道；
+3. **handler body 步间写 state** —— 累积（虚拟 FS、进度）在步间写入：resume 时
+   handler body 重跑、写入按序重放；`STATE_DELTA` 自动发（攒到边界），观测面
+   自动跟上。
+
+后续步骤读到新 state 有两条路径：**调用点快照捕获**（`let fs =
+(*ctx.state).clone();` 再 `move` 进闭包），或 **`sc.ctx.state`**——`step_with`
+入口**先 flush 再拍快照**，每个 attempt 的快照必然包含此前所有 handler body
+写入。两者重放确定性等价；`sc.ctx.state` 是 typed 值快照（无回流通道——改它
+只改本地副本），写教义由此机制化执行。
+
+对照：**DAG 形态下 state 是 run 常量**（生成的 handler 无写入者，state ≡
+`initialize` 产物，日志零 `STATE_DELTA`）。两种形态的写权限差别由「谁会重放」
+决定；读语义统一——`sc.ctx.state` 都是 run 级镜像快照。
+
 ## 可执行验证
 
 `examples/store_file/tests/step_write.rs`（7 个测试）：

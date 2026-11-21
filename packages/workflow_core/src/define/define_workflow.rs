@@ -19,7 +19,14 @@ use crate::middleware::{AnyMiddleware, Append, Middleware, MiddlewareServer, Mid
 
 /// The declaration config consumed by [`create_workflow`]. Mirrors TanStack's
 /// `createWorkflow(options)`; only `id` is required (`initialize` defaults to
-/// `{}`). `input`/`state`/`output` re-type the config and install the matching
+/// `{}`).
+///
+/// `TState` 缺省 `serde_json::Value`——对齐上游无 schema 时的
+/// `Record<string, unknown>`：未声明 state 的工作流仍有**动态** state 可用
+/// （handler 可把 `ctx.state` 当 JSON bag 读写）。要表达「无 state」就显式
+/// `.state::<()>()` + `.initialize(|_| Ok(()))`（unit 序列化为 null，形状
+/// 校验通过）。缺省不能改成 `()`：默认 `initialize` 产 `{}`，而 unit 只吃
+/// null——未声明工作流会在 seed 时反序列化失败。 `input`/`state`/`output` re-type the config and install the matching
 /// serde shape-checks (zod `.safeParse` counterparts); `version` is the string
 /// this workflow's runs persist for version routing; `default_step_retry` is
 /// the step retry fallback; `description` is metadata.
