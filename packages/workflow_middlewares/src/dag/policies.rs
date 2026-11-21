@@ -116,13 +116,12 @@ pub struct DagPoliciesMw {
 }
 
 impl MiddlewareServer for DagPoliciesMw {
-    async fn call(&self, args: MiddlewareServerFnArgs) -> Result<Value> {
-        let mut sc = args;
+    async fn call(&self, mut args: MiddlewareServerFnArgs) -> Result<Value> {
 
         // 前置：解析 RunWorkflowOptions.meta 里的 DagPlan → PlanState。
         // 缺失 = 本次 run 不做任何策略（与另两个中间件一致）。
-        let Some(plan) = sc.ctx.meta.try_get::<DagPlanKey>() else {
-            return sc.next(None).await;
+        let Some(plan) = args.ctx.meta.try_get::<DagPlanKey>() else {
+            return args.next(None).await;
         };
 
         let mut st = PlanState {
@@ -162,13 +161,13 @@ impl MiddlewareServer for DagPoliciesMw {
 
         // 无任何策略 → 不装拦截器，纯透传。
         if st.goals.is_empty() && st.lookup.is_empty() {
-            return sc.next(None).await;
+            return args.next(None).await;
         }
 
         // 计划是不变的，直接按值捕获；无锁、无状态。
         let plan = Arc::new(st);
 
-        sc.wrap_step(step_layer(move |req: &StepRequest| {
+        args.wrap_step(step_layer(move |req: &StepRequest| {
             // ① 临时目标：入口判定——此前所有 step 完成后 goals 已全齐
             //    则泊车。当前 step 尚未执行，所以 `completed` 不含它。
             if !plan.goals.is_empty() && plan.goals.iter().all(|g| req.completed.contains(g)) {
@@ -190,6 +189,6 @@ impl MiddlewareServer for DagPoliciesMw {
             Decision::Pass
         }));
 
-        sc.next(None).await
+        args.next(None).await
     }
 }

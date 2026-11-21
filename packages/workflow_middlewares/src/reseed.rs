@@ -112,17 +112,16 @@ pub struct ReseedMw {
 }
 
 impl MiddlewareServer for ReseedMw {
-    async fn call(&self, args: MiddlewareServerFnArgs) -> Result<Value> {
-        let mut sc = args;
+    async fn call(&self, mut args: MiddlewareServerFnArgs) -> Result<Value> {
 
         // 计划只在 meta 里；缺失 = 本次 run 不做播种。
-        let Some(plan) = sc.ctx.meta.try_get::<ReseedKey>() else {
-            return sc.next(None).await;
+        let Some(plan) = args.ctx.meta.try_get::<ReseedKey>() else {
+            return args.next(None).await;
         };
         let redo: std::collections::HashSet<String> = plan.redo_set.iter().cloned().collect();
 
         // 本 run 就是源 run？不做任何事（禁止自我播种）。
-        if plan.source_run_id != sc.ctx.run_id {
+        if plan.source_run_id != args.ctx.run_id {
             // **drive 开始时加载一次**，而不是在包装层里懒加载 + 缓存：
             // `load_results` 是同步函数，放在这里不会阻塞；省掉可变状态后
             // 层就是纯的（只读 plan）。
@@ -131,7 +130,7 @@ impl MiddlewareServer for ReseedMw {
             // （与引擎版「导入 0 条」同义）。
             let lookup = Arc::new((self.load_results)(&plan.source_run_id).unwrap_or_default());
 
-            sc.wrap_step(step_layer({
+            args.wrap_step(step_layer({
                 let redo = redo.clone();
                 let lookup = lookup.clone();
                 let source_run_id = plan.source_run_id.clone();
@@ -156,7 +155,7 @@ impl MiddlewareServer for ReseedMw {
             }));
         }
 
-        sc.next(None).await
+        args.next(None).await
     }
 }
 

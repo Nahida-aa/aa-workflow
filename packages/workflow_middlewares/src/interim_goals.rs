@@ -94,18 +94,17 @@ pub struct InterimGoalsMw {
 }
 
 impl MiddlewareServer for InterimGoalsMw {
-    async fn call(&self, args: MiddlewareServerFnArgs) -> Result<Value> {
-        let mut sc = args;
+    async fn call(&self, mut args: MiddlewareServerFnArgs) -> Result<Value> {
         // 目标只在 meta 里；缺失 = 本次 drive 不设临时目标。
-        let goals: Vec<String> = match sc.ctx.meta.try_get::<InterimGoalsKey>() {
+        let goals: Vec<String> = match args.ctx.meta.try_get::<InterimGoalsKey>() {
             Some(g) if !g.is_empty() => g,
-            _ => return sc.next(None).await,
+            _ => return args.next(None).await,
         };
 
         // 开局已完成的目标（续驱 / reseed 导入）——不该为它们泊车。
         // `&self.get_events` 直接借字段——server_state/闭包形态里这曾是
         // 「async move 前 clone 一行」的仪式位。
-        let finished_at_start: HashSet<String> = (self.get_events)(&sc.ctx.run_id)?
+        let finished_at_start: HashSet<String> = (self.get_events)(&args.ctx.run_id)?
             .iter()
             .filter_map(|e| match e {
                 aa_workflow_core::event::WorkflowEvent::StepFinished { step_id, .. } => {
@@ -125,7 +124,7 @@ impl MiddlewareServer for InterimGoalsMw {
         //
         // 为什么不用 `parked` 标记：泊车会整条 drive 结束
         // （`WorkflowParked`），不可能在同一 drive 内触发第二次。
-        sc.wrap_step(step_layer(move |req: &StepRequest| {
+        args.wrap_step(step_layer(move |req: &StepRequest| {
             if goals_done_at_start {
                 return Decision::Pass;
             }
@@ -139,6 +138,6 @@ impl MiddlewareServer for InterimGoalsMw {
             Decision::Pass
         }));
 
-        sc.next(None).await
+        args.next(None).await
     }
 }

@@ -12,7 +12,7 @@
 //! | TS `server` 里做的事 | Rust 对应 |
 //! | --- | --- |
 //! | `next({ context: {...} })` 扩展 ctx | [`MiddlewareServerFnArgs::next`]`(ext)`（一次调用，同构） |
-//! | 在 `next` 前后加行为（计时 / 日志） | `server` 闭包里 `sc.next(..).await` 前后 |
+//! | 在 `next` 前后加行为（计时 / 日志） | `server` 闭包里 `args.next(..).await` 前后 |
 //! | `ctx.step = wrapped` 拦截 step | [`MiddlewareServerFnArgs::wrap_step`]（tower `Layer`，可叠加） |
 //!
 //! 剩下的差异是**语言必然**，不是设计取舍：
