@@ -1,12 +1,13 @@
 //! `dub_sf_ocr` 的 **DAG 策略版**：同一条流水线 + [`dag_policies`] 中间件
-//! （读 `RunWorkflowOptions.meta` 里的 [`DagPlan`](crate::dag::policies::DagPlan)）。
+//! （读 `RunWorkflowOptions.meta` 里的 [`DagPlan`][crate::dag::policies::DagPlan]）。
 //!
 //! # 三个场景（`tests/dub_sf_ocr_dag.rs` 实测）
 //!
 //! 1. **全量首跑**：不传 meta → 中间件透明，10 步全真跑；
 //! 2. **redo（世界变了）**：`DagPlan { source_run_id, from: ["translate"] }`
 //!    ——shape 把 `translate` 的**下游闭包**展开成重跑名单（翻译轴 5 步真跑），
-//!    人声轴 + OCR 链 5 步用源结果复用（`Decision::Skip` 落 checkpoint）；
+//!    人声轴 + OCR 链 5 步用源结果复用（`Decision::SkipImported` 落 checkpoint
+//!    **带 imported_from 溯源**）；
 //! 3. **临时目标**：`DagPlan { goals: ["translate"] }` → goals 全 checkpoint 后
 //!    在 `split_audio` 入口泊车 → `deliver_signal(__interim-goal)` 续驱补齐。
 //!
