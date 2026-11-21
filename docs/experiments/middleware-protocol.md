@@ -172,3 +172,7 @@ dub_sf_ocr_dag 示例初版把 `deliver_signal` 的 resume 失败定性为
   定义 id（`"dub-sf-ocr"`），与上游惯例一致；
 - 教训：定性为 bug 前先查上游——本例查证后从「store bug」变为
   「测试键名不一致 + 注册惯例未成文」（惯例已补进测试与文档）。
+- **告警已落地**（runtime 层，core 无注册键）：`load_workflow` 在注册键 ≠
+  定义 id 时发 stderr 告警（提示 resume 按 run.workflowId 加载将找不到
+  注册）。**容错不拒绝**：首驱照常（mismatched_registration_key_still_drives_start
+  测试钉住）——键一致是惯例不是硬约束，与上游零校验同款。

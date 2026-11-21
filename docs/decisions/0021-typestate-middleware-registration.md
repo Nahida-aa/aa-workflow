@@ -66,6 +66,9 @@ drive 的 server 调用再擦一次（`serve` 返回 `BoxFuture`）。
   需求，低代码场景出现再加」。已知调用点全部迁移为静态链式（含测试里的
   `Vec<Middleware>` 参数改双参数——它们的 N 都是编写时已知的）。逃生门重新
   引入的成本 = 一个 `DynListMw` 栈元素（子洋葱折叠），需求出现时加。
+- **`dag_policies` 的 Skip 升级为 `SkipImported`**（同日，配 dub_sf_ocr_dag
+  示例）：lookup 带源下标，复用的 checkpoint **带 imported_from 溯源**——
+  与引擎版 reseedRun 对齐（此前 Skip 无溯源，复用与真跑在日志上不可辨）。
 - **`server_state` 移除**（同日二次修订）：用户裁决——中间件**提前定义**，
   **使用点代码应尽可能短**才是常态；axum 式（使用点传闭包/状态）方向反了。
   带状态中间件的规范形态 = struct + `impl MiddlewareServer`（状态即字段，

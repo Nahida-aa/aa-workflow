@@ -481,6 +481,16 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
             .get(workflow_id)
             .ok_or_else(|| anyhow::anyhow!("WorkflowDefinition \"{workflow_id}\" is not registered."))?;
         let loaded = (registration.load)();
+        // 注册键与定义自身 id 不一致时告警：首次 drive 后 run 记录的
+        // `workflowId` 会被 RunState 覆写为**定义 id**（core 不知道注册键），
+        // resume（deliver_signal / sweep 按 run.workflowId 加载）将找不到注册。
+        // 惯例是两者写同一字符串（上游同款——run-workflow.ts:300 用定义 id）。
+        if workflow_id.as_str() != loaded.id {
+            eprintln!(
+                "[aa_workflow_runtime] WARN: 注册键 `{workflow_id}` 与定义 id `{}` 不一致——resume 按 run.workflowId（= 定义 id）加载将找不到注册；请统一两者",
+                loaded.id
+            );
+        }
         let mut prevs = loaded.previous_versions.clone();
         for load_previous in registration.previous_versions.values() {
             prevs.push((load_previous)());

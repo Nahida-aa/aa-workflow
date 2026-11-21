@@ -193,3 +193,49 @@ fn temp_base(tag: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).expect("建临时目录");
     dir
 }
+
+/// 注册键 ≠ 定义 id：**容错**（load 不拒绝、驱动照常）——但 resume 按
+/// run.workflowId（= 定义 id）加载，注册键不一致会让「先 park 后 deliver」
+/// 这类续驱找不到注册。告警在 load_workflow 发出（stderr）。
+#[tokio::test]
+async fn mismatched_registration_key_still_drives_start() {
+    let base = temp_base("dag-mismatch");
+    let store: Arc<dyn WorkflowExecutionStore> = Arc::new(FileExecutionStore::new(&base));
+    let mut workflows = HashMap::new();
+    // 注册键（下划线）≠ 定义 id（连字符，见 dub_builder 的 config）。
+    workflows.insert(
+        "mismatched_key".to_string(),
+        WorkflowRegistration {
+            load: {
+                let get_events = get_events_of(store.clone());
+                Arc::new(move || {
+                    let get_events = Arc::clone(&get_events);
+                    dub_sf_ocr_dag(get_events).into()
+                })
+            },
+            previous_versions: HashMap::new(),
+            version: None,
+            schedules: vec![],
+        },
+    );
+    let rt = Arc::new(
+        define_workflow_runtime(WorkflowRuntimeConfig::new(store, workflows)).unwrap(),
+    );
+    let out = rt
+        .start_run(WorkflowRuntimeStartRunArgs {
+            workflow_id: "mismatched_key".into(),
+            run_id: "dag:mismatch".into(),
+            input: serde_json::json!({ "videoDir": "/w/1" }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    // 容错：首次驱动照常（键只在 resume 按 run.workflowId 加载时才炸）。
+    assert!(matches!(out.kind, WorkflowRuntimeRunResultKind::Completed));
+}
+
+/// get_events（读日志闭包）从 store 组装的公共提取——避免与上面重复。
+fn get_events_of(store: Arc<dyn WorkflowExecutionStore>) -> Arc<GetEvents> {
+    let adapter = create_run_store_adapter(store);
+    Arc::new(move |run_id: &str| adapter.get_events(run_id).map_err(Into::into))
+}
