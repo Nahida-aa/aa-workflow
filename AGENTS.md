@@ -228,6 +228,16 @@ state **observability**"。
 本仓示例 `dub_sf_ocr`（`examples/store_file/src/dub_sf_ocr.rs`）是正例：两个并行分支
 的 step **只读** state，一处都不写。
 
+## 上下文变量命名（wc / sc）与中间件能力边界
+
+- `wc`：`WorkflowCtx`——handler 级上下文，以及**捕获进 step 闭包 / 中间件的克隆**。
+- `sc`：`StepCtx`（step 闭包参数）/ 中间件 server 的 `MiddlewareServerFnArgs`。
+- step 闭包捕获 workflow ctx 时**一律命名 `wc`**——不写 `ctx2` / `ctx_clone`，避免与 `sc` 歧义。
+- **中间件调用 `ctx.step` 是设计意图之一**（middleware 作为编排者：`take_over` + 自发
+  step，如低代码/声明式场景），**不是要避免的口子**。`StepCtx` 上刻意没有 durable
+  原语才是闸门——嵌套耐久操作在 step 闭包内类型不可表达；中间件作用域不受此限。
+- 中间件方法名是 `call`（对齐 tower；`serve` 已改名，见 ADR 0020/0021 的修订脉络）。
+
 ## 参考实现
 
 - 上游 TS：`learn_ls/workflow/packages/workflow-store-drizzle-postgres`（全量实现 19 个方法，
