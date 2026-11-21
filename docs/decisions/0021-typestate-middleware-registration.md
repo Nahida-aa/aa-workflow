@@ -55,8 +55,10 @@ drive 的 server 调用再擦一次（`serve` 返回 `BoxFuture`）。
      中间件自声明 meta 键的折叠留待后续）。
    静态长列表直接传元组 `.middleware((a, b, c))`（元组即栈），不需要宏；
    真要糖可后加（`middleware![]` 展开成链式）。
-4. **`WorkflowDefinition.handler` 的擦除从 N+1 次降为 1 次**；drive 期
-   箱从 2N 降为 N（pipeline 的结构性 N 保留）。
+4. **drive 期的 future 箱从 2N 降为 N**（RPITIT serve 的 async 体不再
+   装箱；每层链闭包的 body 箱与 pipeline 的 N 保留——后者是 CPS 协议的
+   结构性成本）。定义期的组合 Arc 数不变（N 层闭包 + 1 个 innermost——
+   递归折叠的形状决定；2026-11-21 实现后核账修正，初稿误写为「降为 1」）。
 
 ## 后果
 
