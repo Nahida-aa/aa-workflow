@@ -136,3 +136,21 @@ async fn interim_goals_flat(get_events: Arc<GetEvents>, args: MiddlewareServerFn
 tower）在这个维度上被「状态注入方式」之争取代了：**axum 式的短，本质是
 「参数化状态」的短，与 CPS/tower 的协议选择正交**。我们的 next 协议 +
 `server_state` 已经拿到这份短。
+
+
+## 8. 裁决（同日，用户拍板）：`server_state` 移除——使用点最短原则
+
+§7 的实测推翻了我推荐 server_state 的理由：36 行 vs 54 行的「短」发生在
+**定义点**，而中间件的本命用法是**提前定义、使用点极短**（`.middleware(interim_goals(ge))`
+一行）——定义点可长、使用点必须短。axum 式（使用点传闭包/状态）把定义逻辑
+推到注册处，**方向反了，并不好**。
+
+**裁决**：
+- `server_state` / `StateServer` **移除**；
+- **带状态中间件的规范形态 = struct + `impl MiddlewareServer`**（状态即字段，
+  定义点随便长）；
+- **使用点规范形态 = 构造器函数调用**（`.middleware(interim_goals(ge))`——
+  一行，参数只是配置句柄）；
+- 无状态速写闭包（`.server(f)`）保留。
+
+三分形态表作废，替换为两形态：**struct（带状态，规范）/ 闭包（无状态，速写）**。

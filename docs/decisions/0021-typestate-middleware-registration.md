@@ -66,6 +66,12 @@ drive 的 server 调用再擦一次（`serve` 返回 `BoxFuture`）。
   需求，低代码场景出现再加」。已知调用点全部迁移为静态链式（含测试里的
   `Vec<Middleware>` 参数改双参数——它们的 N 都是编写时已知的）。逃生门重新
   引入的成本 = 一个 `DynListMw` 栈元素（子洋葱折叠），需求出现时加。
+- **`server_state` 移除**（同日二次修订）：用户裁决——中间件**提前定义**，
+  **使用点代码应尽可能短**才是常态；axum 式（使用点传闭包/状态）方向反了。
+  带状态中间件的规范形态 = struct + `impl MiddlewareServer`（状态即字段，
+  定义点可长）+ 构造器函数；使用点 = `.middleware(interim_goals(ge))` 一行。
+  独立 async fn + `server_state` 的「最短定义点」形态被否（见
+  `docs/experiments/middleware-protocol.md` §7/§8）。
 - **RPITIT serve 的 impl 可写 `async fn`**（编译器实测）：`impl MiddlewareServer
   for Mw { async fn serve(&self, args) -> Result<Value> { .. } }`——body 平铺、
   无 `async move` 包裹、无额外缩进（相对 tower `call` 的形状对齐）。两个策略
