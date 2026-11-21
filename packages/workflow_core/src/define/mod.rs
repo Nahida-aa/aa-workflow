@@ -41,32 +41,43 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type WorkflowHandler =
     Arc<dyn Fn(WorkflowCtx) -> BoxFuture<'static, anyhow::Result<serde_json::Value>> + Send + Sync>;
 
-/// Per-invocation view handed step closures. Mirrors TanStack's `StepContext`
-/// member-for-member: `id` / `attempt` / `runtime` helpers, with the per-attempt
-/// `signal` exposed as a cooperative [`is_cancelled`](Self::is_cancelled) poll.
+/// **Run 级只读视图 + 观测出口**——step 闭包经 `sc.ctx.*` 访问（与
+/// middleware 侧 `sc.ctx` 同名同位；那边是完整 `WorkflowCtx`，编排者全能力，
+/// 这边是只读视图：**无 durable 原语**——嵌套 step 在 step 闭包内类型不可
+/// 表达，闸门保持）。
+///
+/// 成员对齐 middleware 侧 `StepRequest` 能拿到的 run 级事实：
+/// `run_id` / `input` / `meta`（run 级参数，擦除值）/ `ext`（middleware
+/// 贡献的扩展）/ `emit`（观测出口，`CUSTOM`）/ `is_cancelled`。
 #[derive(Clone)]
-pub struct StepCtx {
+pub struct RunCtx {
     pub(crate) engine: Arc<EngineRuntime>,
-    /// Deterministic step ID. Stable across retries *and* replays of the same
-    /// run — the idempotency-key candidate for external systems (`id`).
-    pub id: String,
-    /// Current attempt number (1-indexed).
-    pub attempt: usize,
 }
 
-impl StepCtx {
+impl RunCtx {
     pub fn run_id(&self) -> &str {
         &self.engine.run_id
     }
     pub fn input(&self) -> &serde_json::Value {
         &self.engine.input
     }
-    /// Emit an observability event (`CUSTOM`) from inside a step attempt.
-    /// Never appended to the log — outside replay. The step-level channel for
-    /// arbitrary activity reporting（agent loop 的「干到哪了」、分轮比例、
-    /// 状态文本——形状由使用者定；引擎不理解也不落盘）。
-    /// **不是耐久机制**：resume 后闭包被跳过，中途报的进度不会恢复——
-    /// 要耐久请拆 step（见 `docs/concepts/ctx-state.md` 三通道表）。
+    /// Run 级参数（`RunWorkflowOptions.meta` 的擦除值）。类型化读取在
+    /// handler 侧（`ctx.meta.<ns>()`，TMeta 泛型）；step 闭包读擦除值，
+    /// 或经 middleware 的 typed 判定间接生效。
+    pub fn meta(&self) -> Option<&serde_json::Value> {
+        self.engine.meta.as_ref()
+    }
+    /// middleware 贡献的扩展（`next(Some(..))` 合并进 `engine.ext_extra`）。
+    /// 与 handler 入口的 `ctx.ext` 同源（同一份 `ext_extra` 的当前视图）。
+    pub fn ext(&self) -> crate::define::ExtBag {
+        crate::define::ExtBag::from_value(
+            self.engine.ext_extra.lock().expect("ext extra lock").clone(),
+        )
+    }
+    /// Emit an observability event (`CUSTOM`) to the publisher. Never appended
+    /// to the log — outside replay. 进度/活动上报走这里（形状由使用者定，
+    /// 引擎不落盘不解析——**不是耐久机制**：resume 后闭包被跳过，要耐久请拆
+    /// step，见 `docs/concepts/ctx-state.md` 三通道表）。
     pub fn emit(&self, name: impl AsRef<str>, value: serde_json::Value) {
         self.engine.publish(&WorkflowEvent::Custom {
             ts: crate::engine::now_ms(),
@@ -75,10 +86,6 @@ impl StepCtx {
             value,
         });
     }
-    /// Whether this run was cancelled via [`cancel_run`](crate::engine::cancel_run).
-    /// Cooperative poll counterpart to TanStack's per-attempt `signal` — Rust
-    /// cannot interrupt an in-flight future, so long steps must self-check on
-    /// their own cadence (same granularity as `BaseCtx::is_cancelled`).
     pub fn is_cancelled(&self) -> bool {
         self.engine
             .store
@@ -88,8 +95,7 @@ impl StepCtx {
             .map(|st| st.status == crate::event::RunStatus::Aborted)
             .unwrap_or(false)
     }
-    /// Absolute UTC ms runtime budget for this drive (TanStack
-    /// `runtime.deadline`); `None` when unbudgeted.
+    /// 本次 drive 的预算上限（上游 `runtime.deadline`）；未设 = `None`。
     pub fn deadline(&self) -> Option<i64> {
         self.engine.deadline
     }
@@ -101,10 +107,44 @@ impl StepCtx {
         }
     }
     /// True once the budget is nearly exhausted (`time_remaining() <
-    /// min_yield_remaining_ms`); the step should `?` fast or orchestrate
-    /// yielding via `WorkflowCtx::yield_`.
+    /// `min_yield_remaining_ms`).
     pub fn should_yield(&self) -> bool {
         self.time_remaining() < self.engine.min_yield_remaining_ms
+    }
+}
+
+/// `signal` exposed as a cooperative [`RunCtx::is_cancelled`] poll (via
+/// `sc.ctx`).
+#[derive(Clone)]
+pub struct StepCtx {
+    /// Run 级视图（run_id / input / meta / ext / emit / is_cancelled）——
+    /// middleware 侧 `sc.ctx` 同名同位（那边是完整 `WorkflowCtx`，编排者
+    /// 全能力；这边是只读视图 [`RunCtx`]：**无 durable 原语**，嵌套 step
+    /// 在 step 闭包内类型不可表达，闸门保持）。
+    pub ctx: RunCtx,
+    /// Deterministic step ID. Stable across retries *and* replays of the same
+    /// run — the idempotency-key candidate for external systems (`id`).
+    pub id: String,
+    /// Current attempt number (1-indexed).
+    pub attempt: usize,
+}
+
+impl StepCtx {
+    /// Whether this run was cancelled via [`cancel_run`](crate::engine::cancel_run).
+    /// Cooperative poll counterpart to TanStack's per-attempt `signal` — Rust
+    /// cannot interrupt an in-flight future, so long steps must self-check on
+    /// their own cadence (same granularity as `BaseCtx::is_cancelled`).
+    pub fn is_cancelled(&self) -> bool {
+        self.ctx.is_cancelled()
+    }
+    pub fn deadline(&self) -> Option<i64> {
+        self.ctx.deadline()
+    }
+    pub fn time_remaining(&self) -> u64 {
+        self.ctx.time_remaining()
+    }
+    pub fn should_yield(&self) -> bool {
+        self.ctx.should_yield()
     }
 }
 

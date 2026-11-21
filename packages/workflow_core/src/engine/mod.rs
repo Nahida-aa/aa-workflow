@@ -186,7 +186,7 @@ pub(crate) async fn run_compensations(
         let mut attempts = 1usize;
         loop {
             let step_ctx = StepCtx {
-                engine: Arc::clone(engine),
+                ctx: crate::define::RunCtx { engine: Arc::clone(engine) },
                 id: format!("{run_id}:__compensation:{}", comp.id),
                 attempt: attempts,
             };
@@ -1002,7 +1002,7 @@ where
 
     for attempt in (carried.1 + 1)..=max_attempts {
         let step_ctx = StepCtx {
-            engine: engine.clone(),
+            ctx: crate::define::RunCtx { engine: engine.clone() },
             id: step_id.to_string(),
             attempt,
         };
@@ -2235,7 +2235,7 @@ mod tests {
         let sink = events.clone();
         let wf = WorkflowDefinition::new("w").handler(|ctx: WorkflowCtx| async move {
             ctx.step("a", move |sc: StepCtx| async move {
-                sc.emit("progress", serde_json::json!(0.5));
+                sc.ctx.emit("progress", serde_json::json!(0.5));
                 Ok(serde_json::Value::Null)
             })
             .await
@@ -3523,11 +3523,11 @@ mod tests {
                     let sink = sink.clone();
                     async move {
                         *sink.lock().unwrap() = (
-                            Some(sc.deadline()),
-                            sc.time_remaining() < 1000,
-                            sc.should_yield(),
+                            Some(sc.ctx.deadline()),
+                            sc.ctx.time_remaining() < 1000,
+                            sc.ctx.should_yield(),
                         );
-                        Ok(serde_json::json!({ "d": sc.deadline(), "tr": sc.time_remaining() }))
+                        Ok(serde_json::json!({ "d": sc.ctx.deadline(), "tr": sc.ctx.time_remaining() }))
                     }
                 })
                 .await?;

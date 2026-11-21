@@ -45,7 +45,7 @@
 //!
 //! 所以本示例刻意把两件事并排放：
 //!
-//! - `slow` step 循环 5 次调 `sc.emit("progress", ..)` —— 观察者实时收到 5 条
+//! - `slow` step 循环 5 次调 `sc.ctx.emit("progress", ..)` —— 观察者实时收到 5 条
 //!   `CUSTOM`（name == "progress"）
 //! - `phase` step 不调 —— 它的状态变化只能等 `STEP_FINISHED`
 //!
@@ -121,7 +121,7 @@ pub fn progress_report() -> WorkflowDefinition<ProgressInput, serde_json::Value,
                     for i in 1..=rounds {
                         tokio::time::sleep(tick).await;
                         // 观察者立刻收到，引擎不落盘（emit-only）。
-                        sc.emit(
+                        sc.ctx.emit(
                             "progress",
                             serde_json::json!({ "stepId": sc.id, "ratio": i as f64 / rounds as f64 }),
                         );
