@@ -1341,7 +1341,7 @@ mod tests {
         });
 
         let wf = create_workflow(CreateWorkflowConfig::new("mw-mixed").input::<Value>())
-            .middleware_any(vec![user_mw, trace_mw])
+            .middleware(user_mw).middleware(trace_mw)
             .handler(|ctx: WorkflowCtx| async move {
                 Ok(serde_json::json!({
                     "user": ctx.ext.user().user,

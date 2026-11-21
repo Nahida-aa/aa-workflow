@@ -40,14 +40,16 @@ fn loader(
 /// 一个把 a/b/c 串起来的 workflow，挂上调用方给的两个中间件。
 fn make_wf(
     ran: Arc<Mutex<Vec<String>>>,
-    middlewares: Vec<aa_workflow_core::middleware::Middleware>,
+    a: aa_workflow_core::middleware::Middleware,
+    b: aa_workflow_core::middleware::Middleware,
 ) -> aa_workflow_core::define::WorkflowDefinition<
     serde_json::Value,
     serde_json::Value,
     serde_json::Value,
 > {
     create_workflow(CreateWorkflowConfig::new("combined").input::<serde_json::Value>())
-        .middleware_any(middlewares)
+        .middleware(a)
+        .middleware(b)
         .handler(move |ctx: WorkflowCtx| {
             let ran = ran.clone();
             async move {
@@ -81,10 +83,11 @@ async fn outer_reseed_short_circuits_before_interim_goals_can_park() {
 
     let wf = Arc::new(make_wf(
         ran.clone(),
-        vec![reseed(loader(store.clone())), interim_goals({
+        reseed(loader(store.clone())),
+        interim_goals({
             let store = store.clone();
             move |run_id| Ok(store.get_events(run_id)?)
-        })],
+        }),
     ));
 
     // run1：不给任何 plan → 两个中间件都不装层 → 全跑。
@@ -175,13 +178,11 @@ async fn outer_interim_goals_parks_before_reseed_short_circuits() {
     // 注意顺序反了：interim_goals 在外层。
     let wf = Arc::new(make_wf(
         ran.clone(),
-        vec![
-            interim_goals({
-                let store = store.clone();
-                move |run_id| Ok(store.get_events(run_id)?)
-            }),
-            reseed(loader(store.clone())),
-        ],
+        interim_goals({
+            let store = store.clone();
+            move |run_id| Ok(store.get_events(run_id)?)
+        }),
+        reseed(loader(store.clone())),
     ));
 
     run_workflow(
@@ -250,19 +251,17 @@ async fn outer_interim_goals_wins_the_park_race() {
 
     let wf = Arc::new(make_wf(
         ran.clone(),
-        vec![
-            interim_goals({
+        interim_goals({
+            let store = store.clone();
+            move |run_id| Ok(store.get_events(run_id)?)
+        }),
+        dag_policies(
+            linear_shape(),
+            Arc::new({
                 let store = store.clone();
-                move |run_id| Ok(store.get_events(run_id)?)
+                move |run_id: &str| Ok(store.get_events(run_id)?)
             }),
-            dag_policies(
-                linear_shape(),
-                Arc::new({
-                    let store = store.clone();
-                    move |run_id: &str| Ok(store.get_events(run_id)?)
-                }),
-            ),
-        ],
+        ),
     ));
 
     let out = run_workflow(
@@ -299,19 +298,17 @@ async fn outer_dag_policies_wins_the_park_race() {
 
     let wf = Arc::new(make_wf(
         ran.clone(),
-        vec![
-            dag_policies(
-                linear_shape(),
-                Arc::new({
-                    let store = store.clone();
-                    move |run_id: &str| Ok(store.get_events(run_id)?)
-                }),
-            ),
-            interim_goals({
+        dag_policies(
+            linear_shape(),
+            Arc::new({
                 let store = store.clone();
-                move |run_id| Ok(store.get_events(run_id)?)
+                move |run_id: &str| Ok(store.get_events(run_id)?)
             }),
-        ],
+        ),
+        interim_goals({
+            let store = store.clone();
+            move |run_id| Ok(store.get_events(run_id)?)
+        }),
     ));
 
     let out = run_workflow(

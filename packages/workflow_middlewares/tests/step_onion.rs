@@ -138,7 +138,8 @@ impl Service<StepRequest> for SkipService {
 }
 
 fn workflow(
-    middlewares: Vec<Middleware>,
+    a: Middleware,
+    b: Middleware,
     ran: Arc<Mutex<Vec<String>>>,
 ) -> aa_workflow_core::define::WorkflowDefinition<
     serde_json::Value,
@@ -146,7 +147,8 @@ fn workflow(
     serde_json::Value,
 > {
     create_workflow(CreateWorkflowConfig::new("step-onion").input::<serde_json::Value>())
-        .middleware_any(middlewares)
+        .middleware(a)
+        .middleware(b)
         .handler(move |ctx: WorkflowCtx| {
             let ran = ran.clone();
             async move {
@@ -174,10 +176,8 @@ async fn two_wrappers_stack_in_registration_order() {
     let ran = Arc::new(Mutex::new(Vec::new()));
 
     let wf = workflow(
-        vec![
-            observer("outer", log.clone()),
-            observer("inner", log.clone()),
-        ],
+        observer("outer", log.clone()),
+        observer("inner", log.clone()),
         ran.clone(),
     );
     let store = Arc::new(InMemoryStore::new());
@@ -217,7 +217,8 @@ async fn inner_skip_short_circuits_base_but_outer_still_wraps() {
 
     // outer 观测；inner 对 b 短路。
     let wf = workflow(
-        vec![observer("outer", log.clone()), skipper("b", "B-CACHED")],
+        observer("outer", log.clone()),
+        skipper("b", "B-CACHED"),
         ran.clone(),
     );
     let store = Arc::new(InMemoryStore::new());
@@ -278,7 +279,7 @@ async fn wrapper_order_decides_who_wins() {
     };
 
     let store = Arc::new(InMemoryStore::new());
-    let wf = workflow(vec![mk("FIRST"), mk("SECOND")], Arc::new(Mutex::new(Vec::new())));
+    let wf = workflow(mk("FIRST"), mk("SECOND"), Arc::new(Mutex::new(Vec::new())));
     run_workflow(
         RunWorkflowOptions::new(Arc::new(wf), store.clone())
             .input(serde_json::json!({}))

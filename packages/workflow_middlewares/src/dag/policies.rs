@@ -116,87 +116,80 @@ struct DagPoliciesMw {
 }
 
 impl MiddlewareServer for DagPoliciesMw {
-    fn serve<'a>(
-        &'a self,
-        args: MiddlewareServerFnArgs,
-    ) -> impl Future<Output = Result<Value>> + Send + 'a {
-        async move {
-            let mut sc = args;
-            // 前置：解析 RunWorkflowOptions.meta 里的 DagPlan → PlanState。
-            // 缺失 = 本次 run 不做任何策略（与另两个中间件一致）。
-            let Some(plan) = sc.ctx.meta.try_get::<DagPlanKey>() else {
-                return sc.next(None).await;
-            };
+    async fn serve(&self, args: MiddlewareServerFnArgs) -> Result<Value> {
+        let mut sc = args;
 
-            let mut st = PlanState {
-                goals: plan.goals.clone(),
-                ..Default::default()
-            };
+        // 前置：解析 RunWorkflowOptions.meta 里的 DagPlan → PlanState。
+        // 缺失 = 本次 run 不做任何策略（与另两个中间件一致）。
+        let Some(plan) = sc.ctx.meta.try_get::<DagPlanKey>() else {
+            return sc.next(None).await;
+        };
 
-            {
-                // redo：source_run_id 存在才启用；from 闭包展开交给
-                // DagShape::reseed_plan（库有图，含缺省种子计算）。
-                if let Some(source_run_id) = plan.source_run_id.as_deref() {
-                    let source_log = (self.get_events)(source_run_id)?;
-                    let from = plan.from.clone();
-                    let reseed_run = self.shape.reseed_plan(&source_log, from)?;
-                    let mut redo: HashSet<String> =
-                        reseed_run.redo_set.iter().cloned().collect();
-                    if let Some(extra) = &plan.redo_set {
-                        for id in extra {
-                            redo.insert(id.clone());
-                        }
+        let mut st = PlanState {
+            goals: plan.goals.clone(),
+            ..Default::default()
+        };
+
+        {
+            // redo：source_run_id 存在才启用；from 闭包展开交给
+            // DagShape::reseed_plan（库有图，含缺省种子计算）。
+            if let Some(source_run_id) = plan.source_run_id.as_deref() {
+                let source_log = (self.get_events)(source_run_id)?;
+                let from = plan.from.clone();
+                let reseed_run = self.shape.reseed_plan(&source_log, from)?;
+                let mut redo: HashSet<String> = reseed_run.redo_set.iter().cloned().collect();
+                if let Some(extra) = &plan.redo_set {
+                    for id in extra {
+                        redo.insert(id.clone());
                     }
+                }
 
-                    // 源结果 → lookup（排除重跑名单）。
-                    for e in &source_log {
-                        if let aa_workflow_core::event::WorkflowEvent::StepFinished {
-                            step_id,
-                            result: Some(result),
-                            ..
-                        } = e
-                        {
-                            if !redo.contains(step_id) {
-                                st.lookup.insert(step_id.clone(), result.clone());
-                            }
+                // 源结果 → lookup（排除重跑名单）。
+                for e in &source_log {
+                    if let aa_workflow_core::event::WorkflowEvent::StepFinished {
+                        step_id,
+                        result: Some(result),
+                        ..
+                    } = e
+                    {
+                        if !redo.contains(step_id) {
+                            st.lookup.insert(step_id.clone(), result.clone());
                         }
                     }
                 }
             }
-
-            // 无任何策略 → 不装拦截器，纯透传。
-            if st.goals.is_empty() && st.lookup.is_empty() {
-                return sc.next(None).await;
-            }
-
-            // 计划是不变的，直接按值捕获；无锁、无状态。
-            let plan = Arc::new(st);
-
-            sc.wrap_step(step_layer(move |req: &StepRequest| {
-                // ① 临时目标：入口判定——此前所有 step 完成后 goals 已全齐
-                //    则泊车。当前 step 尚未执行，所以 `completed` 不含它。
-                if !plan.goals.is_empty()
-                    && plan.goals.iter().all(|g| req.completed.contains(g))
-                {
-                    // 泊车会整条 drive 结束，不可能在同一 drive 内触发第二次
-                    // （不需要额外的 `parked` 标记）。
-                    return Decision::Park {
-                        signal: INTERIM_GOAL_SIGNAL.to_string(),
-                        meta: Some(serde_json::json!({ "goals": plan.goals })),
-                    };
-                }
-
-                // ② redo：有源结果 → 复用（`skip` 会落 STEP_FINISHED，
-                //    所以它同样进入下一次调用的 `completed`）。
-                if let Some(result) = plan.lookup.get(&req.step_id).cloned() {
-                    return Decision::Skip(result);
-                }
-
-                // ③ redoSet 里的 step（或源里没有的）真跑。
-                Decision::Pass
-            }));
-
-            sc.next(None).await
         }
+
+        // 无任何策略 → 不装拦截器，纯透传。
+        if st.goals.is_empty() && st.lookup.is_empty() {
+            return sc.next(None).await;
+        }
+
+        // 计划是不变的，直接按值捕获；无锁、无状态。
+        let plan = Arc::new(st);
+
+        sc.wrap_step(step_layer(move |req: &StepRequest| {
+            // ① 临时目标：入口判定——此前所有 step 完成后 goals 已全齐
+            //    则泊车。当前 step 尚未执行，所以 `completed` 不含它。
+            if !plan.goals.is_empty() && plan.goals.iter().all(|g| req.completed.contains(g)) {
+                // 泊车会整条 drive 结束，不可能在同一 drive 内触发第二次
+                // （不需要额外的 `parked` 标记）。
+                return Decision::Park {
+                    signal: INTERIM_GOAL_SIGNAL.to_string(),
+                    meta: Some(serde_json::json!({ "goals": plan.goals })),
+                };
+            }
+
+            // ② redo：有源结果 → 复用（`skip` 会落 STEP_FINISHED，
+            //    所以它同样进入下一次调用的 `completed`）。
+            if let Some(result) = plan.lookup.get(&req.step_id).cloned() {
+                return Decision::Skip(result);
+            }
+
+            // ③ redoSet 里的 step（或源里没有的）真跑。
+            Decision::Pass
+        }));
+
+        sc.next(None).await
     }
 }

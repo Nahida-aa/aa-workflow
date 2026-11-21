@@ -15,7 +15,7 @@ use std::sync::Arc;
 use super::meta_spec::{Nil, Push};
 use super::MetaKey;
 use super::{AnyWorkflowDefinition, BaseCtx, InitializeFn, RetryPolicy, StateValidatorFn, WorkflowCtx, WorkflowDefinition, WorkflowHandler};
-use crate::middleware::{AnyMiddleware, Append, DynListMw, Middleware, MiddlewareServer, MiddlewareStack};
+use crate::middleware::{AnyMiddleware, Append, Middleware, MiddlewareServer, MiddlewareStack};
 
 /// The declaration config consumed by [`create_workflow`]. Mirrors TanStack's
 /// `createWorkflow(options)`; only `id` is required (`initialize` defaults to
@@ -300,23 +300,6 @@ impl<TInput, TOutput, TState, TMeta, TMw: MiddlewareStack>
         WorkflowBuilder {
             config: self.config,
             stack: self.stack.append(m),
-            previous: self.previous,
-            _meta: PhantomData,
-        }
-    }
-
-    /// **擦除逃生门**：运行期动态的中间件集合（低代码）——收擦除元素列表，
-    /// 折叠成一个子洋葱作为单个栈元素（逐层箱 = 动态的固有税，见 ADR 0021）。
-    pub fn middleware_any(
-        self,
-        middlewares: impl IntoIterator<Item = Middleware>,
-    ) -> WorkflowBuilder<TInput, TOutput, TState, TMeta, TMw::Out>
-    where
-        TMw: Append<DynListMw>,
-    {
-        WorkflowBuilder {
-            config: self.config,
-            stack: self.stack.append(DynListMw(middlewares.into_iter().collect())),
             previous: self.previous,
             _meta: PhantomData,
         }

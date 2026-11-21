@@ -60,6 +60,20 @@ drive 的 server 调用再擦一次（`serve` 返回 `BoxFuture`）。
    结构性成本）。定义期的组合 Arc 数不变（N 层闭包 + 1 个 innermost——
    递归折叠的形状决定；2026-11-21 实现后核账修正，初稿误写为「降为 1」）。
 
+## 修订（2026-11-21，落地当轮）
+
+- **擦除逃生门（`middleware_any` / `DynListMw`）暂缓**：用户指出「传列表是少数
+  需求，低代码场景出现再加」。已知调用点全部迁移为静态链式（含测试里的
+  `Vec<Middleware>` 参数改双参数——它们的 N 都是编写时已知的）。逃生门重新
+  引入的成本 = 一个 `DynListMw` 栈元素（子洋葱折叠），需求出现时加。
+- **RPITIT serve 的 impl 可写 `async fn`**（编译器实测）：`impl MiddlewareServer
+  for Mw { async fn serve(&self, args) -> Result<Value> { .. } }`——body 平铺、
+  无 `async move` 包裹、无额外缩进（相对 tower `call` 的形状对齐）。两个策略
+  中间件已改为此形态；trait 定义保持 `-> impl Future .. + Send + 'a`
+  （调用方 Send 从签名可证）。
+- 核账修正：定义期的组合 Arc 数**不变**（N 层闭包 + 1 innermost——递归折叠
+  形状决定；初稿误写「N+1 → 1」）。降的是 drive 期 future 箱 2N → N。
+
 ## 后果
 
 - **兼容**：`Middleware::server(f)` / `server_state(state, f)` /

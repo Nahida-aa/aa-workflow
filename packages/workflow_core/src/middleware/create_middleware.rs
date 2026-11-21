@@ -172,64 +172,6 @@ where
     }
 }
 
-/// **擦除列表的栈元素**（`.middleware_any(iter)`——低代码逃生门）：内部把
-/// 列表折叠成一条子洋葱再驱动。逐层箱 = 动态的固有税（ADR 0021）。
-#[derive(Clone)]
-pub struct DynListMw(pub Vec<Middleware>);
-
-impl MiddlewareServer for DynListMw {
-    fn serve<'a>(
-        &'a self,
-        args: MiddlewareServerFnArgs,
-    ) -> impl Future<Output = Result<Value>> + Send + 'a {
-        let list = self.0.clone();
-        async move {
-            let ctx0 = sc_ctx(&args);
-            let outer_next: NextFn = match args.pipeline.clone() {
-                Some(p) => p,
-                None => Arc::new(|_| {
-                    Box::pin(async {
-                        anyhow::bail!("middleware list ran with no pipeline (taken over)")
-                    }) as BoxFuture<'static, Result<Value>>
-                }),
-            };
-            // 终端：外层续延以 None 调用（各子层的 ext 已由自己的 pipeline 合并）
-            let mut inner: WorkflowHandler = {
-                let outer_next = outer_next.clone();
-                Arc::new(move |_ctx: WorkflowCtx| {
-                    let outer_next = outer_next.clone();
-                    Box::pin(async move { outer_next(None).await })
-                })
-            };
-            // 从最内向前折：每个元素得到「ctx + pipeline = 目前为止的内层」
-            for m in list.iter().rev() {
-                let m = m.clone();
-                let inner_prev = inner.clone();
-                let ctx = ctx0.clone();
-                inner = Arc::new(move |ctx: WorkflowCtx| {
-                    let m = m.clone();
-                    let inner_prev = inner_prev.clone();
-                    let ctx_for_pipe = ctx.clone();
-                    let pipeline: NextFn = Arc::new(move |ext: Option<Value>| {
-                        let inner_prev = inner_prev.clone();
-                        let mut ctx = ctx_for_pipe.clone();
-                        if let Some(ext) = ext {
-                            ctx.engine.merge_ext(ext);
-                        }
-                        Box::pin(async move { inner_prev(ctx).await })
-                    });
-                    let sc = MiddlewareServerFnArgs {
-                        ctx,
-                        pipeline: Some(pipeline),
-                    };
-                    Box::pin(async move { m.server.call(sc).await })
-                });
-            }
-            inner(ctx0).await
-        }
-    }
-}
-
 fn sc_ctx(args: &MiddlewareServerFnArgs) -> WorkflowCtx {
     args.ctx.clone()
 }

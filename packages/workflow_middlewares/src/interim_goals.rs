@@ -94,12 +94,8 @@ struct InterimGoalsMw {
 }
 
 impl MiddlewareServer for InterimGoalsMw {
-    fn serve<'a>(
-        &'a self,
-        args: MiddlewareServerFnArgs,
-    ) -> impl Future<Output = Result<Value>> + Send + 'a {
-        async move {
-            let mut sc = args;
+    async fn serve(&self, args: MiddlewareServerFnArgs) -> Result<Value> {
+        let mut sc = args;
             // 目标只在 meta 里；缺失 = 本次 drive 不设临时目标。
             let goals: Vec<String> = match sc.ctx.meta.try_get::<InterimGoalsKey>() {
                 Some(g) if !g.is_empty() => g,
@@ -143,7 +139,6 @@ impl MiddlewareServer for InterimGoalsMw {
                 Decision::Pass
             }));
 
-            sc.next(None).await
-        }
+        sc.next(None).await
     }
 }
