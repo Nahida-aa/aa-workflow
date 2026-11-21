@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use aa_workflow_middlewares::{DagShape, GetEvents, dag_policies};
 
-use super::{dub_builder, dub_run, DubSfOcrInput, DubSfOcrState};
+use super::{dub_builder, dub_run, DubEnv, DubSfOcrInput, DubSfOcrState};
 
 /// `dub_sf_ocr` 的依赖形状：两条并行分支 + 汇聚链（10 步）。
 pub fn dub_shape() -> Arc<DagShape> {
@@ -42,10 +42,14 @@ pub fn dub_shape() -> Arc<DagShape> {
 }
 
 /// DAG 策略版 dub 流水线：同一条 handler 链 + [`dag_policies`] 中间件。
+///
+/// 环境由调用方注入（[`DubEnv`]）：runtime 的 `load` 闭包每次装配定义时
+/// 克隆同一个 handle，测试侧持同一柄——「服务故障 / 恢复」跨 run 生效。
 pub fn dub_sf_ocr_dag(
     get_events: Arc<GetEvents>,
+    env: DubEnv,
 ) -> aa_workflow_core::WorkflowDefinition<DubSfOcrInput, serde_json::Value, DubSfOcrState> {
     dub_builder()
         .middleware(dag_policies(dub_shape(), get_events))
-        .handler(dub_run)
+        .handler(dub_run(env))
 }

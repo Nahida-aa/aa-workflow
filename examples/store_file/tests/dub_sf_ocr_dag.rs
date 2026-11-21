@@ -22,13 +22,23 @@ use aa_workflow_runtime::{
     create_run_store_adapter, define_workflow_runtime,
 };
 use example_store_file::dub_sf_ocr::dag::{dub_sf_ocr_dag, dub_shape};
+use example_store_file::dub_sf_ocr::DubEnv;
 use example_store_file::FileExecutionStore;
 
 /// runtime 组装：FileExecutionStore + dag 策略版 dub 注册 + `get_events` 注入。
 ///
 /// `get_events` 从同一把 store 读（adapter 升格到 core `RunStore` 面）——
-/// `dag_policies` 靠它读 run1 的日志算 redo 名单。
+/// `dag_policies` 靠它读 run1 的日志算 redo 名单。缺省环境（全健康）。
 fn get_runtime(base: &PathBuf) -> (Arc<WorkflowRuntimeDefinition>, Arc<GetEvents>) {
+    get_runtime_with_env(base, &DubEnv::default())
+}
+
+/// 同上，但环境由调用方注入：测试持一份 [`DubEnv`] handle，`load` 闭包克隆
+/// 同一柄进定义——「服务故障 / 恢复」由测试改环境表达，对后续 run 生效。
+fn get_runtime_with_env(
+    base: &PathBuf,
+    env: &DubEnv,
+) -> (Arc<WorkflowRuntimeDefinition>, Arc<GetEvents>) {
     let store: Arc<dyn WorkflowExecutionStore> = Arc::new(FileExecutionStore::new(base));
     // `get_events` 闭包持有 adapter（Arc<dyn RunStore>，Clone ✓）
     let adapter = create_run_store_adapter(store.clone());
@@ -41,9 +51,10 @@ fn get_runtime(base: &PathBuf) -> (Arc<WorkflowRuntimeDefinition>, Arc<GetEvents
         WorkflowRegistration {
             load: {
                 let get_events = Arc::clone(&get_events);
+                let env = env.clone();
                 Arc::new(move || {
                     let get_events = Arc::clone(&get_events);
-                    dub_sf_ocr_dag(get_events).into()
+                    dub_sf_ocr_dag(get_events, env.clone()).into()
                 })
             },
             previous_versions: HashMap::new(),
@@ -215,7 +226,7 @@ async fn mismatched_registration_key_still_drives_start() {
                 let get_events = get_events_of(store.clone());
                 Arc::new(move || {
                     let get_events = Arc::clone(&get_events);
-                    dub_sf_ocr_dag(get_events).into()
+                    dub_sf_ocr_dag(get_events, DubEnv::default()).into()
                 })
             },
             previous_versions: HashMap::new(),
@@ -246,23 +257,31 @@ fn get_events_of(store: Arc<dyn WorkflowExecutionStore>) -> Arc<GetEvents> {
 }
 
 /// 场景 ④：**步骤抛错 → reseed 型恢复（不指定目标的续驱）**——
-/// run1：翻译服务故障（input `translateDown: true`）→ translate 抛错 →
-/// `Errored`（人声轴 + OCR 链 5 步成功在案，translate `STEP_FAILED`）；
-/// run2：服务恢复（input 撤掉标志）+ reseedRun **缺省种子**（源日志未成功
-/// 节点 = translate 及其下游 4 步）→ 翻译轴真跑、幸存 5 步导入 → `Finished`。
+/// run1：**环境**故障（`env.translate_service_down()`，翻译服务 503）→
+/// translate 抛错 → `Errored`（人声轴 + OCR 链 5 步成功在案，
+/// translate `STEP_FAILED`）；
+/// run2：环境恢复（`env.translate_service_up()`）+ reseedRun **缺省种子**
+/// （源日志未成功节点 = translate 及其下游 4 步）→ 翻译轴真跑、幸存 5 步
+/// 导入 → `Finished`。
+///
+/// 故障是**环境状态**，不是 input：input 只有用户意图（videoDir），「服务
+/// 挂了没有」由 [`DubEnv`] 回答——真实系统里用户从不声明服务健康度，
+/// 世界变了改的是环境，不是 input。
 ///
 /// 恢复型续驱（同 run 重驱）在这里是 rethrow 而非恢复（失败是终态）——
 /// reseed 型才是跑错之后的恢复路（`errored_run_redrive_rethrows` 引擎测试
 /// 钉过前半，本场景补真实流水线上的后半）。
 #[tokio::test]
 async fn errored_run_recovers_via_reseed_run() {
-    let (rt, _ge) = get_runtime(&temp_base("dag-err"));
+    let env = DubEnv::default();
+    let (rt, _ge) = get_runtime_with_env(&temp_base("dag-err"), &env);
 
-    // run1：翻译服务故障 → errored（5 步成功在案）
+    // run1：翻译服务故障（环境事件）→ errored（5 步成功在案）
+    env.translate_service_down();
     let broken = start(
         &rt,
         "dag:e1",
-        serde_json::json!({ "videoDir": "/w/exp", "translateDown": true }),
+        serde_json::json!({ "videoDir": "/w/exp" }),
         None,
     )
     .await;
@@ -279,9 +298,9 @@ async fn errored_run_recovers_via_reseed_run() {
         "translate 抛错（无成功 checkpoint）"
     );
 
-    // run2：世界变了（服务恢复）——reseedRun 缺省种子 = 未成功节点
-    // 世界变了：服务恢复（input 撤掉 translateDown）——reseedRun 缺省种子
-    // = run1 日志未成功节点（translate 及其下游 4 步）。
+    // run2：世界变了（服务恢复——环境事件，input 不动）——reseedRun 缺省
+    // 种子 = run1 日志未成功节点（translate 及其下游 4 步）。
+    env.translate_service_up();
     let fixed = start(
         &rt,
         "dag:e2",

@@ -39,15 +39,23 @@
 
 pub mod dag;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use aa_workflow_core::{BaseCtx, CreateWorkflowConfig, StepCtx, WorkflowBuilder, WorkflowDefinition, create_workflow};
+use aa_workflow_core::define::BoxFuture;
 
 // ========================================================================
 // dub_sf_ocr 的定义
 // ========================================================================
 
 /// dub-sf-ocr 输入：示例层不落盘，`videoDir` 只用于拼产物路径。
+///
+/// 只有**用户意图**。翻译服务是否可用是**环境状态**（外部服务），不在这里
+/// ——run 的 input 跨 resume 不可变（ADR 0022：run 是不可变事实），而环境
+/// 随时会变，两者不同物。以前这里有个 `translateDown` 标志给 DAG 例子注入
+/// 故障，那是拿「启动时的世界事实」给故障注入找的容身处；有了服务边界
+/// （[`DubEnv`]），故障注入走环境，input 回归纯意图。
 #[derive(serde::Deserialize, serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct DubSfOcrInput {
@@ -55,11 +63,47 @@ pub struct DubSfOcrInput {
     /// 目标语言；缺省由 `initialize` 兜成 `"zh"`。
     #[serde(default)]
     pub target_lang: Option<String>,
-    /// 翻译服务是否故障（DAG 例子的「世界状态」：源 run = true 故障，
-    /// redo run 缺省 = 服务恢复）。真实系统里这是外部服务状态——
-    /// 放 input 是因为它是**启动时的世界事实**（耐久、resume 不可变）。
-    #[serde(default)]
-    pub translate_down: bool,
+}
+
+/// dub 流水线的「环境」：**服务边界**——step 闭包经由它调外部服务。
+///
+/// 生产实现连真模型 / 真 API；本示例给可脚本化的假实现：可用性是一个
+/// 可翻转的环境事实，translate 调用经它回答「服务此刻挂了没有」。真实
+/// 系统里那是一次上游 API 调用的返回码，用户从不声明它——所以它不属于
+/// input（用户意图），属于环境。
+///
+/// `Arc` 内核：定义侧（[`dub_run`] 工厂捕获一份）与测试侧各持一个 handle，
+/// 共享同一个环境——「服务恢复」才能对后续 run 生效（[`dub_pipeline`] 在
+/// 同一进程里连跑 run1 / run2，环境状态自然延续，这正是真实世界的样子：
+/// 服务的健康度独立于任何 run 的 input 而变化）。
+#[derive(Clone)]
+pub struct DubEnv {
+    translate_available: Arc<AtomicBool>,
+}
+
+impl Default for DubEnv {
+    /// 缺省 = 全部服务健康（绝大多数场景不需要注入任何故障）。
+    fn default() -> Self {
+        Self {
+            translate_available: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
+
+impl DubEnv {
+    /// 环境事件：翻译服务故障——之后的 translate 调用返回 503。
+    pub fn translate_service_down(&self) {
+        self.translate_available.store(false, Ordering::SeqCst);
+    }
+
+    /// 环境事件：翻译服务恢复。
+    pub fn translate_service_up(&self) {
+        self.translate_available.store(true, Ordering::SeqCst);
+    }
+
+    fn translate_available(&self) -> bool {
+        self.translate_available.load(Ordering::SeqCst)
+    }
 }
 
 /// dub-sf-ocr 的 **typed state**（Rust 版 zod `stateSchema`）。
@@ -281,8 +325,18 @@ async fn sf_ocr_fix(st: &DubSfOcrState, raw: &RawSubtitle) -> anyhow::Result<Fix
 /// 这是全流程唯一正当使用 `target_lang` 的地方——译文的目标语言本来就是
 /// translate 这一步的产物。之前它出现在 10 个 step 的返回里，等于把 state
 /// 回显伪装成产物。
-async fn translate(st: &DubSfOcrState, fixed: &FixedSubtitle) -> anyhow::Result<Translated> {
+///
+/// 故障由**环境**注入（[`DubEnv`]）：服务不可用就抛 503——真实系统里这是
+/// 一次上游 API 调用的返回码，不是 input 里的标志。
+async fn translate(
+    env: &DubEnv,
+    st: &DubSfOcrState,
+    fixed: &FixedSubtitle,
+) -> anyhow::Result<Translated> {
     stub(st, "translate", 50).await;
+    if !env.translate_available() {
+        anyhow::bail!("translate service unavailable: upstream 503");
+    }
     Ok(Translated {
         path: format!("{}/translate/{}.json", st.video_dir, st.target_lang),
         target_lang: st.target_lang.clone(),
@@ -385,10 +439,31 @@ pub fn dub_builder(
 }
 
 pub fn dub_sf_ocr() -> WorkflowDefinition<DubSfOcrInput, serde_json::Value, DubSfOcrState> {
-    dub_builder().handler(dub_run)
+    dub_builder().handler(dub_run(DubEnv::default()))
 }
 
-pub async fn dub_run(ctx: BaseCtx<DubSfOcrInput, DubSfOcrState>) -> anyhow::Result<serde_json::Value> {
+/// handler 工厂：把「环境」装进 handler。
+///
+/// handler 只收 `ctx`，环境没有别的入路——工厂闭包捕获 env，每次调用克隆
+/// 进 future。定义侧与测试侧各持一份 [`DubEnv`] handle（`Arc` 内核），
+/// 跨 run 共享同一个环境。
+pub fn dub_run(
+    env: DubEnv,
+) -> impl Fn(BaseCtx<DubSfOcrInput, DubSfOcrState>) -> BoxFuture<'static, anyhow::Result<serde_json::Value>>
+       + Clone
+       + Send
+       + Sync
+       + 'static {
+    move |ctx: BaseCtx<DubSfOcrInput, DubSfOcrState>| {
+        let env = env.clone();
+        Box::pin(dub_pipeline(env, ctx))
+    }
+}
+
+async fn dub_pipeline(
+    env: DubEnv,
+    ctx: BaseCtx<DubSfOcrInput, DubSfOcrState>,
+) -> anyhow::Result<serde_json::Value> {
         let video_dir = ctx.input.video_dir.clone();
 
         // 只读快照，clone 一次即可。
@@ -407,8 +482,6 @@ pub async fn dub_run(ctx: BaseCtx<DubSfOcrInput, DubSfOcrState>) -> anyhow::Resu
         //
         // `try_join!` 返回 `Result<(A, B), E>`——A / B **不需要**同类型（只有
         // error 类型要统一），所以这里 A 是 `Separated`、B 是 `Translated`。
-        // 翻译服务故障（DAG 例子的世界状态）——translate 步骤闭包按此抛错。
-        let translate_down = ctx.input.translate_down;
         let (separated, translated) = tokio::try_join!(
             async {
                 // 分支 A：分离人声 + 伴奏。
@@ -439,13 +512,12 @@ pub async fn dub_run(ctx: BaseCtx<DubSfOcrInput, DubSfOcrState>) -> anyhow::Resu
                     })
                     .await?;
                 let st = Arc::clone(&state);
-                // 世界状态在 input 里（translate_down）：true = 翻译服务故障，
-                // 闭包抛错 → run errored（翻译轴的 redo 场景的源）。
+                // 故障由**环境**回答（env 的服务状态），不是 input 标志——
+                // 真实系统里这就是一次上游 API 调用拿到 503。`DubEnv` 是
+                // Arc 内核，克隆只是多一个指向同一环境的 handle。
+                let env = env.clone();
                 ctx.step("translate", move |sc: StepCtx| async move {
-                    if translate_down {
-                        return Err(anyhow::anyhow!("翻译服务不可用"));
-                    }
-                    translate(&st, &fixed).await
+                    translate(&env, &st, &fixed).await
                 })
                 .await
             },
