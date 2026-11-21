@@ -81,11 +81,11 @@ pub use dag::core::{
     DagNode, DagRunFn, DagShape, DagSpec, RedoPlan, ShapeError, dag_to_handler, define_dag,
     run_dag,
 };
-pub use dag::policies::{
+pub use dag::policies::{DagPoliciesMw, 
     DagPlan, DagPlanAccess, DagPlanKey, GetEvents, INTERIM_GOAL_SIGNAL, dag_policies,
 };
-pub use interim_goals::{InterimGoalsAccess, InterimGoalsKey, interim_goals};
-pub use reseed::{LoadResults, ReseedAccess, ReseedKey, ReseedPlan, SourceStep, reseed};
+pub use interim_goals::{InterimGoalsAccess, InterimGoalsKey, InterimGoalsMw, interim_goals};
+pub use reseed::{LoadResults, ReseedAccess, ReseedKey, ReseedPlan, ReseedMw, SourceStep, reseed};
 
 /// 供文档链接用：把常用名字提上来，避免调用方再导一遍 core。
 ///

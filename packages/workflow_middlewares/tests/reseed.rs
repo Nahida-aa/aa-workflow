@@ -43,7 +43,7 @@ fn loader(
 /// plan 由每次 run 的 `meta` 决定，不给就不播种。
 fn make_wf(
     exec: Arc<Mutex<Vec<String>>>,
-    mw: aa_workflow_core::middleware::Middleware,
+    mw: impl aa_workflow_core::middleware::MiddlewareServer + 'static,
 ) -> aa_workflow_core::define::WorkflowDefinition<
     serde_json::Value,
     serde_json::Value,

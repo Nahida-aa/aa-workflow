@@ -29,9 +29,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use aa_workflow_core::middleware::{Middleware, MiddlewareServerFnArgs};
+use anyhow::Result;
+use serde_json::Value;
 
-use aa_workflow_core::middleware::{step_layer, Decision};
+use aa_workflow_core::middleware::{MiddlewareServer, MiddlewareServerFnArgs, step_layer, Decision};
 
 /// 一次 redo 的计划：从哪里播种、哪些 step 重跑。
 ///
@@ -94,58 +95,68 @@ pub struct SourceStep {
 /// ```
 ///
 /// 没传 `ReseedKey` 时不装层（= 本次 run 不做播种，全部真跑）。
-pub fn reseed<F>(load_results: F) -> Middleware
+pub fn reseed<F>(load_results: F) -> ReseedMw
 where
     F: Fn(&str) -> anyhow::Result<HashMap<String, SourceStep>> + Send + Sync + 'static,
 {
-    let load_results = Arc::new(load_results);
-
-    Middleware::new().server(move |mut sc: MiddlewareServerFnArgs| {
-        let load_results = load_results.clone();
-
-        async move {
-            // 计划只在 meta 里；缺失 = 本次 run 不做播种。
-            let Some(plan) = sc.ctx.meta.try_get::<ReseedKey>() else {
-                return sc.next(None).await;
-            };
-            let redo: std::collections::HashSet<String> = plan.redo_set.iter().cloned().collect();
-
-            // 本 run 就是源 run？不做任何事（禁止自我播种）。
-            if plan.source_run_id != sc.ctx.run_id {
-                // **drive 开始时加载一次**，而不是在包装层里懒加载 + 缓存：
-                // `load_results` 是同步函数，放在这里不会阻塞；省掉可变状态后
-                // 层就是纯的（只读 plan）。
-                //
-                // 源读不到 → 空表，「没有可复用结果」→ 全部真跑
-                // （与引擎版「导入 0 条」同义）。
-                let lookup = Arc::new(load_results(&plan.source_run_id).unwrap_or_default());
-
-                sc.wrap_step(step_layer({
-                    let redo = redo.clone();
-                    let lookup = lookup.clone();
-                    let source_run_id = plan.source_run_id.clone();
-                    move |req: &aa_workflow_core::middleware::StepRequest| {
-                        // redoSet 里的 step 要真跑。
-                        if redo.contains(&req.step_id) {
-                            return Decision::Pass;
-                        }
-                        match lookup.get(&req.step_id).cloned() {
-                            // 短路：源结果作为本 step 的 checkpoint 落盘，**带溯源**。
-                            Some(src) => Decision::SkipImported {
-                                result: src.result,
-                                from: aa_workflow_core::event::ImportedFrom {
-                                    run_id: source_run_id.clone(),
-                                    index: src.index,
-                                },
-                            },
-                            // 源里没有这个 step（新加的 / 上次失败的）→ 真跑。
-                            None => Decision::Pass,
-                        }
-                    }
-                }));
-            }
-
-            sc.next(None).await
-        }
-    })
+    ReseedMw {
+        load_results: Arc::new(load_results),
+    }
 }
+
+/// struct 形态（tower `Service` 同款）：参数是**字段**，`serve<'a>(&'a self)`
+/// 的 future 借 `&self`——零捕获仪式、零 per-call 克隆。
+#[derive(Clone)]
+pub struct ReseedMw {
+    load_results: Arc<LoadResults>,
+}
+
+impl MiddlewareServer for ReseedMw {
+    async fn serve(&self, args: MiddlewareServerFnArgs) -> Result<Value> {
+        let mut sc = args;
+
+        // 计划只在 meta 里；缺失 = 本次 run 不做播种。
+        let Some(plan) = sc.ctx.meta.try_get::<ReseedKey>() else {
+            return sc.next(None).await;
+        };
+        let redo: std::collections::HashSet<String> = plan.redo_set.iter().cloned().collect();
+
+        // 本 run 就是源 run？不做任何事（禁止自我播种）。
+        if plan.source_run_id != sc.ctx.run_id {
+            // **drive 开始时加载一次**，而不是在包装层里懒加载 + 缓存：
+            // `load_results` 是同步函数，放在这里不会阻塞；省掉可变状态后
+            // 层就是纯的（只读 plan）。
+            //
+            // 源读不到 → 空表，「没有可复用结果」→ 全部真跑
+            // （与引擎版「导入 0 条」同义）。
+            let lookup = Arc::new((self.load_results)(&plan.source_run_id).unwrap_or_default());
+
+            sc.wrap_step(step_layer({
+                let redo = redo.clone();
+                let lookup = lookup.clone();
+                let source_run_id = plan.source_run_id.clone();
+                move |req: &aa_workflow_core::middleware::StepRequest| {
+                    // redoSet 里的 step 要真跑。
+                    if redo.contains(&req.step_id) {
+                        return Decision::Pass;
+                    }
+                    match lookup.get(&req.step_id).cloned() {
+                        // 短路：源结果作为本 step 的 checkpoint 落盘，**带溯源**。
+                        Some(src) => Decision::SkipImported {
+                            result: src.result,
+                            from: aa_workflow_core::event::ImportedFrom {
+                                run_id: source_run_id.clone(),
+                                index: src.index,
+                            },
+                        },
+                        // 源里没有这个 step（新加的 / 上次失败的）→ 真跑。
+                        None => Decision::Pass,
+                    }
+                }
+            }));
+        }
+
+        sc.next(None).await
+    }
+}
+

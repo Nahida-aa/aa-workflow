@@ -74,70 +74,70 @@ pub type GetEvents =
 ///
 /// 没传 `InterimGoalsKey` 时中间件不装层（等价于「本次 drive 不设临时目标」），
 /// 而不是泊在空目标上。
-pub fn interim_goals<F>(get_events: F) -> Middleware
+pub fn interim_goals<F>(get_events: F) -> InterimGoalsMw
 where
     F: Fn(&str) -> anyhow::Result<Vec<aa_workflow_core::event::WorkflowEvent>>
         + Send
         + Sync
         + 'static,
 {
-    Middleware::from_impl(InterimGoalsMw {
+    InterimGoalsMw {
         get_events: Arc::new(get_events),
-    })
+    }
 }
 
 /// struct 形态（tower `Service` 同款）：参数是**字段**，`serve<'a>(&'a self)`
 /// 的 future 借 `&self`——零捕获仪式、零 per-call 克隆。
 #[derive(Clone)]
-struct InterimGoalsMw {
+pub struct InterimGoalsMw {
     get_events: Arc<GetEvents>,
 }
 
 impl MiddlewareServer for InterimGoalsMw {
     async fn serve(&self, args: MiddlewareServerFnArgs) -> Result<Value> {
         let mut sc = args;
-            // 目标只在 meta 里；缺失 = 本次 drive 不设临时目标。
-            let goals: Vec<String> = match sc.ctx.meta.try_get::<InterimGoalsKey>() {
-                Some(g) if !g.is_empty() => g,
-                _ => return sc.next(None).await,
-            };
+        // 目标只在 meta 里；缺失 = 本次 drive 不设临时目标。
+        let goals: Vec<String> = match sc.ctx.meta.try_get::<InterimGoalsKey>() {
+            Some(g) if !g.is_empty() => g,
+            _ => return sc.next(None).await,
+        };
 
-            // 开局已完成的目标（续驱 / reseed 导入）——不该为它们泊车。
-            // `&self.get_events` 直接借字段——server_state/闭包形态里这曾是
-            // 「async move 前 clone 一行」的仪式位。
-            let finished_at_start: HashSet<String> = (self.get_events)(&sc.ctx.run_id)?
-                .iter()
-                .filter_map(|e| match e {
-                    aa_workflow_core::event::WorkflowEvent::StepFinished { step_id, .. } => {
-                        Some(step_id.clone())
-                    }
-                    _ => None,
-                })
-                .collect();
-            let goals_done_at_start = goals.iter().all(|g| finished_at_start.contains(g));
+        // 开局已完成的目标（续驱 / reseed 导入）——不该为它们泊车。
+        // `&self.get_events` 直接借字段——server_state/闭包形态里这曾是
+        // 「async move 前 clone 一行」的仪式位。
+        let finished_at_start: HashSet<String> = (self.get_events)(&sc.ctx.run_id)?
+            .iter()
+            .filter_map(|e| match e {
+                aa_workflow_core::event::WorkflowEvent::StepFinished { step_id, .. } => {
+                    Some(step_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let goals_done_at_start = goals.iter().all(|g| finished_at_start.contains(g));
 
-            // **无状态层**：判定全部读 `req.completed`（引擎给的
-            // 「本 drive 已成功 step」快照），不自己累积。
-            //
-            // 为什么可以不累积：进入某个 step 时，此前所有 step 的
-            // `STEP_FINISHED` 都已落盘（在它们自己的链返回前），引擎在
-            // 构造请求时取的快照就是准确的。
-            //
-            // 为什么不用 `parked` 标记：泊车会整条 drive 结束
-            // （`WorkflowParked`），不可能在同一 drive 内触发第二次。
-            sc.wrap_step(step_layer(move |req: &StepRequest| {
-                if goals_done_at_start {
-                    return Decision::Pass;
-                }
-                // 入口判定：goals 是否已全齐（不含本 step——它还没跑）。
-                if goals.iter().all(|g| req.completed.contains(g)) {
-                    return Decision::Park {
-                        signal: INTERIM_GOAL_SIGNAL.to_string(),
-                        meta: Some(serde_json::json!({ InterimGoalsKey::KEY: goals })),
-                    };
-                }
-                Decision::Pass
-            }));
+        // **无状态层**：判定全部读 `req.completed`（引擎给的
+        // 「本 drive 已成功 step」快照），不自己累积。
+        //
+        // 为什么可以不累积：进入某个 step 时，此前所有 step 的
+        // `STEP_FINISHED` 都已落盘（在它们自己的链返回前），引擎在
+        // 构造请求时取的快照就是准确的。
+        //
+        // 为什么不用 `parked` 标记：泊车会整条 drive 结束
+        // （`WorkflowParked`），不可能在同一 drive 内触发第二次。
+        sc.wrap_step(step_layer(move |req: &StepRequest| {
+            if goals_done_at_start {
+                return Decision::Pass;
+            }
+            // 入口判定：goals 是否已全齐（不含本 step——它还没跑）。
+            if goals.iter().all(|g| req.completed.contains(g)) {
+                return Decision::Park {
+                    signal: INTERIM_GOAL_SIGNAL.to_string(),
+                    meta: Some(serde_json::json!({ InterimGoalsKey::KEY: goals })),
+                };
+            }
+            Decision::Pass
+        }));
 
         sc.next(None).await
     }

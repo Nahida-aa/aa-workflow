@@ -103,14 +103,14 @@ struct PlanState {
 /// DAG 策略中间件：redo 复用 + 临时目标泊车，读 `meta.__dagPlan`。
 ///
 /// `shape` 提供图（`from` 闭包展开、缺省种子计算）；`get_events` 提供日志读取。
-pub fn dag_policies(shape: Arc<DagShape>, get_events: Arc<GetEvents>) -> Middleware {
-    Middleware::from_impl(DagPoliciesMw { shape, get_events })
+pub fn dag_policies(shape: Arc<DagShape>, get_events: Arc<GetEvents>) -> DagPoliciesMw {
+    DagPoliciesMw { shape, get_events }
 }
 
 /// struct 形态（tower `Service` 同款）：两个构造期参数都是**字段**，
 /// `serve<'a>(&'a self)` 的 future 借 `&self`——零捕获仪式、零 per-call 克隆。
 #[derive(Clone)]
-struct DagPoliciesMw {
+pub struct DagPoliciesMw {
     shape: Arc<DagShape>,
     get_events: Arc<GetEvents>,
 }

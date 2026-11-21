@@ -40,8 +40,8 @@ fn loader(
 /// 一个把 a/b/c 串起来的 workflow，挂上调用方给的两个中间件。
 fn make_wf(
     ran: Arc<Mutex<Vec<String>>>,
-    a: aa_workflow_core::middleware::Middleware,
-    b: aa_workflow_core::middleware::Middleware,
+    a: impl aa_workflow_core::middleware::MiddlewareServer + 'static,
+    b: impl aa_workflow_core::middleware::MiddlewareServer + 'static,
 ) -> aa_workflow_core::define::WorkflowDefinition<
     serde_json::Value,
     serde_json::Value,
