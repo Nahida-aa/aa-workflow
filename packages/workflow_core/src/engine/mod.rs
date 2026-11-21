@@ -188,10 +188,11 @@ pub(crate) async fn run_compensations(
             let step_ctx = StepCtx {
                 ctx: crate::define::RunCtx {
                     engine: Arc::clone(engine),
-                    // 擦除面：补偿存储不知道工作流的 typed input，只有引擎的
-                    // 擦除值可填（typed 补偿闭包由登记侧包装重建，见
+                    // 擦除面：补偿存储不知道工作流的 typed input / state，只有
+                    // 引擎的擦除值可填（typed 补偿闭包由登记侧包装重建，见
                     // `BaseCtx::compensate`）。
                     input: engine.input.clone(),
+                    state: engine.state_mirror.lock().expect("state mirror").clone(),
                 },
                 id: format!("{run_id}:__compensation:{}", comp.id),
                 attempt: attempts,
@@ -799,20 +800,23 @@ impl EngineRuntime {
 ///
 /// The log stays `serde_json::Value` regardless of `T` — durability is defined
 /// by the event schema, not by the handler's types.
-pub(crate) async fn exec_step<T, F, Fut, I>(
+pub(crate) async fn exec_step<T, F, Fut, I, St>(
     engine: &Arc<EngineRuntime>,
     step_id: &str,
     opts: &StepOptions,
     input: I,
+    state: St,
     run: F,
 ) -> anyhow::Result<T>
 where
     T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
-    // I = 工作流 input 的精确类型：step 闭包的 `sc.ctx.input` 不擦除（run 级
-    // 事实），由调用方（`BaseCtx::step`，手里有 typed input）传入。擦除面
-    // （补偿存储）用 `RunCtx<Value>`——那边只有擦除值可填。
+    // I / St = 工作流 input / state 的精确类型：step 闭包的 `sc.ctx.input` /
+    // `sc.ctx.state` 不擦除（run 级事实），由调用方（`BaseCtx::step`，手里有
+    // typed 副本）传入。擦除面（补偿存储）用 `RunCtx<Value, Value>`——那边
+    // 只有擦除值可填。
     I: Clone + Send + Sync + 'static,
-    F: FnOnce(StepCtx<I>) -> Fut + Clone + Send + 'static,
+    St: Clone + Send + Sync + 'static,
+    F: FnOnce(StepCtx<I, St>) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = anyhow::Result<T>> + Send + 'static,
 {
     // Cancelled run → stop driving at this boundary.
@@ -844,6 +848,7 @@ where
                 let step_id = step_id.clone();
                 let opts = opts.clone();
                 let input = input.clone();
+                let state = state.clone();
                 let run_slot = run_slot.clone();
                 Box::pin(async move {
                     let run = run_slot
@@ -851,7 +856,7 @@ where
                         .expect("step run slot")
                         .take()
                         .ok_or_else(|| anyhow::anyhow!("step run executed more than once"))?;
-                    exec_step_unwrapped(&engine, &step_id, &opts, input, run)
+                    exec_step_unwrapped(&engine, &step_id, &opts, input, state, run)
                         .await
                         .and_then(|v| serde_json::to_value(v).map_err(anyhow::Error::from))
                         .map_err(Into::into)
@@ -901,24 +906,26 @@ where
         });
     }
 
-    exec_step_unwrapped(engine, step_id, opts, input, run).await
+    exec_step_unwrapped(engine, step_id, opts, input, state, run).await
 }
 
 /// 真正跑闭包、落 `STEP_FINISHED` 的那段（洋葱最内层）。
 ///
 /// 包装链见 [`EngineRuntime::compose_step_wrappers`]；无包装层时 `exec_step`
 /// 直接走这里。
-async fn exec_step_unwrapped<T, F, Fut, I>(
+async fn exec_step_unwrapped<T, F, Fut, I, St>(
     engine: &Arc<EngineRuntime>,
     step_id: &str,
     opts: &StepOptions,
     input: I,
+    state: St,
     run: F,
 ) -> anyhow::Result<T>
 where
     T: serde::Serialize + serde::de::DeserializeOwned + Send + 'static,
     I: Clone + Send + Sync + 'static,
-    F: FnOnce(StepCtx<I>) -> Fut + Clone + Send + 'static,
+    St: Clone + Send + Sync + 'static,
+    F: FnOnce(StepCtx<I, St>) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = anyhow::Result<T>> + Send + 'static,
 {
     // 重试续跑（F2-lite：deadline 到期后由自轮询驱动循环重驱），到期则以
@@ -1020,6 +1027,7 @@ where
             ctx: crate::define::RunCtx {
                 engine: engine.clone(),
                 input: input.clone(),
+                state: state.clone(),
             },
             id: step_id.to_string(),
             attempt,

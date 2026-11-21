@@ -226,8 +226,11 @@ state **observability**"。
 `examples.kyle-durable-agent.test.ts:100`（agent 的虚拟 FS，跨迭代累积）。
 
 本仓示例 `dub_sf_ocr`（`examples/store_file/src/dub_sf_ocr/mod.rs`）是正例：编排
-由 `DagSpec` 声明、handler 由 `dag_to_handler` 生成，节点闭包拿不到 `ctx.state`
-（state 经 `from_input` 从 input 重建）——**只读 state** 的最强形态。
+由 `DagSpec` 声明、handler 由 `dag_to_handler` 生成，节点闭包经 `sc.ctx.state`
+读到 **typed 快照**（无回流通道——值拷贝改不动引擎镜像）。DAG 形态下 state 无
+写入者，一次 run 内恒定 ≡ `initialize` 产物，日志零 `STATE_DELTA`；**对外观测走
+发送（emit/delta，不追加日志），对内数据走返回值与依赖关系（进 checkpoint）——
+两个通道不共用任何载体**（详见 `docs/concepts/ctx-state.md`）。
 
 ## 上下文变量命名（wc / sc）与中间件能力边界
 

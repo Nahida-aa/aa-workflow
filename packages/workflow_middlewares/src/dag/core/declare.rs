@@ -4,15 +4,15 @@
 //! 与 [`DagShape`](super::DagShape) 的分工：`DagShape` 只算名单（redo / 目标闭包），
 //! 这里声明的 `DagSpec` 才是可调度的图。方案与边界见 `docs/decisions/0019`。
 //!
-//! # 类型边界：input 精确、deps 仍是 `Value`
+//! # 类型边界：input / state 精确、deps 仍是 `Value`
 //!
-//! `DagSpec<I>` 的 `I` 是 **run input 的精确类型**（run 级只有一种 input，
-//! 可以泛型直通——节点闭包收 `I` 本身，不过 JSON）。**deps 仍是
-//! `Value`**，这不是偷懒而是结构使然：每个节点吃不同的上游产物（异构），
-//! `DagNode.run` 是 `Arc<dyn Fn>`——擦除后的闭包只能有一个签名，异构 deps
-//! 的公共签名只有 JSON；而且 `ctx.step` 的耐久边界本来就是 JSON
-//! （checkpoint 存 `Value`，replay 反序列化），deps 过 Value 与耐久边界
-//! 同构，不产生额外损失。
+//! `DagSpec<I, S>` 的 `I` / `S` 是 **run input / 工作流 state 的精确类型**
+//! （run 级各只有一种，可以泛型直通——节点闭包经 `sc.ctx.input` /
+//! `sc.ctx.state` 读到类型本身，不过 JSON）。**deps 仍是 `Value`**，这不是
+//! 偷懒而是结构使然：每个节点吃不同的上游产物（异构），`DagNode.run` 是
+//! `Arc<dyn Fn>`——擦除后的闭包只能有一个签名，异构 deps 的公共签名只有
+//! JSON；而且 `ctx.step` 的耐久边界本来就是 JSON（checkpoint 存 `Value`，
+//! replay 反序列化），deps 过 Value 与耐久边界同构，不产生额外损失。
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::Arc;
@@ -23,30 +23,30 @@ use serde_json::Value;
 
 use super::DagShape;
 
-/// 节点执行体：收到 step 上下文（[`StepCtx`]——`sc.ctx.input` 是 **typed**
-/// run input：input 是 run 级事实，run 级视图不擦除；`sc.ctx` 同时给出
-/// emit / is_cancelled / attempt / 预算探针）与直接依赖的结果（键 = 节点
-/// id，JSON），返回 JSON 结果（进 checkpoint）。
+/// 节点执行体：收到 step 上下文（[`StepCtx`]——`sc.ctx.input` / `sc.ctx.state`
+/// 都是 **typed**：input 与 state 是 run 级事实，run 级视图不擦除；`sc.ctx`
+/// 同时给出 emit / is_cancelled / attempt / 预算探针）与直接依赖的结果
+/// （键 = 节点 id，JSON），返回 JSON 结果（进 checkpoint）。
 ///
-/// input **没有参数**——经 `sc.ctx.input` 读；deps 仍是 `Value`（异构上游
+/// input / state **没有参数**——经 `sc.ctx` 读；deps 仍是 `Value`（异构上游
 /// 产物 + 耐久边界的公共形状，理由见模块文档）。
-pub type DagRunFn<I> = Arc<
-    dyn Fn(StepCtx<I>, BTreeMap<String, Value>) -> BoxFuture<'static, Result<Value>> + Send + Sync,
+pub type DagRunFn<I, S = Value> = Arc<
+    dyn Fn(StepCtx<I, S>, BTreeMap<String, Value>) -> BoxFuture<'static, Result<Value>> + Send + Sync,
 >;
 
 /// 一个 DAG 节点：直接依赖列表 + 执行体。
 #[derive(Clone)]
-pub struct DagNode<I = Value> {
+pub struct DagNode<I = Value, S = Value> {
     pub deps: Vec<String>,
-    pub run: DagRunFn<I>,
+    pub run: DagRunFn<I, S>,
 }
 
-impl<I: Clone + Send + Sync + 'static> DagNode<I> {
-    pub fn new<F, Fut, D, S>(deps: D, run: F) -> Self
+impl<I: Clone + Send + Sync + 'static, S: Clone + Send + Sync + 'static> DagNode<I, S> {
+    pub fn new<F, Fut, D, N>(deps: D, run: F) -> Self
     where
-        D: IntoIterator<Item = S>,
-        S: Into<String>,
-        F: Fn(StepCtx<I>, BTreeMap<String, Value>) -> Fut + Send + Sync + 'static,
+        D: IntoIterator<Item = N>,
+        N: Into<String>,
+        F: Fn(StepCtx<I, S>, BTreeMap<String, Value>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Value>> + Send + 'static,
     {
         Self {
@@ -56,15 +56,15 @@ impl<I: Clone + Send + Sync + 'static> DagNode<I> {
     }
 }
 
-/// 静态 DAG 声明。`I` = run input 的精确类型（缺省 `Value`）。`BTreeMap`
-/// 保证遍历与 output 的键顺序确定（replay 可重放）。
+/// 静态 DAG 声明。`I` / `S` = run input / 工作流 state 的精确类型（缺省
+/// `Value`）。`BTreeMap` 保证遍历与 output 的键顺序确定（replay 可重放）。
 #[derive(Clone)]
-pub struct DagSpec<I = Value> {
+pub struct DagSpec<I = Value, S = Value> {
     pub id: String,
-    pub nodes: BTreeMap<String, DagNode<I>>,
+    pub nodes: BTreeMap<String, DagNode<I, S>>,
 }
 
-impl<I: Clone + Send + Sync + 'static> DagSpec<I> {
+impl<I: Clone + Send + Sync + 'static, S: Clone + Send + Sync + 'static> DagSpec<I, S> {
     pub fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -72,11 +72,11 @@ impl<I: Clone + Send + Sync + 'static> DagSpec<I> {
         }
     }
 
-    pub fn node<F, Fut, D, S>(mut self, id: impl Into<String>, deps: D, run: F) -> Self
+    pub fn node<F, Fut, D, N>(mut self, id: impl Into<String>, deps: D, run: F) -> Self
     where
-        D: IntoIterator<Item = S>,
-        S: Into<String>,
-        F: Fn(StepCtx<I>, BTreeMap<String, Value>) -> Fut + Send + Sync + 'static,
+        D: IntoIterator<Item = N>,
+        N: Into<String>,
+        F: Fn(StepCtx<I, S>, BTreeMap<String, Value>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Value>> + Send + 'static,
     {
         self.nodes.insert(id.into(), DagNode::new(deps, run));
@@ -116,7 +116,9 @@ impl<I: Clone + Send + Sync + 'static> DagSpec<I> {
 /// 声明期校验：重复节点 / 未知依赖 / 环，以及 `__dag*` 保留前缀。
 /// 图本身交给 [`DagShape::build`] 把关（经 [`DagSpec::shape`]）；先做拓扑
 /// 排序以满足它「先声明后引用」的要求。
-pub fn define_dag<I: Clone + Send + Sync + 'static>(spec: DagSpec<I>) -> Result<Arc<DagSpec<I>>> {
+pub fn define_dag<I: Clone + Send + Sync + 'static, S: Clone + Send + Sync + 'static>(
+    spec: DagSpec<I, S>,
+) -> Result<Arc<DagSpec<I, S>>> {
     for id in spec.nodes.keys() {
         if id.starts_with("__dag") {
             return Err(anyhow!("dag \"{}\": node id \"{id}\" uses reserved __dag* prefix", spec.id));
@@ -126,10 +128,10 @@ pub fn define_dag<I: Clone + Send + Sync + 'static>(spec: DagSpec<I>) -> Result<
     Ok(Arc::new(spec))
 }
 
-fn topo_order<I>(spec: &DagSpec<I>) -> Result<Vec<String>> {
-    fn visit<I>(
+fn topo_order<I, S>(spec: &DagSpec<I, S>) -> Result<Vec<String>> {
+    fn visit<I, S>(
         id: &str,
-        spec: &DagSpec<I>,
+        spec: &DagSpec<I, S>,
         state: &mut HashMap<String, u8>,
         stack: &mut Vec<String>,
         out: &mut Vec<String>,

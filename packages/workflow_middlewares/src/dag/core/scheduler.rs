@@ -26,10 +26,14 @@ use super::declare::DagSpec;
 /// 首个失败会 `abort_all()`，避免孤儿任务继续写 checkpoint。
 ///
 /// 泛型约束的来历：ctx 要 clone 进每个节点任务（`Clone + Send + Sync`）。
-/// 节点闭包经 `sc.ctx.input` 拿 **typed** run input（`RunCtx<I>`，run 级
-/// 视图不擦除）——typed 工作流（如 dub 的 `DubSfOcrInput`）与 Value 工作流
-/// 都满足。`S: Serialize` 是 `BaseCtx::step` 序列化 state 的既有要求。
-pub async fn run_dag<I, S>(ctx: &BaseCtx<I, S>, spec: &DagSpec<I>) -> Result<BTreeMap<String, Value>>
+/// 节点闭包经 `sc.ctx.input` / `sc.ctx.state` 拿 **typed** run input / state
+/// 快照（`RunCtx<I, S>`，run 级视图不擦除）——typed 工作流（如 dub 的
+/// `DubSfOcrInput` / `DubSfOcrState`）与 Value 工作流都满足。
+/// `S: Serialize` 是 `BaseCtx::step` 序列化 state 的既有要求。
+pub async fn run_dag<I, S>(
+    ctx: &BaseCtx<I, S>,
+    spec: &DagSpec<I, S>,
+) -> Result<BTreeMap<String, Value>>
 where
     I: Clone + Send + Sync + 'static,
     S: Serialize + Clone + Send + Sync + 'static,
@@ -75,7 +79,7 @@ where
 /// 取一个节点的结果（必要时先执行）。返回 boxed future 以支持 DAG 递归。
 fn ensure<'a, I, S>(
     id: &'a str,
-    spec: &'a DagSpec<I>,
+    spec: &'a DagSpec<I, S>,
     cells: &'a BTreeMap<String, Arc<OnceCell<Value>>>,
     ctx: &'a BaseCtx<I, S>,
 ) -> BoxFuture<'a, Result<Value>>
@@ -99,7 +103,7 @@ where
             }
             let run = node.run.clone();
             let step_id = id.to_string();
-            ctx.step(&step_id, move |sc: StepCtx<I>| {
+            ctx.step(&step_id, move |sc: StepCtx<I, S>| {
                 let run = run.clone();
                 let deps = deps.clone();
                 async move { run(sc, deps).await }
@@ -114,7 +118,7 @@ where
 /// 工厂入口：同一套调度逻辑做成 handler，用户自己控制 id / input / meta。
 /// 节点闭包、step id 全部来自 spec——**handler 不需要用户手写**。
 pub fn dag_to_handler<I, S>(
-    spec: Arc<DagSpec<I>>,
+    spec: Arc<DagSpec<I, S>>,
 ) -> impl Fn(BaseCtx<I, S>) -> BoxFuture<'static, Result<Value>> + Clone + Send + Sync + 'static
 where
     I: Clone + Send + Sync + 'static,

@@ -2,6 +2,14 @@
 
 **结论：step 闭包里不要写 `ctx.state`。跨步骤传数据走 step 的返回值。**
 
+**一句话教义：对外观测走发送（emit/delta，不追加日志，丢了无害）；对内数据走
+返回值与依赖关系（进 checkpoint，重放负责）。两个通道不共用任何载体。**
+
+**DAG 形态推论：state 是 run 常量**——生成的 handler 无写入者，state ≡
+`initialize(input)` 产物；节点经 `sc.ctx.state` 读 attempt 入口镜像（typed
+快照，无回流通道），事件日志零 `STATE_DELTA`（场景
+`dag_state_is_a_run_constant_zero_delta_events` 实测钉死）。
+
 这不是风格偏好，是从工作流的本质直接推出来的。
 
 ## 工作流的本质：对副作用的编排

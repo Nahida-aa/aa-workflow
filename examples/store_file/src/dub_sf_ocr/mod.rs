@@ -37,11 +37,12 @@
 //!
 //! # 节点闭包的纪律（ctx-state）
 //!
-//! 节点闭包**不碰 `ctx.state`**：state 由 [`DubSfOcrState::from_input`] 从
-//! input 重建（与 builder 的 `initialize` 同一实现），上游产物从
-//! `deps[节点 id]` 反序列化——「step 只读 state」这条规则由签名保证
-//! （闭包里根本没有 ctx；见 [`stub`] 的文档与 `docs/concepts/ctx-state.md`）。
-//! 跨节点传数据走**耐久结果**（checkpoint 的 JSON），不走 state。
+//! 节点闭包经 `sc.ctx.state` **只读** state（typed 快照，无任何写通道——
+//! 值拷贝改不动引擎镜像），上游产物从 `deps[节点 id]` 反序列化。DAG 形态
+//! 下 state 无写入者：一次 run 内恒定 ≡ `initialize` 产物，事件日志零
+//! `STATE_DELTA`（场景 ⑤ 实测钉死）。对外观测走发送（emit/delta，不追加
+//! 日志）；对内数据走返回值与依赖关系（进 checkpoint）——两个通道不共用
+//! 任何载体（见 `docs/concepts/ctx-state.md`）。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -260,8 +261,9 @@ pub struct DubSfOcrState {
 }
 
 impl DubSfOcrState {
-    /// `initialize` 的唯一实现——builder 与节点闭包共用。state 全部由 input
-    /// 派生（不落盘），两个消费点从同一条派生规则出发，不会各算各的。
+    /// `initialize` 的实现（builder 装配时安装）。state 全部由 input 派生
+    /// （不落盘）；节点闭包经 `sc.ctx.state` 读的是**引擎镜像**（≡ 本函数
+    /// 的产物，见模块文档的常量结论），不再各自重建。
     pub fn from_input(input: &DubSfOcrInput) -> Self {
         Self {
             video_dir: input.video_dir.clone(),
@@ -497,17 +499,17 @@ fn dub_builder() -> WorkflowBuilder<DubSfOcrInput, (), DubSfOcrState> {
 /// ——handler 由 [`dag_to_handler`] 从它生成，形状由 [`DagSpec::shape`]
 /// 从它派生，没有任何第二份编码。
 ///
-/// 节点闭包的形状：`(sc, deps)`——`sc.ctx.input` 是 **typed** run input
-/// （`RunCtx<DubSfOcrInput>`，不过 JSON），`deps[节点 id]` 反序列化上游产物，
-/// [`DubSfOcrState::from_input`] 重建 state → 调「外部服务」（模型类节点经
-/// [`DubEnv`]）或本地处理（ffmpeg 类节点直接调自由函数）→ typed 产物序列化
-/// 进 checkpoint。
+/// 节点闭包的形状：`(sc, deps)`——`sc.ctx.state` 是 **typed** state 快照
+/// （`RunCtx<DubSfOcrInput, DubSfOcrState>`：DAG 形态下 state 无写入者，
+/// 一次 run 内恒定 ≡ `initialize` 产物），`deps[节点 id]` 反序列化上游产物
+/// → 调「外部服务」（模型类节点经 [`DubEnv`]）或本地处理（ffmpeg 类节点
+/// 直接调自由函数）→ typed 产物序列化进 checkpoint。
 ///
 /// env 的捕获仪式（[`DagRunFn`][aa_workflow_middlewares::DagSpec] 是
 /// `Arc<dyn Fn>`，`'static` future 不许借用）：闭包外预克隆一份 handle、
 /// 闭包内每次调用再克隆——`DubEnv` 是 Arc 内核，克隆只是多一个指向同一
 /// 环境的 handle。
-fn dub_spec(env: DubEnv) -> DagSpec<DubSfOcrInput> {
+fn dub_spec(env: DubEnv) -> DagSpec<DubSfOcrInput, DubSfOcrState> {
     // env 的 per-node 预克隆（见上文捕获仪式）。
     let env_sep = env.clone();
     let env_sep2 = env.clone();
@@ -521,7 +523,7 @@ fn dub_spec(env: DubEnv) -> DagSpec<DubSfOcrInput> {
         .node("separate", Vec::<&str>::new(), move |sc, _deps| {
             let env = env_sep.clone();
             async move {
-                let st = DubSfOcrState::from_input(&sc.ctx.input);
+                let st = &sc.ctx.state;
                 let out = env.separate(&st).await?;
                 Ok(serde_json::to_value(out)?)
             }
@@ -529,7 +531,7 @@ fn dub_spec(env: DubEnv) -> DagSpec<DubSfOcrInput> {
         .node("separate_after", ["separate"], move |sc, deps| {
             let env = env_sep2.clone();
             async move {
-                let st = DubSfOcrState::from_input(&sc.ctx.input);
+                let st = &sc.ctx.state;
                 let prev: Separated = serde_json::from_value(deps["separate"].clone())?;
                 let out = env.separate_after(&st, &prev).await?;
                 Ok(serde_json::to_value(out)?)
@@ -538,7 +540,7 @@ fn dub_spec(env: DubEnv) -> DagSpec<DubSfOcrInput> {
         // 分支 B：抽关键帧 → OCR → 校正 → 翻译（抽帧是本地处理）。
         .node("sf_ocr_pre", Vec::<&str>::new(), move |sc, _deps| {
             async move {
-                let st = DubSfOcrState::from_input(&sc.ctx.input);
+                let st = &sc.ctx.state;
                 let out = sf_ocr_pre(&st).await?;
                 Ok(serde_json::to_value(out)?)
             }
@@ -546,7 +548,7 @@ fn dub_spec(env: DubEnv) -> DagSpec<DubSfOcrInput> {
         .node("sf_ocr", ["sf_ocr_pre"], move |sc, deps| {
             let env = env_ocr.clone();
             async move {
-                let st = DubSfOcrState::from_input(&sc.ctx.input);
+                let st = &sc.ctx.state;
                 let frames: Keyframes = serde_json::from_value(deps["sf_ocr_pre"].clone())?;
                 let out = env.sf_ocr(&st, &frames).await?;
                 Ok(serde_json::to_value(out)?)
@@ -555,7 +557,7 @@ fn dub_spec(env: DubEnv) -> DagSpec<DubSfOcrInput> {
         .node("sf_ocr_fix", ["sf_ocr"], move |sc, deps| {
             let env = env_fix.clone();
             async move {
-                let st = DubSfOcrState::from_input(&sc.ctx.input);
+                let st = &sc.ctx.state;
                 let raw: RawSubtitle = serde_json::from_value(deps["sf_ocr"].clone())?;
                 let out = env.sf_ocr_fix(&st, &raw).await?;
                 Ok(serde_json::to_value(out)?)
@@ -564,7 +566,7 @@ fn dub_spec(env: DubEnv) -> DagSpec<DubSfOcrInput> {
         .node("translate", ["sf_ocr_fix"], move |sc, deps| {
             let env = env_tr.clone();
             async move {
-                let st = DubSfOcrState::from_input(&sc.ctx.input);
+                let st = &sc.ctx.state;
                 let fixed: FixedSubtitle = serde_json::from_value(deps["sf_ocr_fix"].clone())?;
                 let out = env.translate(&st, &fixed).await?;
                 Ok(serde_json::to_value(out)?)
@@ -576,7 +578,7 @@ fn dub_spec(env: DubEnv) -> DagSpec<DubSfOcrInput> {
             ["separate_after", "translate"],
             move |sc, deps| {
                 async move {
-                    let st = DubSfOcrState::from_input(&sc.ctx.input);
+                    let st = &sc.ctx.state;
                     let vocals: Separated =
                         serde_json::from_value(deps["separate_after"].clone())?;
                     let translated: Translated =
@@ -589,7 +591,7 @@ fn dub_spec(env: DubEnv) -> DagSpec<DubSfOcrInput> {
         .node("tts", ["split_audio"], move |sc, deps| {
             let env = env_tts.clone();
             async move {
-                let st = DubSfOcrState::from_input(&sc.ctx.input);
+                let st = &sc.ctx.state;
                 let timings: Timings = serde_json::from_value(deps["split_audio"].clone())?;
                 let out = env.tts(&st, &timings).await?;
                 Ok(serde_json::to_value(out)?)
@@ -597,7 +599,7 @@ fn dub_spec(env: DubEnv) -> DagSpec<DubSfOcrInput> {
         })
         .node("mix_audio", ["separate_after", "tts"], move |sc, deps| {
             async move {
-                let st = DubSfOcrState::from_input(&sc.ctx.input);
+                let st = &sc.ctx.state;
                 let vocals: Separated = serde_json::from_value(deps["separate_after"].clone())?;
                 let batch: TtsBatch = serde_json::from_value(deps["tts"].clone())?;
                 let out = mix_audio(&st, &vocals, &batch).await?;
@@ -609,7 +611,7 @@ fn dub_spec(env: DubEnv) -> DagSpec<DubSfOcrInput> {
             ["separate_after", "mix_audio"],
             move |sc, deps| {
                 async move {
-                    let st = DubSfOcrState::from_input(&sc.ctx.input);
+                    let st = &sc.ctx.state;
                     let separated: Separated =
                         serde_json::from_value(deps["separate_after"].clone())?;
                     let audio: MixedAudio = serde_json::from_value(deps["mix_audio"].clone())?;

@@ -324,3 +324,51 @@ async fn errored_run_recovers_via_reseed_run() {
         );
     }
 }
+
+/// 场景 ⑤：**DAG 形态下 state 是 run 常量**——节点经 `sc.ctx.state` 读到
+/// attempt 入口镜像（≡ `initialize` 产物），且无任何写入者：
+/// ① 事件日志零 `STATE_DELTA`——对外观测走**发送**（emit/delta，不追加
+///    日志）；对内数据走**返回值与依赖关系**（进 checkpoint）。两个通道
+///    不共用任何载体；
+/// ② state 读路径实证：translate 的产物 `path` / `targetLang` 由
+///    `sc.ctx.state.target_lang` 派生（input 未给 → `initialize` 兜成
+///    `"zh"`）——节点读错 state 这里立即红。
+#[tokio::test]
+async fn dag_state_is_a_run_constant_zero_delta_events() {
+    let (rt, _ge) = get_runtime(&temp_base("dag-state"));
+    let out = start(&rt, "dag:s1", serde_json::json!({ "videoDir": "/w/const" }), None).await;
+    assert!(matches!(out.kind, WorkflowRuntimeRunResultKind::Completed));
+
+    let events = rt
+        .config
+        .store
+        .read_events(ReadEventsArgs { run_id: "dag:s1".into(), from_index: None })
+        .expect("读事件");
+
+    // ① 观测通道不落日志：DAG 形态无 state 写入者 → 零 STATE_DELTA。
+    let deltas = events.iter().filter(|e| e.event_type == "STATE_DELTA").count();
+    assert_eq!(
+        deltas, 0,
+        "DAG 形态 state 无写入者——日志不得出现 STATE_DELTA（观测走发送，不走日志）"
+    );
+
+    // ② state 读路径实证：translate 产物由 sc.ctx.state.target_lang 派生。
+    let tr = events
+        .iter()
+        .find_map(|e| match &e.event {
+            WorkflowEvent::StepFinished { step_id, result, .. } if step_id == "translate" => {
+                result.clone()
+            }
+            _ => None,
+        })
+        .expect("translate 应有 checkpoint");
+    assert_eq!(
+        tr,
+        serde_json::json!({
+            "path": "/w/const/translate/zh.json",
+            "targetLang": "zh",
+            "segments": 3,
+        }),
+        "节点经 sc.ctx.state 读到的 target_lang 应与 initialize 产物一致"
+    );
+}
