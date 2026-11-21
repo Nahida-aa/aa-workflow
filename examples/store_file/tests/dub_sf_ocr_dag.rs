@@ -57,11 +57,16 @@ fn get_runtime(base: &PathBuf) -> (Arc<WorkflowRuntimeDefinition>, Arc<GetEvents
     )
 }
 
-async fn start(rt: &WorkflowRuntimeDefinition, run_id: &str, meta: Option<serde_json::Value>) -> WorkflowRuntimeRunResult {
+async fn start(
+    rt: &WorkflowRuntimeDefinition,
+    run_id: &str,
+    input: serde_json::Value,
+    meta: Option<serde_json::Value>,
+) -> WorkflowRuntimeRunResult {
     rt.start_run(WorkflowRuntimeStartRunArgs {
         workflow_id: "dub-sf-ocr".to_string(),
         run_id: run_id.to_string(),
-        input: serde_json::json!({ "videoDir": "/w/exp" }),
+        input,
         meta,
         ..Default::default()
     })
@@ -108,7 +113,7 @@ fn imported_steps(rt: &WorkflowRuntimeDefinition, run_id: &str) -> Vec<String> {
 #[tokio::test]
 async fn full_first_run() {
     let (rt, _ge) = get_runtime(&temp_base("dag-full"));
-    let out = start(&rt, "dag:r1", None).await;
+    let out = start(&rt, "dag:r1", serde_json::json!({ "videoDir": "/w/exp" }), None).await;
     assert!(matches!(out.kind, WorkflowRuntimeRunResultKind::Completed));
     let executed = executed_steps(&rt, "dag:r1");
     assert_eq!(executed.len(), 10, "10 步全真跑");
@@ -119,11 +124,12 @@ async fn full_first_run() {
 #[tokio::test]
 async fn redo_reruns_the_translation_axis() {
     let (rt, _ge) = get_runtime(&temp_base("dag-redo"));
-    start(&rt, "dag:r1", None).await;
+    start(&rt, "dag:r1", serde_json::json!({ "videoDir": "/w/exp" }), None).await;
 
     let out = start(
         &rt,
         "dag:r2",
+        serde_json::json!({ "videoDir": "/w/exp" }),
         Some(serde_json::json!({
             "__dagPlan": {
                 "sourceRunId": "dag:r1",
@@ -156,9 +162,8 @@ async fn interim_goal_parks_then_resumes() {
     let out = start(
         &rt,
         "dag:g1",
-        Some(serde_json::json!({
-            "__dagPlan": { "goals": ["translate"] }
-        })),
+        serde_json::json!({ "videoDir": "/w/exp" }),
+        Some(serde_json::json!({ "__dagPlan": { "goals": ["translate"] } })),
     )
     .await;
     assert!(
@@ -238,4 +243,64 @@ async fn mismatched_registration_key_still_drives_start() {
 fn get_events_of(store: Arc<dyn WorkflowExecutionStore>) -> Arc<GetEvents> {
     let adapter = create_run_store_adapter(store);
     Arc::new(move |run_id: &str| adapter.get_events(run_id).map_err(Into::into))
+}
+
+/// 场景 ④：**步骤抛错 → reseed 型恢复（不指定目标的续驱）**——
+/// run1：翻译服务故障（input `translateDown: true`）→ translate 抛错 →
+/// `Errored`（人声轴 + OCR 链 5 步成功在案，translate `STEP_FAILED`）；
+/// run2：服务恢复（input 撤掉标志）+ reseedRun **缺省种子**（源日志未成功
+/// 节点 = translate 及其下游 4 步）→ 翻译轴真跑、幸存 5 步导入 → `Finished`。
+///
+/// 恢复型续驱（同 run 重驱）在这里是 rethrow 而非恢复（失败是终态）——
+/// reseed 型才是跑错之后的恢复路（`errored_run_redrive_rethrows` 引擎测试
+/// 钉过前半，本场景补真实流水线上的后半）。
+#[tokio::test]
+async fn errored_run_recovers_via_reseed_run() {
+    let (rt, _ge) = get_runtime(&temp_base("dag-err"));
+
+    // run1：翻译服务故障 → errored（5 步成功在案）
+    let broken = start(
+        &rt,
+        "dag:e1",
+        serde_json::json!({ "videoDir": "/w/exp", "translateDown": true }),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(broken.kind, WorkflowRuntimeRunResultKind::Errored),
+        "translate 抛错 → errored"
+    );
+    let executed_1 = executed_steps(&rt, "dag:e1");
+    for id in ["separate", "separate_after", "sf_ocr_pre", "sf_ocr", "sf_ocr_fix"] {
+        assert!(executed_1.contains(&id.to_string()), "{id} 成功在案");
+    }
+    assert!(
+        !executed_1.contains(&"translate".to_string()),
+        "translate 抛错（无成功 checkpoint）"
+    );
+
+    // run2：世界变了（服务恢复）——reseedRun 缺省种子 = 未成功节点
+    // 世界变了：服务恢复（input 撤掉 translateDown）——reseedRun 缺省种子
+    // = run1 日志未成功节点（translate 及其下游 4 步）。
+    let fixed = start(
+        &rt,
+        "dag:e2",
+        serde_json::json!({ "videoDir": "/w/exp" }),
+        Some(serde_json::json!({
+            "__dagPlan": { "sourceRunId": "dag:e1" }
+        })),
+    )
+    .await;
+    assert!(matches!(fixed.kind, WorkflowRuntimeRunResultKind::Completed));
+
+    let executed_2 = executed_steps(&rt, "dag:e2");
+    for id in ["translate", "split_audio", "tts", "mix_audio", "mix_video"] {
+        assert!(executed_2.contains(&id.to_string()), "{id} 真跑（未成功节点）");
+    }
+    for id in ["separate", "separate_after", "sf_ocr_pre", "sf_ocr", "sf_ocr_fix"] {
+        assert!(
+            !executed_2.contains(&id.to_string()),
+            "{id} 复用（imported_from 溯源）"
+        );
+    }
 }

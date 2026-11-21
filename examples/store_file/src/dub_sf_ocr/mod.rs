@@ -55,6 +55,11 @@ pub struct DubSfOcrInput {
     /// 目标语言；缺省由 `initialize` 兜成 `"zh"`。
     #[serde(default)]
     pub target_lang: Option<String>,
+    /// 翻译服务是否故障（DAG 例子的「世界状态」：源 run = true 故障，
+    /// redo run 缺省 = 服务恢复）。真实系统里这是外部服务状态——
+    /// 放 input 是因为它是**启动时的世界事实**（耐久、resume 不可变）。
+    #[serde(default)]
+    pub translate_down: bool,
 }
 
 /// dub-sf-ocr 的 **typed state**（Rust 版 zod `stateSchema`）。
@@ -402,6 +407,8 @@ pub async fn dub_run(ctx: BaseCtx<DubSfOcrInput, DubSfOcrState>) -> anyhow::Resu
         //
         // `try_join!` 返回 `Result<(A, B), E>`——A / B **不需要**同类型（只有
         // error 类型要统一），所以这里 A 是 `Separated`、B 是 `Translated`。
+        // 翻译服务故障（DAG 例子的世界状态）——translate 步骤闭包按此抛错。
+        let translate_down = ctx.input.translate_down;
         let (separated, translated) = tokio::try_join!(
             async {
                 // 分支 A：分离人声 + 伴奏。
@@ -432,7 +439,12 @@ pub async fn dub_run(ctx: BaseCtx<DubSfOcrInput, DubSfOcrState>) -> anyhow::Resu
                     })
                     .await?;
                 let st = Arc::clone(&state);
-                ctx.step("translate", move |_sc: StepCtx| async move {
+                // 世界状态在 input 里（translate_down）：true = 翻译服务故障，
+                // 闭包抛错 → run errored（翻译轴的 redo 场景的源）。
+                ctx.step("translate", move |sc: StepCtx| async move {
+                    if translate_down {
+                        return Err(anyhow::anyhow!("翻译服务不可用"));
+                    }
                     translate(&st, &fixed).await
                 })
                 .await
