@@ -52,7 +52,7 @@ async fn leaf(ctx: &RunCtx) -> Result<serde_json::Value, anyhow::Error> {
 #[derive(Clone)]
 struct SkipCps;
 impl MiddlewareServer for SkipCps {
-    async fn serve(&self, mut args: MiddlewareServerFnArgs) -> Result<serde_json::Value, anyhow::Error> {
+    async fn call(&self, mut args: MiddlewareServerFnArgs) -> Result<serde_json::Value, anyhow::Error> {
         if args.ctx.meta.try_get::<SkipFlag>().unwrap_or(false) {
             return Ok(serde_json::json!({ "skipped": true }));
         }
@@ -121,7 +121,7 @@ struct TimedCps {
     log: Arc<Mutex<Vec<String>>>,
 }
 impl MiddlewareServer for TimedCps {
-    async fn serve(&self, mut args: MiddlewareServerFnArgs) -> Result<serde_json::Value, anyhow::Error> {
+    async fn call(&self, mut args: MiddlewareServerFnArgs) -> Result<serde_json::Value, anyhow::Error> {
         let start = std::time::Instant::now();
         let out = args.next(None).await?;
         let ms = start.elapsed().as_millis();
@@ -245,7 +245,7 @@ where
 #[derive(Clone)]
 struct ExtCps;
 impl MiddlewareServer for ExtCps {
-    async fn serve(&self, mut args: MiddlewareServerFnArgs) -> Result<serde_json::Value, anyhow::Error> {
+    async fn call(&self, mut args: MiddlewareServerFnArgs) -> Result<serde_json::Value, anyhow::Error> {
         args.next(Some(serde_json::json!({ "from": "cps" }))).await
     }
 }
@@ -365,7 +365,7 @@ struct StepsMw {
     log: Arc<Mutex<Vec<String>>>,
 }
 impl MiddlewareServer for StepsMw {
-    async fn serve(&self, mut args: MiddlewareServerFnArgs) -> Result<serde_json::Value> {
+    async fn call(&self, mut args: MiddlewareServerFnArgs) -> Result<serde_json::Value> {
         self.log.lock().unwrap().push("mw-before".into());
         let out = args.next(None).await?;
         self.log.lock().unwrap().push("mw-after".into());

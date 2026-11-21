@@ -50,8 +50,11 @@ use crate::define::{BoxFuture, WorkflowCtx, WorkflowHandler};
 /// 的递归组合要把各层 clone 进 `'static` 闭包——struct 中间件的字段用
 /// `Arc` 句柄即可（Clone = 引用计数）。
 pub trait MiddlewareServer: Send + Sync + Clone + 'static {
-    /// 名字刻意不是 `call`——与 `Fn::call` 在 blanket 场景下会歧义（E0034）。
-    fn serve<'a>(
+    /// 方法名与 tower 的 `Service::call` 对齐。E0034 歧义（与 `Fn::call`）
+    /// 已重查排除：本 trait 无 `Fn` blanket，实现者（struct / [`Middleware`]）
+    /// 均非 `Fn`，泛型位按 bound 解析——唯一的理论暴露是用户为同一类型
+    /// 同时实现 `Fn` 与本 trait，tower 生态对同级暴露同样直接共存。
+    fn call<'a>(
         &'a self,
         args: MiddlewareServerFnArgs,
     ) -> impl Future<Output = Result<Value>> + Send + 'a;
@@ -71,7 +74,7 @@ pub struct Erased<M: MiddlewareServer>(M);
 
 impl<M: MiddlewareServer + 'static> DynMiddlewareServer for Erased<M> {
     fn call<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>> {
-        Box::pin(self.0.serve(args))
+        Box::pin(self.0.call(args))
     }
 }
 
@@ -107,11 +110,11 @@ pub type MiddlewareServerFn = Arc<dyn DynMiddlewareServer>;
 /// 元素是 [`MiddlewareServer`]（静态，零箱）或 [`Middleware`]（擦除，
 /// 动态元素的固有箱）。
 pub trait MiddlewareStack: Send + Sync + Clone + 'static {
-    fn serve(&self, inner: WorkflowHandler) -> WorkflowHandler;
+    fn compose(&self, inner: WorkflowHandler) -> WorkflowHandler;
 }
 
 impl MiddlewareStack for () {
-    fn serve(&self, inner: WorkflowHandler) -> WorkflowHandler {
+    fn compose(&self, inner: WorkflowHandler) -> WorkflowHandler {
         inner
     }
 }
@@ -121,7 +124,7 @@ where
     H: MiddlewareServer,
     T: MiddlewareStack,
 {
-    fn serve(&self, inner: WorkflowHandler) -> WorkflowHandler {
+    fn compose(&self, inner: WorkflowHandler) -> WorkflowHandler {
         let (head, tail) = self;
         let head = head.clone();
         let tail = tail.clone();
@@ -142,13 +145,13 @@ where
                 if let Some(ext) = ext {
                     ctx.engine.merge_ext(ext);
                 }
-                Box::pin(async move { tail.serve(inner)(ctx).await })
+                Box::pin(async move { tail.compose(inner)(ctx).await })
             });
             let sc = MiddlewareServerFnArgs {
                 ctx,
                 pipeline: Some(pipeline),
             };
-            Box::pin(async move { head.serve(sc).await })
+            Box::pin(async move { head.call(sc).await })
         })
     }
 }
@@ -439,10 +442,12 @@ impl Clone for Middleware {
 
 /// 擦除元素也是合法的静态栈成员（委托给内层 dyn——动态元素的固有箱）。
 impl MiddlewareServer for Middleware {
-    fn serve<'a>(
+    fn call<'a>(
         &'a self,
         args: MiddlewareServerFnArgs,
     ) -> impl Future<Output = Result<Value>> + Send + 'a {
+        // 内层是 dyn DynMiddlewareServer——它的 `call` 与本 trait 的 `call`
+        // 不同 trait，无歧义。
         self.server.call(args)
     }
 }
@@ -496,7 +501,7 @@ impl Middleware {
     /// ```ignore
     /// struct InterimGoalsMw { get_events: Arc<GetEvents> }
     /// impl MiddlewareServer for InterimGoalsMw {
-    ///     fn serve<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>> {
+    ///     fn call<'a>(&'a self, args: MiddlewareServerFnArgs) -> BoxFuture<'a, Result<Value>> {
     ///         Box::pin(async move {
     ///             let events = (self.get_events)(&args.ctx.run_id)?;   // 借 &self，无 clone
     ///             args.next(None).await
@@ -533,7 +538,7 @@ mod tests {
             calls: Arc<AtomicUsize>,
         }
         impl MiddlewareServer for CountingMw {
-            fn serve<'a>(
+            fn call<'a>(
                 &'a self,
                 args: MiddlewareServerFnArgs,
             ) -> BoxFuture<'a, Result<Value>> {
@@ -574,7 +579,7 @@ mod tests {
         #[derive(Clone)]
         struct Nop;
         impl MiddlewareServer for Nop {
-            fn serve<'a>(
+            fn call<'a>(
                 &'a self,
                 args: MiddlewareServerFnArgs,
             ) -> BoxFuture<'a, Result<Value>> {

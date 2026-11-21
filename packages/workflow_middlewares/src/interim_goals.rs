@@ -94,7 +94,7 @@ pub struct InterimGoalsMw {
 }
 
 impl MiddlewareServer for InterimGoalsMw {
-    async fn serve(&self, args: MiddlewareServerFnArgs) -> Result<Value> {
+    async fn call(&self, args: MiddlewareServerFnArgs) -> Result<Value> {
         let mut sc = args;
         // 目标只在 meta 里；缺失 = 本次 drive 不设临时目标。
         let goals: Vec<String> = match sc.ctx.meta.try_get::<InterimGoalsKey>() {

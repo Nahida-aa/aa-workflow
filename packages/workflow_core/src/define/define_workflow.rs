@@ -420,7 +420,7 @@ impl<TInput, TOutput, TState, TMeta, TMw: MiddlewareStack>
         });
         // 洋葱折叠（typestate 栈）：中间件栈在类型层组合，定义期一次擦除
         // （`MiddlewareStack::serve` 把栈折叠成一个 WorkflowHandler）。
-        let engine_handler: WorkflowHandler = self.stack.serve(innermost);
+        let engine_handler: WorkflowHandler = self.stack.compose(innermost);
         WorkflowDefinition {
             id,
             version,

@@ -116,7 +116,7 @@ pub struct DagPoliciesMw {
 }
 
 impl MiddlewareServer for DagPoliciesMw {
-    async fn serve(&self, args: MiddlewareServerFnArgs) -> Result<Value> {
+    async fn call(&self, args: MiddlewareServerFnArgs) -> Result<Value> {
         let mut sc = args;
 
         // 前置：解析 RunWorkflowOptions.meta 里的 DagPlan → PlanState。
