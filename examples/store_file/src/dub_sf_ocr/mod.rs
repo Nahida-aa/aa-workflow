@@ -65,44 +65,174 @@ pub struct DubSfOcrInput {
     pub target_lang: Option<String>,
 }
 
-/// dub 流水线的「环境」：**服务边界**——step 闭包经由它调外部服务。
+/// dub 依赖的**外部服务**（生产里各是一个模型 / API 进程）。
 ///
-/// 生产实现连真模型 / 真 API；本示例给可脚本化的假实现：可用性是一个
-/// 可翻转的环境事实，translate 调用经它回答「服务此刻挂了没有」。真实
-/// 系统里那是一次上游 API 调用的返回码，用户从不声明它——所以它不属于
-/// input（用户意图），属于环境。
-///
-/// `Arc` 内核：定义侧（[`dub_run`] 工厂捕获一份）与测试侧各持一个 handle，
-/// 共享同一个环境——「服务恢复」才能对后续 run 生效（[`dub_pipeline`] 在
-/// 同一进程里连跑 run1 / run2，环境状态自然延续，这正是真实世界的样子：
-/// 服务的健康度独立于任何 run 的 input 而变化）。
-#[derive(Clone)]
-pub struct DubEnv {
-    translate_available: Arc<AtomicBool>,
+/// 本地 ffmpeg 类处理（抽帧 / 切分 / 混音 / 合成视频）不算——同一台机器上
+/// 的子进程，没有独立的健康度要注入，所以它们不走环境边界。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DubService {
+    /// 人声 / 伴奏分离模型（`separate` 与 `separate_after` 两次调用共用）。
+    Separate,
+    /// subtitle-finder 关键帧 OCR。
+    SfOcr,
+    /// 字幕校正 LLM。
+    SfOcrFix,
+    /// 翻译模型。
+    Translate,
+    /// 逐段 TTS。
+    Tts,
 }
 
-impl Default for DubEnv {
-    /// 缺省 = 全部服务健康（绝大多数场景不需要注入任何故障）。
-    fn default() -> Self {
-        Self {
-            translate_available: Arc::new(AtomicBool::new(true)),
+impl DubService {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Separate => "separate",
+            Self::SfOcr => "sf_ocr",
+            Self::SfOcrFix => "sf_ocr_fix",
+            Self::Translate => "translate",
+            Self::Tts => "tts",
         }
     }
 }
 
+/// 一个外部服务的可用性——可翻转的环境事实（缺省健康）。
+///
+/// ⚠️ `Default` 手写不派生：`AtomicBool::default()` 是 `false`，派生会把
+/// 「缺省健康」变成「缺省全故障」。
+#[derive(Clone)]
+struct ServiceHealth(Arc<AtomicBool>);
+
+impl Default for ServiceHealth {
+    fn default() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+}
+
+/// dub 流水线的「环境」：**服务边界**——外部模型调用经由它发生。
+///
+/// 生产实现连真模型 / 真 API；本示例给可脚本化的假实现：每个服务一条
+/// 可用性（[`DubService`]），测试经 [`DubEnv::service_down`] /
+/// [`DubEnv::service_up`] 改环境表达「世界变了」——服务故障是一次上游
+/// API 调用的返回码，用户从不声明它，所以它不属于 input（用户意图），
+/// 属于环境。（以前这里有个 `translateDown` input 字段，是拿「启动时的
+/// 世界事实」给故障注入找的容身处。）
+///
+/// `Arc` 内核：定义侧与测试侧各持一个 handle，共享同一个环境——「服务
+/// 恢复」才能对后续 run 生效（dub 在同一进程里连跑 run1 / run2，环境状态
+/// 自然延续；这正是真实世界的样子：服务健康度独立于任何 run 的 input 而
+/// 变化）。
+///
+/// 服务实现（[`DubEnv::separate`] 等六个）是**假实现**：stub 计并发 / 记
+/// 日志 / 模拟耗时，再过可用性闸门。两个编排形态共用它们：
+/// - 主例 [`dub_run`]（手写 `try_join!`，Rust 原生并行的教具）；
+/// - dag 版（[`super::dag::dub_sf_ocr_dag`]，`dag_to_handler` 生成的
+///   handler，节点闭包调这些方法）。
+#[derive(Clone, Default)]
+pub struct DubEnv {
+    separate: ServiceHealth,
+    sf_ocr: ServiceHealth,
+    sf_ocr_fix: ServiceHealth,
+    translate: ServiceHealth,
+    tts: ServiceHealth,
+}
+
 impl DubEnv {
-    /// 环境事件：翻译服务故障——之后的 translate 调用返回 503。
-    pub fn translate_service_down(&self) {
-        self.translate_available.store(false, Ordering::SeqCst);
+    /// 环境事件：某外部服务故障——之后的调用返回 503。
+    pub fn service_down(&self, svc: DubService) {
+        self.health(svc).0.store(false, Ordering::SeqCst);
     }
 
-    /// 环境事件：翻译服务恢复。
-    pub fn translate_service_up(&self) {
-        self.translate_available.store(true, Ordering::SeqCst);
+    /// 环境事件：某外部服务恢复。
+    pub fn service_up(&self, svc: DubService) {
+        self.health(svc).0.store(true, Ordering::SeqCst);
     }
 
-    fn translate_available(&self) -> bool {
-        self.translate_available.load(Ordering::SeqCst)
+    fn health(&self, svc: DubService) -> &ServiceHealth {
+        match svc {
+            DubService::Separate => &self.separate,
+            DubService::SfOcr => &self.sf_ocr,
+            DubService::SfOcrFix => &self.sf_ocr_fix,
+            DubService::Translate => &self.translate,
+            DubService::Tts => &self.tts,
+        }
+    }
+
+    /// 服务调用前的可用性闸门——不可用即 503（生产里这是一次上游 API
+    /// 调用的返回码）。
+    fn check(&self, svc: DubService) -> anyhow::Result<()> {
+        if !self.health(svc).0.load(Ordering::SeqCst) {
+            anyhow::bail!("{} service unavailable: upstream 503", svc.name());
+        }
+        Ok(())
+    }
+
+    // ── 外部服务实现（假）：stub 计并发 / 记日志 / 模拟耗时，再过闸门 ──
+
+    /// 分离服务：无入参产物，产出人声 + 伴奏两条轨（分支 A 第 1 步调用）。
+    async fn separate(&self, st: &DubSfOcrState) -> anyhow::Result<Separated> {
+        stub(st, "separate", 50).await;
+        self.check(DubService::Separate)?;
+        Ok(Separated {
+            vocals: format!("{}/separate/target_3_vocals.wav", st.video_dir),
+            bgm: format!("{}/separate/target_bgm.wav", st.video_dir),
+        })
+    }
+
+    /// 分离服务第二轮：**消费**上一轮的分轨（分支 A 第 2 步调用）。
+    async fn separate_after(
+        &self,
+        st: &DubSfOcrState,
+        prev: &Separated,
+    ) -> anyhow::Result<Separated> {
+        stub(st, "separate_after", 50).await;
+        self.check(DubService::Separate)?;
+        Ok(Separated {
+            // 人声轨是上一轮的输入，所以这里能看到数据真的流过来了。
+            vocals: prev.vocals.clone(),
+            bgm: format!("{}/separate_after/target_bgm.wav", st.video_dir),
+        })
+    }
+
+    /// OCR 服务：**消费**关键帧目录，产出字幕（分支 B 第 2 步调用）。
+    async fn sf_ocr(&self, st: &DubSfOcrState, frames: &Keyframes) -> anyhow::Result<RawSubtitle> {
+        stub(st, "sf_ocr", 50).await;
+        self.check(DubService::SfOcr)?;
+        Ok(RawSubtitle {
+            srt: format!("{}/sf_ocr/raw.srt", st.video_dir),
+            segments: frames.frames,
+        })
+    }
+
+    /// 校正服务（LLM）：**消费**原始字幕，产出校正后的（分支 B 第 3 步调用）。
+    async fn sf_ocr_fix(&self, st: &DubSfOcrState, raw: &RawSubtitle) -> anyhow::Result<FixedSubtitle> {
+        stub(st, "sf_ocr_fix", 50).await;
+        self.check(DubService::SfOcrFix)?;
+        Ok(FixedSubtitle {
+            srt: format!("{}/sf_ocr_fix/fixed.srt", st.video_dir),
+            // 修复数不可能超过原始段数——`raw` 真的参与了计算。
+            repaired: 2.min(raw.segments),
+        })
+    }
+
+    /// 翻译服务：**消费**校正后的字幕 + 目标语言（分支 B 第 4 步调用）。
+    async fn translate(&self, st: &DubSfOcrState, fixed: &FixedSubtitle) -> anyhow::Result<Translated> {
+        stub(st, "translate", 50).await;
+        self.check(DubService::Translate)?;
+        Ok(Translated {
+            path: format!("{}/translate/{}.json", st.video_dir, st.target_lang),
+            target_lang: st.target_lang.clone(),
+            segments: fixed.repaired + 1,
+        })
+    }
+
+    /// TTS 服务：**消费**分段表，产出逐段 wav（汇聚链第 2 步调用）。
+    async fn tts(&self, st: &DubSfOcrState, timings: &Timings) -> anyhow::Result<TtsBatch> {
+        stub(st, "tts", 50).await;
+        self.check(DubService::Tts)?;
+        Ok(TtsBatch {
+            dir: format!("{}/tts/wavs", st.video_dir),
+            wavs: timings.segments,
+        })
     }
 }
 
@@ -130,6 +260,23 @@ pub struct DubSfOcrState {
     pub target_lang: String,
     pub output_mode: String,
     pub subtitle_source: String,
+}
+
+impl DubSfOcrState {
+    /// `initialize` 的唯一实现——主例 builder 与 dag 节点闭包共用。state
+    /// 全部由 input 派生（不落盘，每次 start / resume 从这里重建），所以
+    /// 两个编排形态从同一条派生规则出发，不会各算各的。
+    pub fn from_input(input: &DubSfOcrInput) -> Self {
+        Self {
+            video_dir: input.video_dir.clone(),
+            target_lang: input
+                .target_lang
+                .clone()
+                .unwrap_or_else(|| "zh".to_string()),
+            output_mode: "dub".to_string(),
+            subtitle_source: "sf_ocr".to_string(),
+        }
+    }
 }
 
 /// 并发探针：记录同时在飞的 step 数峰值。
@@ -250,7 +397,10 @@ struct MixedVideo {
     audio: String,
 }
 
-/// 桩 step 的公共**行为**：计并发 → 记一行 → 模拟耗时。
+/// 外部服务桩的公共**行为**：计并发 → 记一行 → 模拟耗时。
+///
+/// 服务实现（[`DubEnv`] 的六个方法）与本地处理步骤（抽帧 / 切分 / 混音 /
+/// 合成视频）都经它。
 ///
 /// 只抽行为，不抽签名。每个 step 的入参（消费上游产物）和返回类型各不相同，
 /// 那正是这个示例要展示的东西——把它们压成一个 `dub_step(&st, "字面量", ms)`
@@ -273,74 +423,12 @@ async fn stub(st: &DubSfOcrState, name: &str, millis: u64) {
     dub_probe::leave();
 }
 
-/// 分支 A 第 1 步：无入参产物，产出两条轨。
-async fn separate(st: &DubSfOcrState) -> anyhow::Result<Separated> {
-    stub(st, "separate", 50).await;
-    Ok(Separated {
-        vocals: format!("{}/separate/target_3_vocals.wav", st.video_dir),
-        bgm: format!("{}/separate/target_bgm.wav", st.video_dir),
-    })
-}
-
-/// 分支 A 第 2 步：**消费**上一轮的分轨。
-async fn separate_after(st: &DubSfOcrState, prev: &Separated) -> anyhow::Result<Separated> {
-    stub(st, "separate_after", 50).await;
-    Ok(Separated {
-        // 人声轨是上一轮的输入，所以这里能看到数据真的流过来了。
-        vocals: prev.vocals.clone(),
-        bgm: format!("{}/separate_after/target_bgm.wav", st.video_dir),
-    })
-}
-
-/// 分支 B 第 1 步：抽关键帧。
+/// 分支 B 第 1 步：抽关键帧（本地 ffmpeg 类处理，不走服务边界）。
 async fn sf_ocr_pre(st: &DubSfOcrState) -> anyhow::Result<Keyframes> {
     stub(st, "sf_ocr_pre", 50).await;
     Ok(Keyframes {
         dir: format!("{}/sf_ocr_pre/frames", st.video_dir),
         frames: 12,
-    })
-}
-
-/// 分支 B 第 2 步：**消费**关键帧目录，产出字幕。
-async fn sf_ocr(st: &DubSfOcrState, frames: &Keyframes) -> anyhow::Result<RawSubtitle> {
-    stub(st, "sf_ocr", 50).await;
-    Ok(RawSubtitle {
-        srt: format!("{}/sf_ocr/raw.srt", st.video_dir),
-        segments: frames.frames,
-    })
-}
-
-/// 分支 B 第 3 步：**消费**原始字幕，产出校正后的。
-async fn sf_ocr_fix(st: &DubSfOcrState, raw: &RawSubtitle) -> anyhow::Result<FixedSubtitle> {
-    stub(st, "sf_ocr_fix", 50).await;
-    Ok(FixedSubtitle {
-        srt: format!("{}/sf_ocr_fix/fixed.srt", st.video_dir),
-        // 修复数不可能超过原始段数——`raw` 真的参与了计算。
-        repaired: 2.min(raw.segments),
-    })
-}
-
-/// 分支 B 第 4 步：**消费**校正后的字幕 + 读 state 的目标语言。
-///
-/// 这是全流程唯一正当使用 `target_lang` 的地方——译文的目标语言本来就是
-/// translate 这一步的产物。之前它出现在 10 个 step 的返回里，等于把 state
-/// 回显伪装成产物。
-///
-/// 故障由**环境**注入（[`DubEnv`]）：服务不可用就抛 503——真实系统里这是
-/// 一次上游 API 调用的返回码，不是 input 里的标志。
-async fn translate(
-    env: &DubEnv,
-    st: &DubSfOcrState,
-    fixed: &FixedSubtitle,
-) -> anyhow::Result<Translated> {
-    stub(st, "translate", 50).await;
-    if !env.translate_available() {
-        anyhow::bail!("translate service unavailable: upstream 503");
-    }
-    Ok(Translated {
-        path: format!("{}/translate/{}.json", st.video_dir, st.target_lang),
-        target_lang: st.target_lang.clone(),
-        segments: fixed.repaired + 1,
     })
 }
 
@@ -361,15 +449,6 @@ async fn split_audio(
     Ok(Timings {
         path,
         segments: translated.segments,
-    })
-}
-
-/// 汇聚第 2 步：**消费**分段表，产出逐段 wav。
-async fn tts(st: &DubSfOcrState, timings: &Timings) -> anyhow::Result<TtsBatch> {
-    stub(st, "tts", 50).await;
-    Ok(TtsBatch {
-        dir: format!("{}/tts/wavs", st.video_dir),
-        wavs: timings.segments,
     })
 }
 
@@ -424,17 +503,7 @@ pub fn dub_builder(
             .input::<DubSfOcrInput>()
             .state::<DubSfOcrState>()
             // state 不落盘：每次 start / resume 都从这里重建。
-            .initialize(|input: &DubSfOcrInput| {
-                Ok(DubSfOcrState {
-                    video_dir: input.video_dir.clone(),
-                    target_lang: input
-                        .target_lang
-                        .clone()
-                        .unwrap_or_else(|| "zh".to_string()),
-                    output_mode: "dub".to_string(),
-                    subtitle_source: "sf_ocr".to_string(),
-                })
-            }),
+            .initialize(|input: &DubSfOcrInput| Ok(DubSfOcrState::from_input(input))),
     )
 }
 
@@ -484,40 +553,50 @@ async fn dub_pipeline(
         // error 类型要统一），所以这里 A 是 `Separated`、B 是 `Translated`。
         let (separated, translated) = tokio::try_join!(
             async {
-                // 分支 A：分离人声 + 伴奏。
+                // 分支 A：分离人声 + 伴奏（两轮分离都走分离服务）。
+                // env 是 Arc 内核：每个 step 闭包克隆一份 handle——从稳定
+                // 的 env 参数出发（同 `st` 的模式），各步克隆互不干扰。
                 let st = Arc::clone(&state);
+                let env_sep = env.clone();
                 let sep = ctx
-                    .step("separate", move |_sc: StepCtx| async move { separate(&st).await })
+                    .step("separate", move |_sc: StepCtx| async move {
+                        env_sep.separate(&st).await
+                    })
                     .await?;
                 let st = Arc::clone(&state);
+                let env_sep2 = env.clone();
                 ctx.step("separate_after", move |_sc: StepCtx| async move {
-                    separate_after(&st, &sep).await
+                    env_sep2.separate_after(&st, &sep).await
                 })
                 .await
             },
             async {
                 // 分支 B：抽关键帧 → OCR → 校正 → 翻译，四步串成一条链。
+                // 抽帧是本地处理（不走服务边界）；OCR / 校正 / 翻译是模型
+                // 调用，故障由**环境**回答——真实系统里这就是一次上游 API
+                // 调用拿到 503。
                 let st = Arc::clone(&state);
                 let frames = ctx
                     .step("sf_ocr_pre", move |_sc: StepCtx| async move { sf_ocr_pre(&st).await })
                     .await?;
                 let st = Arc::clone(&state);
+                let env_ocr = env.clone();
                 let raw = ctx
-                    .step("sf_ocr", move |_sc: StepCtx| async move { sf_ocr(&st, &frames).await })
-                    .await?;
-                let st = Arc::clone(&state);
-                let fixed = ctx
-                    .step("sf_ocr_fix", move |_sc: StepCtx| async move {
-                        sf_ocr_fix(&st, &raw).await
+                    .step("sf_ocr", move |_sc: StepCtx| async move {
+                        env_ocr.sf_ocr(&st, &frames).await
                     })
                     .await?;
                 let st = Arc::clone(&state);
-                // 故障由**环境**回答（env 的服务状态），不是 input 标志——
-                // 真实系统里这就是一次上游 API 调用拿到 503。`DubEnv` 是
-                // Arc 内核，克隆只是多一个指向同一环境的 handle。
-                let env = env.clone();
+                let env_fix = env.clone();
+                let fixed = ctx
+                    .step("sf_ocr_fix", move |_sc: StepCtx| async move {
+                        env_fix.sf_ocr_fix(&st, &raw).await
+                    })
+                    .await?;
+                let st = Arc::clone(&state);
+                let env_tr = env.clone();
                 ctx.step("translate", move |sc: StepCtx| async move {
-                    translate(&env, &st, &fixed).await
+                    env_tr.translate(&st, &fixed).await
                 })
                 .await
             },
@@ -553,8 +632,9 @@ async fn dub_pipeline(
         let out_timings = timings.clone();
 
         let st = Arc::clone(&state);
+        let env_tts = env.clone();
         let tts = ctx
-            .step("tts", move |_sc: StepCtx| async move { tts(&st, &timings).await })
+            .step("tts", move |_sc: StepCtx| async move { env_tts.tts(&st, &timings).await })
             .await?;
         let out_tts = tts.clone();
 

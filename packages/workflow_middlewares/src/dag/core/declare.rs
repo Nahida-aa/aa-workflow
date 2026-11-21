@@ -65,35 +65,47 @@ impl DagSpec {
         self.nodes.insert(id.into(), DagNode::new(deps, run));
         self
     }
+
+    /// spec → 形状图（[`DagShape`]）：调度执行与策略中间件的名单计算共用
+    /// **同一张图**——声明式的单一真相源，没有「手写编排与形状各编码一遍」
+    /// 的漂移面。校验与 [`define_dag`] 同源（拓扑排序 + 未知依赖 / 环）。
+    pub fn shape(&self) -> Result<DagShape> {
+        let order = topo_order(self)?;
+        // 把拓扑序转成 DagShape::build 要的 (&str, &[&str])。
+        let steps: Vec<(String, Vec<String>)> = order
+            .iter()
+            .map(|id| {
+                let deps = self
+                    .nodes
+                    .get(id)
+                    .map(|n| n.deps.clone())
+                    .unwrap_or_default();
+                (id.clone(), deps)
+            })
+            .collect();
+        let dep_refs: Vec<Vec<&str>> = steps
+            .iter()
+            .map(|(_, deps)| deps.iter().map(String::as_str).collect())
+            .collect();
+        let declared: Vec<(&str, &[&str])> = steps
+            .iter()
+            .zip(dep_refs.iter())
+            .map(|((id, _), deps)| (id.as_str(), deps.as_slice()))
+            .collect();
+        Ok(DagShape::build(&declared)?)
+    }
 }
 
 /// 声明期校验：重复节点 / 未知依赖 / 环，以及 `__dag*` 保留前缀。
-/// 图本身交给 [`DagShape::build`] 把关；先做拓扑排序以满足它「先声明后引用」的要求。
+/// 图本身交给 [`DagShape::build`] 把关（经 [`DagSpec::shape`]）；先做拓扑
+/// 排序以满足它「先声明后引用」的要求。
 pub fn define_dag(spec: DagSpec) -> Result<Arc<DagSpec>> {
     for id in spec.nodes.keys() {
         if id.starts_with("__dag") {
             return Err(anyhow!("dag \"{}\": node id \"{id}\" uses reserved __dag* prefix", spec.id));
         }
     }
-    let order = topo_order(&spec)?;
-    // 把拓扑序转成 DagShape::build 要的 (&str, &[&str])。
-    let steps: Vec<(String, Vec<String>)> = order
-        .iter()
-        .map(|id| {
-            let deps = spec.nodes.get(id).map(|n| n.deps.clone()).unwrap_or_default();
-            (id.clone(), deps)
-        })
-        .collect();
-    let dep_refs: Vec<Vec<&str>> = steps
-        .iter()
-        .map(|(_, deps)| deps.iter().map(String::as_str).collect())
-        .collect();
-    let declared: Vec<(&str, &[&str])> = steps
-        .iter()
-        .zip(dep_refs.iter())
-        .map(|((id, _), deps)| (id.as_str(), deps.as_slice()))
-        .collect();
-    DagShape::build(&declared)?;
+    spec.shape()?;
     Ok(Arc::new(spec))
 }
 

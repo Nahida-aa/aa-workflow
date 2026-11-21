@@ -4,12 +4,15 @@
 //! **自己的依赖一全部就绪就立即执行**——即按依赖关系自动并发，没有波次
 //! （Kahn 层）栅栏造成的假等待。`OnceCell` memo 去重保证 diamond 里被多条
 //! 路径依赖的节点只执行一次 `ctx.step`；方案与边界见 ADR 0019。
+//!
+//! handler 是**生成的**（[`dag_to_handler`])——typed 工作流与 Value 工作流
+//! 都可用（泛型约束见 [`run_dag`]）。
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aa_workflow_core::define::{BoxFuture, StepCtx};
-use aa_workflow_core::WorkflowCtx;
+use aa_workflow_core::define::{BaseCtx, BoxFuture, StepCtx};
 use anyhow::{anyhow, Result};
+use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::OnceCell;
 use tokio::task::JoinSet;
@@ -21,14 +24,24 @@ use super::declare::DagSpec;
 /// 每个节点 spawn 一个任务，`OnceCell::get_or_try_init` 做 memo 去重，
 /// 使 diamond 里被多条路径依赖的节点只执行一次 `ctx.step`。
 /// 首个失败会 `abort_all()`，避免孤儿任务继续写 checkpoint。
-pub async fn run_dag(ctx: &WorkflowCtx, spec: &DagSpec) -> Result<BTreeMap<String, Value>> {
+///
+/// 泛型约束的来历：ctx 要 clone 进每个节点任务（`Clone + Send + Sync`），
+/// input 要序列化成节点闭包收到的 `Value`（[`DagRunFn`](super::declare::DagRunFn)
+/// 的入参形状是 JSON）——typed 工作流（如 dub 的 `DubSfOcrInput`）与
+/// Value 工作流都满足。
+pub async fn run_dag<I, S>(ctx: &BaseCtx<I, S>, spec: &DagSpec) -> Result<BTreeMap<String, Value>>
+where
+    I: Serialize + Clone + Send + Sync + 'static,
+    // Serialize：`BaseCtx::step` 要序列化 state（STATE_DELTA / checkpoint）。
+    S: Serialize + Clone + Send + Sync + 'static,
+{
     let cells: BTreeMap<String, Arc<OnceCell<Value>>> = spec
         .nodes
         .keys()
         .map(|id| (id.clone(), Arc::new(OnceCell::new())))
         .collect();
     let ctx = ctx.clone();
-    let input = ctx.input.clone();
+    let input = serde_json::to_value(&ctx.input)?;
 
     let mut set = JoinSet::new();
     for id in spec.nodes.keys() {
@@ -63,13 +76,17 @@ pub async fn run_dag(ctx: &WorkflowCtx, spec: &DagSpec) -> Result<BTreeMap<Strin
 }
 
 /// 取一个节点的结果（必要时先执行）。返回 boxed future 以支持 DAG 递归。
-fn ensure<'a>(
+fn ensure<'a, I, S>(
     id: &'a str,
     spec: &'a DagSpec,
     cells: &'a BTreeMap<String, Arc<OnceCell<Value>>>,
-    ctx: &'a WorkflowCtx,
+    ctx: &'a BaseCtx<I, S>,
     input: &'a Value,
-) -> BoxFuture<'a, Result<Value>> {
+) -> BoxFuture<'a, Result<Value>>
+where
+    I: Serialize + Clone + Send + Sync + 'static,
+    S: Serialize + Clone + Send + Sync + 'static,
+{
     Box::pin(async move {
         let cell = cells
             .get(id)
@@ -101,10 +118,15 @@ fn ensure<'a>(
 }
 
 /// 工厂入口：同一套调度逻辑做成 handler，用户自己控制 id / input / meta。
-pub fn dag_to_handler(
+/// 节点闭包、step id 全部来自 spec——**handler 不需要用户手写**。
+pub fn dag_to_handler<I, S>(
     spec: Arc<DagSpec>,
-) -> impl Fn(WorkflowCtx) -> BoxFuture<'static, Result<Value>> + Clone + Send + Sync + 'static {
-    move |ctx: WorkflowCtx| {
+) -> impl Fn(BaseCtx<I, S>) -> BoxFuture<'static, Result<Value>> + Clone + Send + Sync + 'static
+where
+    I: Serialize + Clone + Send + Sync + 'static,
+    S: Serialize + Clone + Send + Sync + 'static,
+{
+    move |ctx: BaseCtx<I, S>| {
         let spec = spec.clone();
         Box::pin(async move {
             let results = run_dag(&ctx, &spec).await?;

@@ -1,8 +1,9 @@
-//! `dub_sf_ocr` × **DAG 策略中间件**（`dag_policies`）——真实 10 步流水线上的
+//! `dub_sf_ocr` × **DAG 声明式调度 + 策略中间件**——真实 10 步流水线上的
 //! redo（世界变了重跑翻译轴）与临时目标（泊车 + 续驱）。
 //!
-//! 定义在 `src/dub_sf_ocr/dag.rs`（`dub_sf_ocr_dag`：同一条 handler 链 +
-//! `dag_policies` 中间件；shape 为 10 步真实依赖）。store 是 **FileExecutionStore**
+//! 定义在 `src/dub_sf_ocr/dag.rs`（`dub_sf_ocr_dag`：`define_dag` 声明 spec →
+//! handler 由 `dag_to_handler` **生成**，形状从 spec 派生——执行与策略同一
+//! 张图；服务调用经 `DubEnv` 环境边界）。store 是 **FileExecutionStore**
 //! ——redo 的源日志跨 run 持久（run2 读 run1 的事件）。
 //!
 //! 观测口径：**真跑** = `STEP_STARTED`（skip 复用不发起 attempt）；
@@ -21,8 +22,8 @@ use aa_workflow_runtime::{
     WorkflowRuntimeRunResult, WorkflowRuntimeRunResultKind, WorkflowRuntimeStartRunArgs,
     create_run_store_adapter, define_workflow_runtime,
 };
-use example_store_file::dub_sf_ocr::dag::{dub_sf_ocr_dag, dub_shape};
-use example_store_file::dub_sf_ocr::DubEnv;
+use example_store_file::dub_sf_ocr::dag::dub_sf_ocr_dag;
+use example_store_file::dub_sf_ocr::{DubEnv, DubService};
 use example_store_file::FileExecutionStore;
 
 /// runtime 组装：FileExecutionStore + dag 策略版 dub 注册 + `get_events` 注入。
@@ -257,10 +258,10 @@ fn get_events_of(store: Arc<dyn WorkflowExecutionStore>) -> Arc<GetEvents> {
 }
 
 /// 场景 ④：**步骤抛错 → reseed 型恢复（不指定目标的续驱）**——
-/// run1：**环境**故障（`env.translate_service_down()`，翻译服务 503）→
+/// run1：**环境**故障（`service_down(Translate)`，翻译服务 503）→
 /// translate 抛错 → `Errored`（人声轴 + OCR 链 5 步成功在案，
 /// translate `STEP_FAILED`）；
-/// run2：环境恢复（`env.translate_service_up()`）+ reseedRun **缺省种子**
+/// run2：环境恢复（`service_up(Translate)`）+ reseedRun **缺省种子**
 /// （源日志未成功节点 = translate 及其下游 4 步）→ 翻译轴真跑、幸存 5 步
 /// 导入 → `Finished`。
 ///
@@ -277,7 +278,7 @@ async fn errored_run_recovers_via_reseed_run() {
     let (rt, _ge) = get_runtime_with_env(&temp_base("dag-err"), &env);
 
     // run1：翻译服务故障（环境事件）→ errored（5 步成功在案）
-    env.translate_service_down();
+    env.service_down(DubService::Translate);
     let broken = start(
         &rt,
         "dag:e1",
@@ -300,7 +301,7 @@ async fn errored_run_recovers_via_reseed_run() {
 
     // run2：世界变了（服务恢复——环境事件，input 不动）——reseedRun 缺省
     // 种子 = run1 日志未成功节点（translate 及其下游 4 步）。
-    env.translate_service_up();
+    env.service_up(DubService::Translate);
     let fixed = start(
         &rt,
         "dag:e2",
