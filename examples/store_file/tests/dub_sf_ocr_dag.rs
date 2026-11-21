@@ -125,7 +125,7 @@ fn imported_steps(rt: &WorkflowRuntimeDefinition, run_id: &str) -> Vec<String> {
 #[tokio::test]
 async fn full_first_run() {
     let (rt, _ge) = get_runtime(&temp_base("dag-full"));
-    let out = start(&rt, "dag:r1", serde_json::json!({ "videoDir": "/w/exp" }), None).await;
+    let out = start(&rt, "dag:r1", serde_json::json!({ "video_dir": "/w/exp" }), None).await;
     assert!(matches!(out.kind, WorkflowRuntimeRunResultKind::Completed));
     let executed = executed_steps(&rt, "dag:r1");
     assert_eq!(executed.len(), 10, "10 步全真跑");
@@ -136,12 +136,12 @@ async fn full_first_run() {
 #[tokio::test]
 async fn redo_reruns_the_translation_axis() {
     let (rt, _ge) = get_runtime(&temp_base("dag-redo"));
-    start(&rt, "dag:r1", serde_json::json!({ "videoDir": "/w/exp" }), None).await;
+    start(&rt, "dag:r1", serde_json::json!({ "video_dir": "/w/exp" }), None).await;
 
     let out = start(
         &rt,
         "dag:r2",
-        serde_json::json!({ "videoDir": "/w/exp" }),
+        serde_json::json!({ "video_dir": "/w/exp" }),
         Some(serde_json::json!({
             "__dagPlan": {
                 "sourceRunId": "dag:r1",
@@ -174,7 +174,7 @@ async fn interim_goal_parks_then_resumes() {
     let out = start(
         &rt,
         "dag:g1",
-        serde_json::json!({ "videoDir": "/w/exp" }),
+        serde_json::json!({ "video_dir": "/w/exp" }),
         Some(serde_json::json!({ "__dagPlan": { "goals": ["translate"] } })),
     )
     .await;
@@ -242,7 +242,7 @@ async fn mismatched_registration_key_still_drives_start() {
         .start_run(WorkflowRuntimeStartRunArgs {
             workflow_id: "mismatched_key".into(),
             run_id: "dag:mismatch".into(),
-            input: serde_json::json!({ "videoDir": "/w/1" }),
+            input: serde_json::json!({ "video_dir": "/w/1" }),
             ..Default::default()
         })
         .await
@@ -265,7 +265,7 @@ fn get_events_of(store: Arc<dyn WorkflowExecutionStore>) -> Arc<GetEvents> {
 /// （源日志未成功节点 = translate 及其下游 4 步）→ 翻译轴真跑、幸存 5 步
 /// 导入 → `Finished`。
 ///
-/// 故障是**环境状态**，不是 input：input 只有用户意图（videoDir），「服务
+/// 故障是**环境状态**，不是 input：input 只有用户意图（video_dir），「服务
 /// 挂了没有」由 [`DubEnv`] 回答——真实系统里用户从不声明服务健康度，
 /// 世界变了改的是环境，不是 input。
 ///
@@ -282,7 +282,7 @@ async fn errored_run_recovers_via_reseed_run() {
     let broken = start(
         &rt,
         "dag:e1",
-        serde_json::json!({ "videoDir": "/w/exp" }),
+        serde_json::json!({ "video_dir": "/w/exp" }),
         None,
     )
     .await;
@@ -305,7 +305,7 @@ async fn errored_run_recovers_via_reseed_run() {
     let fixed = start(
         &rt,
         "dag:e2",
-        serde_json::json!({ "videoDir": "/w/exp" }),
+        serde_json::json!({ "video_dir": "/w/exp" }),
         Some(serde_json::json!({
             "__dagPlan": { "sourceRunId": "dag:e1" }
         })),
@@ -330,13 +330,13 @@ async fn errored_run_recovers_via_reseed_run() {
 /// ① 事件日志零 `STATE_DELTA`——对外观测走**发送**（emit/delta，不追加
 ///    日志）；对内数据走**返回值与依赖关系**（进 checkpoint）。两个通道
 ///    不共用任何载体；
-/// ② state 读路径实证：translate 的产物 `path` / `targetLang` 由
+/// ② state 读路径实证：translate 的产物 `path` / `target_lang` 由
 ///    `sc.ctx.state.target_lang` 派生（input 未给 → `initialize` 兜成
 ///    `"zh"`）——节点读错 state 这里立即红。
 #[tokio::test]
 async fn dag_state_is_a_run_constant_zero_delta_events() {
     let (rt, _ge) = get_runtime(&temp_base("dag-state"));
-    let out = start(&rt, "dag:s1", serde_json::json!({ "videoDir": "/w/const" }), None).await;
+    let out = start(&rt, "dag:s1", serde_json::json!({ "video_dir": "/w/const" }), None).await;
     assert!(matches!(out.kind, WorkflowRuntimeRunResultKind::Completed));
 
     let events = rt
@@ -366,7 +366,7 @@ async fn dag_state_is_a_run_constant_zero_delta_events() {
         tr,
         serde_json::json!({
             "path": "/w/const/translate/zh.json",
-            "targetLang": "zh",
+            "target_lang": "zh",
             "segments": 3,
         }),
         "节点经 sc.ctx.state 读到的 target_lang 应与 initialize 产物一致"

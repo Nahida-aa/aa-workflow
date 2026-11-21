@@ -54,7 +54,7 @@ use aa_workflow_middlewares::{DagSpec, DagShape, GetEvents, dag_policies, dag_to
 // dub_sf_ocr 的定义
 // ========================================================================
 
-/// dub-sf-ocr 输入：示例层不落盘，`videoDir` 只用于拼产物路径。
+/// dub-sf-ocr 输入：示例层不落盘，`video_dir` 只用于拼产物路径。
 ///
 /// 只有**用户意图**。翻译服务是否可用是**环境状态**（外部服务），不在这里
 /// ——run 的 input 跨 resume 不可变（ADR 0022：run 是不可变事实），而环境

@@ -74,7 +74,7 @@ fn temp_base(tag: &str) -> std::path::PathBuf {
 
 
 fn dub_input() -> serde_json::Value {
-    serde_json::json!({ "videoDir": "/w/1" })
+    serde_json::json!({ "video_dir": "/w/1" })
 }
 
 /// `dub_sf_ocr` 的 10 个 step。
@@ -233,7 +233,7 @@ async fn dub_sf_ocr_replay_short_circuits() {
 /// 每个 step 有**自己的**返回形状，且路径由 typed state 派生。
 ///
 /// 这条以前是个循环，断言 10 个 step 的结果都有 `["artifact"]` 和
-/// `["targetLang"]`——那是在强制一个假形状：`target_lang` 出现在每个 step 的
+/// `["target_lang"]`——那是在强制一个假形状：`target_lang` 出现在每个 step 的
 /// 返回里，只是把 state 回显伪装成产物，而真正的产物差异全压在一个字符串
 /// 字面量里。现在逐步骤钉死完整 JSON。
 ///
@@ -250,7 +250,7 @@ async fn dub_sf_ocr_each_step_has_its_own_shape() {
         .start_run(WorkflowRuntimeStartRunArgs {
             workflow_id: "dub_sf_ocr".to_string(),
             run_id: "dub-1".to_string(),
-            input: serde_json::json!({ "videoDir": "/w/1", "targetLang": "vi" }),
+            input: serde_json::json!({ "video_dir": "/w/1", "target_lang": "vi" }),
             ..Default::default()
         })
         .await
@@ -294,7 +294,7 @@ async fn dub_sf_ocr_each_step_has_its_own_shape() {
             // path 带 state 的目标语言；segments 来自 sf_ocr_fix 的 repaired
             serde_json::json!({
                 "path": "/w/1/translate/vi.json",
-                "targetLang": "vi",
+                "target_lang": "vi",
                 "segments": 3,
             }),
         ),
@@ -379,7 +379,7 @@ async fn dub_sf_ocr_step_shapes_are_distinct() {
     let _ = std::fs::remove_dir_all(base);
 }
 
-/// `targetLang` 缺省时由 `initialize` 兜成 `"zh"`——state 是**重建**的，
+/// `target_lang` 缺省时由 `initialize` 兜成 `"zh"`——state 是**重建**的，
 /// 不是从上次落盘读的。
 #[tokio::test]
 async fn dub_sf_ocr_state_defaults_target_lang() {
@@ -388,14 +388,13 @@ async fn dub_sf_ocr_state_defaults_target_lang() {
 
     let base = temp_base("default_lang");
     let rt = get_workflow_runtime(&base);
-    let out = drive(&rt, "dub-1", serde_json::json!({ "videoDir": "/w/2" })).await;
+    let out = drive(&rt, "dub-1", serde_json::json!({ "video_dir": "/w/2" })).await;
     assert_eq!(out.kind, WorkflowRuntimeRunResultKind::Completed);
 
     let events = events_of(&rt, "dub-1");
     let tr = step_output(&events, "translate");
     assert_eq!(tr["path"], "/w/2/translate/zh.json");
-    assert_eq!(tr["targetLang"], "zh");
+    assert_eq!(tr["target_lang"], "zh");
 
     let _ = std::fs::remove_dir_all(base);
 }
-
