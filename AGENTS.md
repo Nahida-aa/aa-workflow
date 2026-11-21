@@ -231,7 +231,7 @@ state **observability**"。
 ## 上下文变量命名（wc / sc）与中间件能力边界
 
 - `wc`：`WorkflowCtx`——handler 级上下文，以及**捕获进 step 闭包 / 中间件的克隆**。
-- `sc`：`StepCtx`（step 闭包参数）/ 中间件 server 的 `MiddlewareServerFnArgs`。
+- `sc`：**只指 `StepCtx`**（step 闭包参数）。中间件 server 的入参对象（`MiddlewareServerFnArgs`，对齐上游 `({ctx, next})`）命名 `args`——`sc` 与 StepCtx 撞名，不用。
 - step 闭包捕获 workflow ctx 时**一律命名 `wc`**——不写 `ctx2` / `ctx_clone`，避免与 `sc` 歧义。
 - **中间件调用 `ctx.step` 是设计意图之一**（middleware 作为编排者：`take_over` + 自发
   step，如低代码/声明式场景），**不是要避免的口子**。`StepCtx` 上刻意没有 durable
