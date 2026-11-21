@@ -221,6 +221,11 @@ pub struct WorkflowRuntimeStartRunArgs {
     pub workflow_id: WorkflowId,
     pub run_id: RunId,
     pub input: serde_json::Value,
+    /// Run 级参数（`RunWorkflowOptions.meta` 的擦除值——对象形如
+    /// `{ "__dagPlan": .. }`，键为各中间件的 `MetaKey::KEY`）。中间件经
+    /// `sc.ctx.meta.try_get::<K>()` 读取；resume 驱动（deliver_signal 等）
+    /// 不重传——run 级参数属于启动决策。
+    pub meta: Option<serde_json::Value>,
     /// 覆盖时钟（测试用）；缺省取当前时间。
     pub now: Option<i64>,
     pub deadline: Option<i64>,
@@ -534,6 +539,7 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
             workflow_id: &args.workflow_id,
             run_id: &args.run_id,
             input: Some(args.input),
+            meta: args.meta.clone(),
             lease_owner: args.lease_owner.clone(),
             lease_ms: args.lease_ms,
             now,
@@ -601,6 +607,7 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
                         // resume 用**持久化在 run 记录里的 input**（同下游
                         // Delivered 分支的理由）。
                         input: Some(run.input.clone()),
+                        meta: None,
                         lease_owner: args.lease_owner.clone(),
                         lease_ms: args.lease_ms,
                         now,
@@ -680,6 +687,7 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
                         // 给 Null 会让强类型 input（`.input::<T>()`）反序列化失败。
                         // 上游同此：`runtime-driver.ts:481` 传 `claim.run.input`。
                         input: Some(run.input.clone()),
+                        meta: None,
                         lease_owner: args.lease_owner.clone(),
                         lease_ms: args.lease_ms,
                         now,
@@ -794,6 +802,7 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
             workflow_id: &workflow_id,
             run_id: &args.run_id,
             input: Some(input),
+            meta: None,
             lease_owner: args.lease_owner.clone(),
             lease_ms: args.lease_ms,
             now,
@@ -870,6 +879,7 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
                     workflow_id: &claim.run.workflow_id,
                     run_id: &claim.run.run_id,
                     input: Some(claim.run.input.clone()),
+                    meta: None,
                             lease_owner: Some(lease_owner.clone()),
                     lease_ms: Some(lease_ms),
                     thread_id: None,
@@ -910,6 +920,7 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
                     workflow_id: bucket.workflow_id.clone(),
                     run_id: bucket.run_id.clone(),
                     input: bucket.input.clone().unwrap_or(serde_json::Value::Null),
+                    meta: None,
                             now: Some(now),
                     deadline,
                     max_duration_ms: None,
@@ -1107,6 +1118,11 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
         // 所以 threadId 只要在这一处转发就够（上游三个 args 各带一个，
         // runtime-driver.ts:115/182/248 同样都往 driveClaimedRun 传）。
         opts = opts.thread_id(args.thread_id.clone());
+        // Run 级参数（meta）：擦除袋回读——中间件经 `args.ctx.meta.try_get::<K>()`
+        // 按 `MetaKey::KEY` 反序列化。
+        if let Some(raw) = &args.meta {
+            opts = opts.meta(aa_workflow_core::define::MetaBag::<aa_workflow_core::define::Nil>::from_value(raw.clone()));
+        }
         // 投递载荷随 drive 一起给——上游 `driveClaimedRun({ signalDelivery })`
         // → `runWorkflow({ signalDelivery })` → `appendSeed`。core 在重放
         // handler 之前把它落成 `SIGNAL_RESOLVED`，runtime 不再自己写日志。
@@ -1182,6 +1198,9 @@ struct DriveArgs<'a> {
     run_id: &'a RunId,
     /// 全新启动时的 input；resume 时为 `None`（input 已在 store 里）。
     input: Option<serde_json::Value>,
+    /// Run 级参数（擦除值，键 = `MetaKey::KEY`）——start_run 透传，中间件经
+    /// `args.ctx.meta.try_get::<K>()` 读取；deliver_* / sweep 恒 `None`。
+    meta: Option<serde_json::Value>,
     /// 租约属主。`None` = 由 [`Self::drive_claimed_run`] 按上游
     /// `runtime:{run_id}` 前缀兜底生成（`runtime-driver.ts:680`）。**只有 sweep
     /// 会预先生成** `sweep:{now}`（上游 `:416`）——那是批次标识，不是 per-run 的。

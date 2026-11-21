@@ -41,6 +41,7 @@ use aa_workflow_core::middleware::{MiddlewareServer, MiddlewareServerFnArgs, ste
 /// `interim_goals`：中间件是提前配置的（挂一次、跑很多次），而「从哪个源 run
 /// 播种、重跑哪些 step」每次 run 都可能不同。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReseedPlan {
     /// 源 run id。
     pub source_run_id: String,

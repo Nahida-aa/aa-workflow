@@ -37,9 +37,11 @@
 //!
 //! 不是 LocalDub 的接线，只是把它的依赖图形状搬过来。
 
+pub mod dag;
+
 use std::sync::Arc;
 
-use aa_workflow_core::{BaseCtx, CreateWorkflowConfig, StepCtx, WorkflowDefinition, create_workflow};
+use aa_workflow_core::{BaseCtx, CreateWorkflowConfig, StepCtx, WorkflowBuilder, WorkflowDefinition, create_workflow};
 
 // ========================================================================
 // dub_sf_ocr 的定义
@@ -354,7 +356,10 @@ async fn mix_video(
 /// 代价是分支块要用 `async` 而非 `async move`：后者会按值捕获 `ctx`。
 ///
 /// 只读，所以不存在 [`DubSfOcrState`] 说的快照分裂问题。
-pub fn dub_sf_ocr() -> WorkflowDefinition<DubSfOcrInput, serde_json::Value, DubSfOcrState> {
+/// builder 提取：config 到 handler 之前的链——dub 主定义与 dag 策略版共用
+/// （dag 版在 handler 前挂 `dag_policies` 中间件，见 [`super::dag`]）。
+pub fn dub_builder(
+) -> aa_workflow_core::WorkflowBuilder<DubSfOcrInput, (), DubSfOcrState> {
     create_workflow(
         CreateWorkflowConfig::new("dub-sf-ocr")
             .input::<DubSfOcrInput>()
@@ -372,7 +377,13 @@ pub fn dub_sf_ocr() -> WorkflowDefinition<DubSfOcrInput, serde_json::Value, DubS
                 })
             }),
     )
-    .handler(|ctx: BaseCtx<DubSfOcrInput, DubSfOcrState>| async move {
+}
+
+pub fn dub_sf_ocr() -> WorkflowDefinition<DubSfOcrInput, serde_json::Value, DubSfOcrState> {
+    dub_builder().handler(dub_run)
+}
+
+pub async fn dub_run(ctx: BaseCtx<DubSfOcrInput, DubSfOcrState>) -> anyhow::Result<serde_json::Value> {
         let video_dir = ctx.input.video_dir.clone();
 
         // 只读快照，clone 一次即可。
@@ -491,5 +502,4 @@ pub fn dub_sf_ocr() -> WorkflowDefinition<DubSfOcrInput, serde_json::Value, DubS
             "mixAudio": out_mixed_audio,
             "mixVideo": mix_video,
         }))
-    })
 }

@@ -1,0 +1,195 @@
+//! `dub_sf_ocr` × **DAG 策略中间件**（`dag_policies`）——真实 10 步流水线上的
+//! redo（世界变了重跑翻译轴）与临时目标（泊车 + 续驱）。
+//!
+//! 定义在 `src/dub_sf_ocr/dag.rs`（`dub_sf_ocr_dag`：同一条 handler 链 +
+//! `dag_policies` 中间件；shape 为 10 步真实依赖）。store 是 **FileExecutionStore**
+//! ——redo 的源日志跨 run 持久（run2 读 run1 的事件）。
+//!
+//! 观测口径：**真跑** = `STEP_STARTED`（skip 复用不发起 attempt）；
+//! **复用** = `STEP_FINISHED.meta.imported_from`（`SkipImported` 带溯源）。
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use aa_workflow_middlewares::{DagPlan, DagShape, GetEvents};
+use aa_workflow_runtime::run_store_adapter::WorkflowExecutionStore;
+use aa_workflow_core::{StepMeta, WorkflowEvent};
+use aa_workflow_runtime::types::ReadEventsArgs;
+use aa_workflow_runtime::{
+    WorkflowRegistration, WorkflowRuntimeConfig, WorkflowRuntimeDefinition,
+    WorkflowRuntimeRunResult, WorkflowRuntimeRunResultKind, WorkflowRuntimeStartRunArgs,
+    create_run_store_adapter, define_workflow_runtime,
+};
+use example_store_file::dub_sf_ocr::dag::{dub_sf_ocr_dag, dub_shape};
+use example_store_file::FileExecutionStore;
+
+/// runtime 组装：FileExecutionStore + dag 策略版 dub 注册 + `get_events` 注入。
+///
+/// `get_events` 从同一把 store 读（adapter 升格到 core `RunStore` 面）——
+/// `dag_policies` 靠它读 run1 的日志算 redo 名单。
+fn get_runtime(base: &PathBuf) -> (Arc<WorkflowRuntimeDefinition>, Arc<GetEvents>) {
+    let store: Arc<dyn WorkflowExecutionStore> = Arc::new(FileExecutionStore::new(base));
+    // `get_events` 闭包持有 adapter（Arc<dyn RunStore>，Clone ✓）
+    let adapter = create_run_store_adapter(store.clone());
+    let get_events: Arc<GetEvents> = Arc::new(move |run_id: &str| {
+        adapter.get_events(run_id).map_err(Into::into)
+    });
+    let mut workflows = HashMap::new();
+    workflows.insert(
+        "dub-sf-ocr".to_string(),
+        WorkflowRegistration {
+            load: {
+                let get_events = Arc::clone(&get_events);
+                Arc::new(move || {
+                    let get_events = Arc::clone(&get_events);
+                    dub_sf_ocr_dag(get_events).into()
+                })
+            },
+            previous_versions: HashMap::new(),
+            version: None,
+            schedules: vec![],
+        },
+    );
+    (
+        Arc::new(define_workflow_runtime(WorkflowRuntimeConfig::new(store, workflows)).unwrap()),
+        get_events,
+    )
+}
+
+async fn start(rt: &WorkflowRuntimeDefinition, run_id: &str, meta: Option<serde_json::Value>) -> WorkflowRuntimeRunResult {
+    rt.start_run(WorkflowRuntimeStartRunArgs {
+        workflow_id: "dub-sf-ocr".to_string(),
+        run_id: run_id.to_string(),
+        input: serde_json::json!({ "videoDir": "/w/exp" }),
+        meta,
+        ..Default::default()
+    })
+    .await
+    .expect("start_run")
+}
+
+/// 某 run 的全部 `STEP_FINISHED`（真跑与复用都落这条 checkpoint——skip 复用
+/// 同样落盘，所以日志里每步恰好一条）。
+fn finished_events(rt: &WorkflowRuntimeDefinition, run_id: &str) -> Vec<(String, StepMeta)> {
+    rt.config
+        .store
+        .read_events(ReadEventsArgs { run_id: run_id.to_string(), from_index: None })
+        .expect("读事件")
+        .into_iter()
+        .filter_map(|stored| match stored.event {
+            WorkflowEvent::StepFinished { step_id, meta, .. } => {
+                Some((step_id, meta.unwrap_or_default()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// **真跑**的 step：checkpoint 不带 `imported_from` 溯源。
+fn executed_steps(rt: &WorkflowRuntimeDefinition, run_id: &str) -> Vec<String> {
+    finished_events(rt, run_id)
+        .into_iter()
+        .filter(|(_, m)| m.imported_from.is_none())
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// **复用**的 step：checkpoint 带 `imported_from` 溯源（源 run + 下标）。
+fn imported_steps(rt: &WorkflowRuntimeDefinition, run_id: &str) -> Vec<String> {
+    finished_events(rt, run_id)
+        .into_iter()
+        .filter(|(_, m)| m.imported_from.is_some())
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// 场景 ①：全量首跑——无 meta，中间件透明，10 步全真跑。
+#[tokio::test]
+async fn full_first_run() {
+    let (rt, _ge) = get_runtime(&temp_base("dag-full"));
+    let out = start(&rt, "dag:r1", None).await;
+    assert!(matches!(out.kind, WorkflowRuntimeRunResultKind::Completed));
+    let executed = executed_steps(&rt, "dag:r1");
+    assert_eq!(executed.len(), 10, "10 步全真跑");
+}
+
+/// 场景 ②：redo（世界变了重跑翻译轴）——`from: ["translate"]`，shape 展开
+/// 下游闭包 → 翻译轴 5 步真跑；人声轴 + OCR 链 5 步复用（带溯源）。
+#[tokio::test]
+async fn redo_reruns_the_translation_axis() {
+    let (rt, _ge) = get_runtime(&temp_base("dag-redo"));
+    start(&rt, "dag:r1", None).await;
+
+    let out = start(
+        &rt,
+        "dag:r2",
+        Some(serde_json::json!({
+            "__dagPlan": {
+                "sourceRunId": "dag:r1",
+                "from": ["translate"],
+            }
+        })),
+    )
+    .await;
+    assert!(matches!(out.kind, WorkflowRuntimeRunResultKind::Completed));
+
+    let executed = executed_steps(&rt, "dag:r2");
+    for id in ["translate", "split_audio", "tts", "mix_audio", "mix_video"] {
+        assert!(executed.contains(&id.to_string()), "{id} 应真跑");
+    }
+    for id in ["separate", "separate_after", "sf_ocr_pre", "sf_ocr", "sf_ocr_fix"] {
+        assert!(!executed.contains(&id.to_string()), "{id} 应复用（不重跑）");
+    }
+    let imported = imported_steps(&rt, "dag:r2");
+    assert_eq!(imported.len(), 5, "5 步复用且带溯源");
+    for id in ["separate", "separate_after", "sf_ocr_pre", "sf_ocr", "sf_ocr_fix"] {
+        assert!(imported.contains(&id.to_string()), "{id} 应带 imported_from");
+    }
+}
+
+/// 场景 ③：临时目标——goals=["translate"]，translate 完成后在
+/// `split_audio` 入口泊车；`deliver_signal(__interim-goal)` 续驱补齐。
+#[tokio::test]
+async fn interim_goal_parks_then_resumes() {
+    let (rt, _ge) = get_runtime(&temp_base("dag-goal"));
+    let out = start(
+        &rt,
+        "dag:g1",
+        Some(serde_json::json!({
+            "__dagPlan": { "goals": ["translate"] }
+        })),
+    )
+    .await;
+    assert!(
+        matches!(out.kind, WorkflowRuntimeRunResultKind::Paused),
+        "goals 达成后泊车"
+    );
+
+    eprintln!("[exp] run 记录: {:?}", rt.config.store.load_run("dag:g1"));
+    // 续驱：保留信号 `__interim-goal` 投递（runtime 原生 recover 路径）。
+    let resumed = rt
+        .deliver_signal(aa_workflow_runtime::WorkflowRuntimeDeliverSignalArgs {
+            run_id: "dag:g1".into(),
+            signal_id: "dag-goal-resume".into(),
+            name: "__interim-goal".into(),
+            payload: serde_json::json!({}),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(matches!(resumed.kind, WorkflowRuntimeRunResultKind::Completed));
+
+    // 泊车前的步骤 + 续驱的步骤 = 全部 10 步。
+    let executed = executed_steps(&rt, "dag:g1");
+    assert_eq!(executed.len(), 10, "泊车前 6 步 + 续驱 4 步 = 10 步全真跑");
+}
+
+fn temp_base(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "wf_store_file_dub_dag_{tag}_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+    dir
+}

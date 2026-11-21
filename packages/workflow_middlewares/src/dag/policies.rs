@@ -57,6 +57,7 @@ pub const INTERIM_GOAL_SIGNAL: &str = "__interim-goal";
 ///
 /// 字段全 `Option`（`goals` 用 `Vec` + serde default）：四个维度可以只给其中几个。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DagPlan {
     /// redo：播种来源 run。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,8 +97,11 @@ pub type GetEvents =
 struct PlanState {
     /// 临时目标（`goals`）。
     goals: Vec<String>,
-    /// redo 复用表：step_id → 源结果。空 = 无 redo。
-    lookup: HashMap<String, serde_json::Value>,
+    /// redo 复用表：step_id → (源结果, 源下标)。空 = 无 redo。
+    /// 下标用于 `SkipImported` 的溯源（对齐引擎版 `reseedRun`）。
+    lookup: HashMap<String, (serde_json::Value, usize)>,
+    /// 源 run id（`SkipImported` 溯源用）；无 redo 时为 `None`。
+    source_run_id: Option<String>,
 }
 
 /// DAG 策略中间件：redo 复用 + 临时目标泊车，读 `meta.__dagPlan`。
@@ -121,11 +125,12 @@ impl MiddlewareServer for DagPoliciesMw {
         // 前置：解析 RunWorkflowOptions.meta 里的 DagPlan → PlanState。
         // 缺失 = 本次 run 不做任何策略（与另两个中间件一致）。
         let Some(plan) = args.ctx.meta.try_get::<DagPlanKey>() else {
-            return args.next(None).await;
+                return args.next(None).await;
         };
 
         let mut st = PlanState {
             goals: plan.goals.clone(),
+            source_run_id: plan.source_run_id.clone(),
             ..Default::default()
         };
 
@@ -143,8 +148,8 @@ impl MiddlewareServer for DagPoliciesMw {
                     }
                 }
 
-                // 源结果 → lookup（排除重跑名单）。
-                for e in &source_log {
+                // 源结果 → lookup（排除重跑名单），带源下标（溯源）。
+                for (index, e) in source_log.iter().enumerate() {
                     if let aa_workflow_core::event::WorkflowEvent::StepFinished {
                         step_id,
                         result: Some(result),
@@ -152,7 +157,8 @@ impl MiddlewareServer for DagPoliciesMw {
                     } = e
                     {
                         if !redo.contains(step_id) {
-                            st.lookup.insert(step_id.clone(), result.clone());
+                            st.lookup
+                                .insert(step_id.clone(), (result.clone(), index));
                         }
                     }
                 }
@@ -179,10 +185,17 @@ impl MiddlewareServer for DagPoliciesMw {
                 };
             }
 
-            // ② redo：有源结果 → 复用（`skip` 会落 STEP_FINISHED，
-            //    所以它同样进入下一次调用的 `completed`）。
-            if let Some(result) = plan.lookup.get(&req.step_id).cloned() {
-                return Decision::Skip(result);
+            // ② redo：有源结果 → 复用（`skip_with_meta` 落 STEP_FINISHED
+            //    **带 imported_from 溯源**——与引擎版 reseedRun 对齐；它同样
+            //    进入下一次调用的 `completed`）。
+            if let Some((result, index)) = plan.lookup.get(&req.step_id).cloned() {
+                return Decision::SkipImported {
+                    result,
+                    from: aa_workflow_core::event::ImportedFrom {
+                        run_id: plan.source_run_id.clone().expect("有 lookup 必有源"),
+                        index,
+                    },
+                };
             }
 
             // ③ redoSet 里的 step（或源里没有的）真跑。

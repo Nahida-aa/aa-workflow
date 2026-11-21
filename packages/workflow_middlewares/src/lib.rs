@@ -81,8 +81,9 @@ pub use dag::core::{
     DagNode, DagRunFn, DagShape, DagSpec, RedoPlan, ShapeError, dag_to_handler, define_dag,
     run_dag,
 };
-pub use dag::policies::{DagPoliciesMw, 
-    DagPlan, DagPlanAccess, DagPlanKey, GetEvents, INTERIM_GOAL_SIGNAL, dag_policies,
+pub use dag::policies::{
+    DagPoliciesMw, DagPlan, DagPlanAccess, DagPlanKey, GetEvents, INTERIM_GOAL_SIGNAL,
+    dag_policies,
 };
 pub use interim_goals::{InterimGoalsAccess, InterimGoalsKey, InterimGoalsMw, interim_goals};
 pub use reseed::{LoadResults, ReseedAccess, ReseedKey, ReseedPlan, ReseedMw, SourceStep, reseed};
