@@ -23,7 +23,7 @@ async fn dag_schedules_by_dependency_order_and_fans_out() {
     let bar_c = barrier.clone();
 
     let spec = define_dag(
-        DagSpec::new("pipe")
+        DagSpec::<Value>::new("pipe")
             .node("a", Vec::<&str>::new(), move |_deps, input| {
                 let exec = e_a.clone();
                 async move {
@@ -96,7 +96,7 @@ async fn dag_replay_short_circuits_checkpointed_nodes() {
         let runs_a = runs.clone();
         let runs_b = runs.clone();
         define_dag(
-            DagSpec::new("chain")
+            DagSpec::<Value>::new("chain")
                 .node("a", Vec::<&str>::new(), move |_, _| {
                     let runs = runs_a.clone();
                     async move {
@@ -131,14 +131,14 @@ async fn dag_replay_short_circuits_checkpointed_nodes() {
 
 #[test]
 fn define_dag_rejects_unknown_dep_and_cycle() {
-    let bad = DagSpec::new("bad").node("a", ["nope"], |_, _| async { Ok(json!(1)) });
+    let bad = DagSpec::<Value>::new("bad").node("a", ["nope"], |_, _| async { Ok(json!(1)) });
     assert!(define_dag(bad).is_err());
 
-    let cyclic = DagSpec::new("cyc")
+    let cyclic = DagSpec::<Value>::new("cyc")
         .node("a", ["b"], |_, _| async { Ok(json!(1)) })
         .node("b", ["a"], |_, _| async { Ok(json!(1)) });
     assert!(define_dag(cyclic).is_err());
 
-    let reserved = DagSpec::new("r").node("__dagx", Vec::<&str>::new(), |_, _| async { Ok(json!(1)) });
+    let reserved = DagSpec::<Value>::new("r").node("__dagx", Vec::<&str>::new(), |_, _| async { Ok(json!(1)) });
     assert!(define_dag(reserved).is_err());
 }

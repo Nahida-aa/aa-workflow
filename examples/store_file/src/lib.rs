@@ -55,8 +55,10 @@
 //!
 //! - [`file_store`] — `FileExecutionStore` 本体（新契约的落盘实现）
 //! - [`mod@dub_sf_ocr`] — 一个可复用的示例 workflow：LocalDub `dub_sf_ocr` 的
-//!   **两分支并行**形状。放在 `src/` 而非测试里，是为了别人也能
-//!   `use example_store_file::dub_sf_ocr` 拿去驱动自己的 store。
+//!   **DAG 声明**形状（10 节点，handler 由 `dag_to_handler` 生成）。放在
+//!   `src/` 而非测试里，是为了别人也能
+//!   `use example_store_file::dub_sf_ocr` 拿去驱动自己的 store（DAG 声明 →
+//!   handler 生成）。
 //! - [`mod@progress_report`] — 长 step 用 `StepCtx::progress(f64)` 报实时进度。
 //!   钉住它**即时但不耐久**：publisher 收得到 `STEP_PROGRESS`，事件日志里一条都
 //!   没有（与 `STEP_FINISHED` 恰成对照）。

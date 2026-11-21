@@ -1,17 +1,23 @@
-//! LocalDub `dub_sf_ocr` pipeline 的形状模型（可复用的 workflow 定义）。
+//! LocalDub `dub_sf_ocr` pipeline 的**声明式定义**（可复用的 workflow）。
 //!
 //! 放在 `src/` 而不是测试里，是因为它是一个**完整的示例 workflow**——别人可以
 //! `use example_store_file::dub_sf_ocr` 拿去驱动自己的 store。测试在
-//! `tests/dub_sf_ocr.rs`。
+//! `tests/dub_sf_ocr.rs`（引擎语义）与 `tests/dub_sf_ocr_dag.rs`（策略场景）。
 //!
 //! 从 `examples/shared` 搬过来的（那边已删除）。
 //!
-//! # 它示范两件事
+//! # 编排只有一个故事：DAG 声明 → handler 生成
 //!
-//! 1. **两分支并行的编排**（`tokio::try_join!`）——这是 LocalDub 现阶段的串行
-//!    for 循环做不到的；
-//! 2. **typed state 的只读用法**（`.state::<T>()` + `initialize`），以及
-//!    「写 state 必须发生在 join 之后」这条准则（见 aa-workflow 的 AGENTS.md）。
+//! 整条流水线用 [`define_dag`] 声明成 `DagSpec`（[`dub_spec`]：10 个节点 +
+//! 依赖 + 执行体），handler 由 [`dag_to_handler`] **生成**——本文件没有任何
+//! 手写编排体。执行是 dataflow 调度：每个节点一个任务，**依赖一就绪就跑**，
+//! 没有波次栅栏；失败即 `abort_all`。两个装配入口共用同一份 spec：
+//!
+//! 1. [`dub_sf_ocr`]——纯定义（健康环境、无中间件）；
+//! 2. [`dub_sf_ocr_dag`]——+ [`dag_policies`] 中间件（redo / 临时目标 /
+//!    reseedRun，走 `RunWorkflowOptions.meta`）。形状由 `DagSpec::shape()`
+//!    派生——**执行与策略共用同一张图**，没有「编排与形状各编码一遍」的
+//!    漂移面。
 //!
 //! # 形状
 //!
@@ -26,24 +32,22 @@
 //! ```
 //!
 //! 两分支**零跨分支读**（A 只吃 `audio_source.wav`，B 只吃 `video_source.mp4`），
-//! 所以 `try_join!` 是安全的；分支内部仍是词法 `.await` 串行（`separate_after`
-//! 要 `separate` 的 stems）。
+//! 所以是两条并行分支；分支内部靠依赖边串行（`separate_after` 要 `separate`
+//! 的 stems）。不是 LocalDub 的接线，只是把它的依赖图形状搬过来。
 //!
-//! 本示例的 step **只读** `ctx.state`，而且这条约束是**类型层面**保证的：每个 step
-//! 函数的 state 参数都取 `&DubSfOcrState`，签名上就没有写 state 的路径
-//! （见 [`stub`] 的文档）。写入必须发生在 join 之后，且跨步骤传数据走 step 的**返回值**
-//! —— 见 `aa-workflow/docs/concepts/ctx-state.md` 与 AGENTS.md 的「`ctx.state` 的
-//! 写入位置准则」。
+//! # 节点闭包的纪律（ctx-state）
 //!
-//! 不是 LocalDub 的接线，只是把它的依赖图形状搬过来。
-
-pub mod dag;
+//! 节点闭包**不碰 `ctx.state`**：state 由 [`DubSfOcrState::from_input`] 从
+//! input 重建（与 builder 的 `initialize` 同一实现），上游产物从
+//! `deps[节点 id]` 反序列化——「step 只读 state」这条规则由签名保证
+//! （闭包里根本没有 ctx；见 [`stub`] 的文档与 `docs/concepts/ctx-state.md`）。
+//! 跨节点传数据走**耐久结果**（checkpoint 的 JSON），不走 state。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use aa_workflow_core::{BaseCtx, CreateWorkflowConfig, StepCtx, WorkflowBuilder, WorkflowDefinition, create_workflow};
-use aa_workflow_core::define::BoxFuture;
+use aa_workflow_core::{CreateWorkflowConfig, WorkflowBuilder, WorkflowDefinition, create_workflow};
+use aa_workflow_middlewares::{DagSpec, DagShape, GetEvents, dag_policies, dag_to_handler, define_dag};
 
 // ========================================================================
 // dub_sf_ocr 的定义
@@ -123,10 +127,8 @@ impl Default for ServiceHealth {
 /// 变化）。
 ///
 /// 服务实现（[`DubEnv::separate`] 等六个）是**假实现**：stub 计并发 / 记
-/// 日志 / 模拟耗时，再过可用性闸门。两个编排形态共用它们：
-/// - 主例 [`dub_run`]（手写 `try_join!`，Rust 原生并行的教具）；
-/// - dag 版（[`super::dag::dub_sf_ocr_dag`]，`dag_to_handler` 生成的
-///   handler，节点闭包调这些方法）。
+/// 日志 / 模拟耗时，再过可用性闸门。它们被 [`dub_spec`] 的模型类节点闭包
+/// 调用——[`dub_sf_ocr`] 与 [`dub_sf_ocr_dag`] 两个装配共用同一套服务。
 #[derive(Clone, Default)]
 pub struct DubEnv {
     separate: ServiceHealth,
@@ -238,21 +240,16 @@ impl DubEnv {
 
 /// dub-sf-ocr 的 **typed state**（Rust 版 zod `stateSchema`）。
 ///
-/// 每个 step 都**读带类型的 state**，而不是从 `serde_json::Value` 里 `.get()` 链取值。
-/// `.state::<T>()` 声明契约后，handler 的 `ctx.state` 就是 `DubSfOcrState`，
-/// 字段直接访问、编译期校验。
+/// state **不落盘**：每次 start / resume 都由 [`DubSfOcrState::from_input`]
+/// 重建（builder 的 `initialize` 与节点闭包共用），handler 从头重跑
+/// （与 TanStack 一致）。
 ///
-/// state **不落盘**：每次 start / resume 都由 `initialize(input)` 重建，handler
-/// 从头重跑（与 TanStack 一致）。
+/// ## 与 DAG 调度的交互
 ///
-/// ## 与并行分支的交互（重要）
-///
-/// 本示例两条分支**共享**同一个 `ctx`（全程只读，见 [`dub_sf_ocr`]），所以
-/// 这里描述的分裂**没有发生**。但你若让某一分支**写** state，就必须
-/// `ctx.clone()` 分出去——`StateHandle::clone` 是**快照分裂**，两条分支各持
-/// 一份 state 副本，互不共享：那份修改既对另一分支不可见，join 之后从原始
-/// `ctx.state` 也读不回来（`Deref` 走 `&self.st`，不回查共享的 mirror）。
-/// 需要跨分支可见的可变状态，只能走 step 的**返回值**（durable 结果）。
+/// 节点闭包**拿不到** `ctx.state`（[`DagRunFn`]
+/// 只收 deps + input）——state 的读路径只剩 `from_input` 一条，写路径为零
+/// ：这正是「step 只读 state」的最强形态。需要跨节点可见的可变状态，走
+/// step 的**耐久结果**（checkpoint 的 JSON）。
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DubSfOcrState {
@@ -263,9 +260,8 @@ pub struct DubSfOcrState {
 }
 
 impl DubSfOcrState {
-    /// `initialize` 的唯一实现——主例 builder 与 dag 节点闭包共用。state
-    /// 全部由 input 派生（不落盘，每次 start / resume 从这里重建），所以
-    /// 两个编排形态从同一条派生规则出发，不会各算各的。
+    /// `initialize` 的唯一实现——builder 与节点闭包共用。state 全部由 input
+    /// 派生（不落盘），两个消费点从同一条派生规则出发，不会各算各的。
     pub fn from_input(input: &DubSfOcrInput) -> Self {
         Self {
             video_dir: input.video_dir.clone(),
@@ -311,12 +307,12 @@ pub mod dub_probe {
     }
 }
 
-// ─── 每个 step 一个返回类型 ────────────────────────────────────────────────
+// ─── 每个节点一个产物类型 ──────────────────────────────────────────────────
 //
 // 之前 10 个 step 共用一个 `DubArtifact { artifact, target_lang, output_mode }`，
 // 形状对每个 step 都是假的：`target_lang` / `output_mode` 只是把 state 回显一遍，
-// 真正的产物差异全压在一个字符串字面量里。现在每个 step 返回**它实际产出的东西**，
-// 于是 `step<T>` 的泛型才真的在做事——10 个 step 推导出 9 个不同的 `T`。
+// 真正的产物差异全压在一个字符串字面量里。现在每个节点产出**它实际产出的东西**
+// 的 typed 产物，序列化发生在 step 的耐久边界（checkpoint 存 JSON）。
 //
 // `separate` 和 `separate_after` 共用 `Separated` 是如实反映：两轮都产出
 // 同样的一对音轨，没有必要硬造第二个形状相同的类型。
@@ -353,7 +349,7 @@ struct FixedSubtitle {
     repaired: u32,
 }
 
-/// `translate`：译文。`target_lang` 属于**这个** step 的结果（之前它出现在
+/// `translate`：译文。`target_lang` 属于**这个**节点的结果（之前它出现在
 /// 每个 step 的返回里，那是把 state 回显伪装成产物）。
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -402,14 +398,13 @@ struct MixedVideo {
 /// 服务实现（[`DubEnv`] 的六个方法）与本地处理步骤（抽帧 / 切分 / 混音 /
 /// 合成视频）都经它。
 ///
-/// 只抽行为，不抽签名。每个 step 的入参（消费上游产物）和返回类型各不相同，
-/// 那正是这个示例要展示的东西——把它们压成一个 `dub_step(&st, "字面量", ms)`
-/// 就等于把 `step<T>` 退化回 `Value`。
+/// 只抽行为，不抽签名。每个节点的入参（消费上游产物）和返回类型各不相同
+/// ——那是这个示例要展示的东西，压成一个统一签名就把产物形状抹平了。
 ///
 /// 所有入参都以 `&DubSfOcrState` 打头且只取共享引用，于是「step 只读 state」
 /// 这条规则由类型系统保证：`&DubSfOcrState` 没有 `DerefMut` 路径，写不进去。
-/// 这与 `docs/concepts/ctx-state.md` 的结论一致——step 闭包唯一耐久的输出
-/// 通道是返回值，state 不是那条通道，所以这里连类型都不给它留。
+/// 这与 `docs/concepts/ctx-state.md` 的结论一致——节点闭包唯一耐久的输出
+/// 通道是返回值（checkpoint 的 JSON），state 不是那条通道。
 async fn stub(st: &DubSfOcrState, name: &str, millis: u64) {
     dub_probe::enter();
     tracing::info!(
@@ -423,7 +418,7 @@ async fn stub(st: &DubSfOcrState, name: &str, millis: u64) {
     dub_probe::leave();
 }
 
-/// 分支 B 第 1 步：抽关键帧（本地 ffmpeg 类处理，不走服务边界）。
+/// 抽关键帧（本地 ffmpeg 类处理，不走服务边界）。
 async fn sf_ocr_pre(st: &DubSfOcrState) -> anyhow::Result<Keyframes> {
     stub(st, "sf_ocr_pre", 50).await;
     Ok(Keyframes {
@@ -486,18 +481,9 @@ async fn mix_video(
     })
 }
 
-/// LocalDub `dub_sf_ocr` pipeline 的形状：**两分支并行 → split_audio 汇聚**。
-///
-/// 两条分支**共享同一个 `&ctx`**，不 `clone()`：`step(&self)` 只拿共享借用，
-/// 并发的 `&ctx` 是合法的（只有某一分支要**写** state 时，`DerefMut` 才会
-/// 需要 `&mut ctx` 而与另一分支的 `&ctx` 冲突——那时才必须 `ctx.clone()`）。
-/// 代价是分支块要用 `async` 而非 `async move`：后者会按值捕获 `ctx`。
-///
-/// 只读，所以不存在 [`DubSfOcrState`] 说的快照分裂问题。
-/// builder 提取：config 到 handler 之前的链——dub 主定义与 dag 策略版共用
-/// （dag 版在 handler 前挂 `dag_policies` 中间件，见 [`super::dag`]）。
-pub fn dub_builder(
-) -> aa_workflow_core::WorkflowBuilder<DubSfOcrInput, (), DubSfOcrState> {
+/// builder 提取：config 到 handler 之前的链——两个装配入口（[`dub_sf_ocr`] /
+/// [`dub_sf_ocr_dag`]）共用。
+fn dub_builder() -> WorkflowBuilder<DubSfOcrInput, (), DubSfOcrState> {
     create_workflow(
         CreateWorkflowConfig::new("dub-sf-ocr")
             .input::<DubSfOcrInput>()
@@ -507,163 +493,152 @@ pub fn dub_builder(
     )
 }
 
-pub fn dub_sf_ocr() -> WorkflowDefinition<DubSfOcrInput, serde_json::Value, DubSfOcrState> {
-    dub_builder().handler(dub_run(DubEnv::default()))
-}
-
-/// handler 工厂：把「环境」装进 handler。
+/// dub 流水线的声明：10 个节点 + 依赖 + 执行体。**编排的全部真相都在这里**
+/// ——handler 由 [`dag_to_handler`] 从它生成，形状由 [`DagSpec::shape`]
+/// 从它派生，没有任何第二份编码。
 ///
-/// handler 只收 `ctx`，环境没有别的入路——工厂闭包捕获 env，每次调用克隆
-/// 进 future。定义侧与测试侧各持一份 [`DubEnv`] handle（`Arc` 内核），
-/// 跨 run 共享同一个环境。
-pub fn dub_run(
-    env: DubEnv,
-) -> impl Fn(BaseCtx<DubSfOcrInput, DubSfOcrState>) -> BoxFuture<'static, anyhow::Result<serde_json::Value>>
-       + Clone
-       + Send
-       + Sync
-       + 'static {
-    move |ctx: BaseCtx<DubSfOcrInput, DubSfOcrState>| {
-        let env = env.clone();
-        Box::pin(dub_pipeline(env, ctx))
-    }
+/// 节点闭包的形状：`deps[节点 id]` 反序列化上游产物 + [`DubSfOcrState::from_input`]
+/// 重建 state → 调「外部服务」（模型类节点经 [`DubEnv`]）或本地处理（ffmpeg
+/// 类节点直接调自由函数）→ typed 产物序列化进 checkpoint。
+///
+/// env 的捕获仪式（[`DagRunFn`][aa_workflow_middlewares::DagSpec] 是
+/// `Arc<dyn Fn>`，`'static` future 不许借用）：闭包外预克隆一份 handle、
+/// 闭包内每次调用再克隆——`DubEnv` 是 Arc 内核，克隆只是多一个指向同一
+/// 环境的 handle。
+fn dub_spec(env: DubEnv) -> DagSpec<DubSfOcrInput> {
+    // env 的 per-node 预克隆（见上文捕获仪式）。
+    let env_sep = env.clone();
+    let env_sep2 = env.clone();
+    let env_ocr = env.clone();
+    let env_fix = env.clone();
+    let env_tr = env.clone();
+    let env_tts = env.clone();
+
+    DagSpec::new("dub-sf-ocr")
+        // 分支 A：分离人声 + 伴奏。
+        .node("separate", Vec::<&str>::new(), move |_deps, input| {
+            let env = env_sep.clone();
+            async move {
+                let st = DubSfOcrState::from_input(&input);
+                let out = env.separate(&st).await?;
+                Ok(serde_json::to_value(out)?)
+            }
+        })
+        .node("separate_after", ["separate"], move |deps, input| {
+            let env = env_sep2.clone();
+            async move {
+                let st = DubSfOcrState::from_input(&input);
+                let prev: Separated = serde_json::from_value(deps["separate"].clone())?;
+                let out = env.separate_after(&st, &prev).await?;
+                Ok(serde_json::to_value(out)?)
+            }
+        })
+        // 分支 B：抽关键帧 → OCR → 校正 → 翻译（抽帧是本地处理）。
+        .node("sf_ocr_pre", Vec::<&str>::new(), move |_deps, input| {
+            async move {
+                let st = DubSfOcrState::from_input(&input);
+                let out = sf_ocr_pre(&st).await?;
+                Ok(serde_json::to_value(out)?)
+            }
+        })
+        .node("sf_ocr", ["sf_ocr_pre"], move |deps, input| {
+            let env = env_ocr.clone();
+            async move {
+                let st = DubSfOcrState::from_input(&input);
+                let frames: Keyframes = serde_json::from_value(deps["sf_ocr_pre"].clone())?;
+                let out = env.sf_ocr(&st, &frames).await?;
+                Ok(serde_json::to_value(out)?)
+            }
+        })
+        .node("sf_ocr_fix", ["sf_ocr"], move |deps, input| {
+            let env = env_fix.clone();
+            async move {
+                let st = DubSfOcrState::from_input(&input);
+                let raw: RawSubtitle = serde_json::from_value(deps["sf_ocr"].clone())?;
+                let out = env.sf_ocr_fix(&st, &raw).await?;
+                Ok(serde_json::to_value(out)?)
+            }
+        })
+        .node("translate", ["sf_ocr_fix"], move |deps, input| {
+            let env = env_tr.clone();
+            async move {
+                let st = DubSfOcrState::from_input(&input);
+                let fixed: FixedSubtitle = serde_json::from_value(deps["sf_ocr_fix"].clone())?;
+                let out = env.translate(&st, &fixed).await?;
+                Ok(serde_json::to_value(out)?)
+            }
+        })
+        // 汇聚链（全是本地处理，直接吃两支的产物）。
+        .node(
+            "split_audio",
+            ["separate_after", "translate"],
+            move |deps, input| {
+                async move {
+                    let st = DubSfOcrState::from_input(&input);
+                    let vocals: Separated =
+                        serde_json::from_value(deps["separate_after"].clone())?;
+                    let translated: Translated =
+                        serde_json::from_value(deps["translate"].clone())?;
+                    let out = split_audio(&st, &vocals, &translated).await?;
+                    Ok(serde_json::to_value(out)?)
+                }
+            },
+        )
+        .node("tts", ["split_audio"], move |deps, input| {
+            let env = env_tts.clone();
+            async move {
+                let st = DubSfOcrState::from_input(&input);
+                let timings: Timings = serde_json::from_value(deps["split_audio"].clone())?;
+                let out = env.tts(&st, &timings).await?;
+                Ok(serde_json::to_value(out)?)
+            }
+        })
+        .node("mix_audio", ["separate_after", "tts"], move |deps, input| {
+            async move {
+                let st = DubSfOcrState::from_input(&input);
+                let vocals: Separated = serde_json::from_value(deps["separate_after"].clone())?;
+                let batch: TtsBatch = serde_json::from_value(deps["tts"].clone())?;
+                let out = mix_audio(&st, &vocals, &batch).await?;
+                Ok(serde_json::to_value(out)?)
+            }
+        })
+        .node(
+            "mix_video",
+            ["separate_after", "mix_audio"],
+            move |deps, input| {
+                async move {
+                    let st = DubSfOcrState::from_input(&input);
+                    let separated: Separated =
+                        serde_json::from_value(deps["separate_after"].clone())?;
+                    let audio: MixedAudio = serde_json::from_value(deps["mix_audio"].clone())?;
+                    let out = mix_video(&st, &separated, &audio).await?;
+                    Ok(serde_json::to_value(out)?)
+                }
+            },
+        )
 }
 
-async fn dub_pipeline(
+/// dub 流水线（纯定义）：spec → **生成的** handler，健康环境、无中间件。
+///
+/// 环境用缺省值（全部服务健康）；要脚本化故障，用 [`dub_sf_ocr_dag`] 传
+/// 自己的 [`DubEnv`] handle。
+pub fn dub_sf_ocr() -> WorkflowDefinition<DubSfOcrInput, serde_json::Value, DubSfOcrState> {
+    let spec = define_dag(dub_spec(DubEnv::default())).expect("dub spec 合法（无重复 / 未知依赖 / 环）");
+    dub_builder().handler(dag_to_handler(spec))
+}
+
+/// DAG 策略版 dub 流水线：同一份 spec → **生成的** handler + [`dag_policies`]
+/// 中间件（形状从 spec 派生——执行与策略同一张图）。
+///
+/// 环境由调用方注入（[`DubEnv`]）：runtime 的 `load` 闭包每次装配定义时
+/// 克隆同一个 handle，测试侧持同一柄——「服务故障 / 恢复」跨 run 生效。
+pub fn dub_sf_ocr_dag(
+    get_events: Arc<GetEvents>,
     env: DubEnv,
-    ctx: BaseCtx<DubSfOcrInput, DubSfOcrState>,
-) -> anyhow::Result<serde_json::Value> {
-        let video_dir = ctx.input.video_dir.clone();
-
-        // 只读快照，clone 一次即可。
-        //
-        // step 闭包的 bound 是 `FnOnce(StepCtx) -> Fut + Clone + Send + 'static`，
-        // `'static` 只禁止**借用** `ctx`，不禁止共享所有权。所以每个 step 各写
-        // 一遍 `(*ctx.state).clone()` 是 10 次无谓的深拷贝（每次 4 个 String）。
-        //
-        // ⚠️ 成立前提：本 workflow 在 `initialize` 之后不再写 state。若中途有写，
-        // 早先取的那份快照会变陈旧，必须在写之后重新取。
-        let state = Arc::new((*ctx.state).clone());
-
-        // 两条分支共享同一个 `&ctx`——`step(&self)` 只拿共享借用，并发的 `&ctx`
-        // 合法，不需要 `ctx.clone()`。分支块用 `async`（非 `async move`）：
-        // `move` 会试图按值捕获 `ctx`，两个块各抢一份就冲突了。
-        //
-        // `try_join!` 返回 `Result<(A, B), E>`——A / B **不需要**同类型（只有
-        // error 类型要统一），所以这里 A 是 `Separated`、B 是 `Translated`。
-        let (separated, translated) = tokio::try_join!(
-            async {
-                // 分支 A：分离人声 + 伴奏（两轮分离都走分离服务）。
-                // env 是 Arc 内核：每个 step 闭包克隆一份 handle——从稳定
-                // 的 env 参数出发（同 `st` 的模式），各步克隆互不干扰。
-                let st = Arc::clone(&state);
-                let env_sep = env.clone();
-                let sep = ctx
-                    .step("separate", move |_sc: StepCtx| async move {
-                        env_sep.separate(&st).await
-                    })
-                    .await?;
-                let st = Arc::clone(&state);
-                let env_sep2 = env.clone();
-                ctx.step("separate_after", move |_sc: StepCtx| async move {
-                    env_sep2.separate_after(&st, &sep).await
-                })
-                .await
-            },
-            async {
-                // 分支 B：抽关键帧 → OCR → 校正 → 翻译，四步串成一条链。
-                // 抽帧是本地处理（不走服务边界）；OCR / 校正 / 翻译是模型
-                // 调用，故障由**环境**回答——真实系统里这就是一次上游 API
-                // 调用拿到 503。
-                let st = Arc::clone(&state);
-                let frames = ctx
-                    .step("sf_ocr_pre", move |_sc: StepCtx| async move { sf_ocr_pre(&st).await })
-                    .await?;
-                let st = Arc::clone(&state);
-                let env_ocr = env.clone();
-                let raw = ctx
-                    .step("sf_ocr", move |_sc: StepCtx| async move {
-                        env_ocr.sf_ocr(&st, &frames).await
-                    })
-                    .await?;
-                let st = Arc::clone(&state);
-                let env_fix = env.clone();
-                let fixed = ctx
-                    .step("sf_ocr_fix", move |_sc: StepCtx| async move {
-                        env_fix.sf_ocr_fix(&st, &raw).await
-                    })
-                    .await?;
-                let st = Arc::clone(&state);
-                let env_tr = env.clone();
-                ctx.step("translate", move |sc: StepCtx| async move {
-                    env_tr.translate(&st, &fixed).await
-                })
-                .await
-            },
-        )?;
-
-        // workflow 出口要用的副本先留好（下面会把原件 move 进闭包）。克隆的都是
-        // 几个 String，不是深拷贝 state。
-        let out_separated = separated.clone();
-        let out_translated = translated.clone();
-
-        // ── 关于克隆放在哪 ──
-        //
-        // 上面的 `let st = Arc::clone(&state);` 在**闭包外**，`state` 要分给 10 个
-        // step，每个闭包得有自己那份，所以这个克隆是必需的。
-        //
-        // 而 `sep` / `frames` / `raw` / `fixed` / `timings` / `tts` / `translated`
-        // 这些**上游产物**不需要在闭包体内再克隆：闭包的 bound 是
-        // `FnOnce(..) + Clone`，引擎每次 attempt 执行 `run.clone()(step_ctx)`，
-        // 捕获环境随之克隆——每个 attempt 本来就各有一份。在闭包体内写
-        // `let prev = sep.clone();` 是重复劳动。
-        //
-        // 下面 `separated` 的三处克隆则是必需的：它同时被 `split_audio`、
-        // `mix_audio`、`mix_video` 三个闭包消费，每个都要自己那份。
-
-        // 汇聚：split_audio 同时吃两支的产物。
-        let split_input = separated.clone();
-        let st = Arc::clone(&state);
-        let timings = ctx
-            .step("split_audio", move |_sc: StepCtx| async move {
-                split_audio(&st, &split_input, &translated).await
-            })
-            .await?;
-        let out_timings = timings.clone();
-
-        let st = Arc::clone(&state);
-        let env_tts = env.clone();
-        let tts = ctx
-            .step("tts", move |_sc: StepCtx| async move { env_tts.tts(&st, &timings).await })
-            .await?;
-        let out_tts = tts.clone();
-
-        let split_audio_input = separated.clone();
-        let st = Arc::clone(&state);
-        let mixed_audio = ctx
-            .step("mix_audio", move |_sc: StepCtx| async move {
-                mix_audio(&st, &split_audio_input, &tts).await
-            })
-            .await?;
-        let out_mixed_audio = mixed_audio.clone();
-
-        let st = Arc::clone(&state);
-        let mix_video = ctx
-            .step("mix_video", move |_sc: StepCtx| async move {
-                mix_video(&st, &separated, &mixed_audio).await
-            })
-            .await?;
-
-        // workflow **出口**仍是 `serde_json::Value`（store 是 `dyn`，装不下泛型）
-        // ——那是 `step<T>` 之外的另一回事，见 docs/quick-start.md 的差异速览。
-        Ok(serde_json::json!({
-            "videoDir": video_dir,
-            "pipeline": "dub_sf_ocr",
-            "separated": out_separated,
-            "translated": out_translated,
-            "timings": out_timings,
-            "tts": out_tts,
-            "mixAudio": out_mixed_audio,
-            "mixVideo": mix_video,
-        }))
+) -> WorkflowDefinition<DubSfOcrInput, serde_json::Value, DubSfOcrState> {
+    let spec = define_dag(dub_spec(env)).expect("dub spec 合法（无重复 / 未知依赖 / 环）");
+    let shape = Arc::new(spec.shape().expect("dub 形状无环"));
+    dub_builder()
+        .middleware(dag_policies(shape, get_events))
+        .handler(dag_to_handler(spec))
 }

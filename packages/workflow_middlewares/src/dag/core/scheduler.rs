@@ -25,14 +25,13 @@ use super::declare::DagSpec;
 /// 使 diamond 里被多条路径依赖的节点只执行一次 `ctx.step`。
 /// 首个失败会 `abort_all()`，避免孤儿任务继续写 checkpoint。
 ///
-/// 泛型约束的来历：ctx 要 clone 进每个节点任务（`Clone + Send + Sync`），
-/// input 要序列化成节点闭包收到的 `Value`（[`DagRunFn`](super::declare::DagRunFn)
-/// 的入参形状是 JSON）——typed 工作流（如 dub 的 `DubSfOcrInput`）与
-/// Value 工作流都满足。
-pub async fn run_dag<I, S>(ctx: &BaseCtx<I, S>, spec: &DagSpec) -> Result<BTreeMap<String, Value>>
+/// 泛型约束的来历：ctx 要 clone 进每个节点任务（`Clone + Send + Sync`）；
+/// `I` 直通给节点闭包（[`DagRunFn`](super::declare::DagRunFn) 收精确类型，
+/// 不过 JSON）——typed 工作流（如 dub 的 `DubSfOcrInput`）与 Value 工作流
+/// 都满足。`S: Serialize` 是 `BaseCtx::step` 序列化 state 的既有要求。
+pub async fn run_dag<I, S>(ctx: &BaseCtx<I, S>, spec: &DagSpec<I>) -> Result<BTreeMap<String, Value>>
 where
-    I: Serialize + Clone + Send + Sync + 'static,
-    // Serialize：`BaseCtx::step` 要序列化 state（STATE_DELTA / checkpoint）。
+    I: Clone + Send + Sync + 'static,
     S: Serialize + Clone + Send + Sync + 'static,
 {
     let cells: BTreeMap<String, Arc<OnceCell<Value>>> = spec
@@ -41,7 +40,7 @@ where
         .map(|id| (id.clone(), Arc::new(OnceCell::new())))
         .collect();
     let ctx = ctx.clone();
-    let input = serde_json::to_value(&ctx.input)?;
+    let input = ctx.input.clone();
 
     let mut set = JoinSet::new();
     for id in spec.nodes.keys() {
@@ -78,13 +77,13 @@ where
 /// 取一个节点的结果（必要时先执行）。返回 boxed future 以支持 DAG 递归。
 fn ensure<'a, I, S>(
     id: &'a str,
-    spec: &'a DagSpec,
+    spec: &'a DagSpec<I>,
     cells: &'a BTreeMap<String, Arc<OnceCell<Value>>>,
     ctx: &'a BaseCtx<I, S>,
-    input: &'a Value,
+    input: &'a I,
 ) -> BoxFuture<'a, Result<Value>>
 where
-    I: Serialize + Clone + Send + Sync + 'static,
+    I: Clone + Send + Sync + 'static,
     S: Serialize + Clone + Send + Sync + 'static,
 {
     Box::pin(async move {
@@ -120,10 +119,10 @@ where
 /// 工厂入口：同一套调度逻辑做成 handler，用户自己控制 id / input / meta。
 /// 节点闭包、step id 全部来自 spec——**handler 不需要用户手写**。
 pub fn dag_to_handler<I, S>(
-    spec: Arc<DagSpec>,
+    spec: Arc<DagSpec<I>>,
 ) -> impl Fn(BaseCtx<I, S>) -> BoxFuture<'static, Result<Value>> + Clone + Send + Sync + 'static
 where
-    I: Serialize + Clone + Send + Sync + 'static,
+    I: Clone + Send + Sync + 'static,
     S: Serialize + Clone + Send + Sync + 'static,
 {
     move |ctx: BaseCtx<I, S>| {

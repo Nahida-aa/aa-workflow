@@ -225,8 +225,9 @@ state **observability**"。
 两条已证实事实）。参考用法见上游 `engine.smoke.test.ts:37`（最小）与
 `examples.kyle-durable-agent.test.ts:100`（agent 的虚拟 FS，跨迭代累积）。
 
-本仓示例 `dub_sf_ocr`（`examples/store_file/src/dub_sf_ocr.rs`）是正例：两个并行分支
-的 step **只读** state，一处都不写。
+本仓示例 `dub_sf_ocr`（`examples/store_file/src/dub_sf_ocr/mod.rs`）是正例：编排
+由 `DagSpec` 声明、handler 由 `dag_to_handler` 生成，节点闭包拿不到 `ctx.state`
+（state 经 `from_input` 从 input 重建）——**只读 state** 的最强形态。
 
 ## 上下文变量命名（wc / sc）与中间件能力边界
 

@@ -1,6 +1,6 @@
 //! `dub_sf_ocr` 在 `FileExecutionStore`（新契约）上的测试。
 //!
-//! workflow 定义在 `src/dub_sf_ocr.rs`——本文件只放测试。
+//! workflow 定义在 `src/dub_sf_ocr/mod.rs`（DAG 声明 → handler 生成）——本文件只放测试。
 //!
 //! 驱动走 **runtime 层**（`define_workflow_runtime` + `start_run`），并通过
 //! 使用者侧自定义的 [`get_workflow_runtime`] 访问器组装。与早期版本（直驱

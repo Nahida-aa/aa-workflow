@@ -261,8 +261,8 @@ async fn demo_durable_retry_park_and_resume() {
 ///    `DagShape::reseed_plan` 缺省 from = 未成功节点（translate 及其下游
 ///    4 步），闭包展开后交给 `reseed` 中间件；修复后重跑恰好
 ///    那 5 步，OCR 链与人声轴全部导入短路。本 demo 只验证名单计算——
-///    声明式版（`src/dub_sf_ocr/dag.rs`）里执行也由同一张图生成
-///    （`dag_to_handler`），主例手写 try_join! 的编排序则与形状解耦。
+///    dub_sf_ocr 的执行本就由同一张图生成（`dub_spec` 声明 →
+///    `dag_to_handler`），不存在第二份编排编码。
 #[tokio::test]
 async fn demo_dub_sf_ocr_shape_closure_redo() {
     // 依赖方向与 examples/store_file/src/dub_sf_ocr/mod.rs 的 handler 逐步对应：

@@ -22,7 +22,7 @@ use aa_workflow_runtime::{
     WorkflowRuntimeRunResult, WorkflowRuntimeRunResultKind, WorkflowRuntimeStartRunArgs,
     create_run_store_adapter, define_workflow_runtime,
 };
-use example_store_file::dub_sf_ocr::dag::dub_sf_ocr_dag;
+use example_store_file::dub_sf_ocr::dub_sf_ocr_dag;
 use example_store_file::dub_sf_ocr::{DubEnv, DubService};
 use example_store_file::FileExecutionStore;
 
