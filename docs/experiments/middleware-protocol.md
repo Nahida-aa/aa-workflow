@@ -154,3 +154,21 @@ tower）在这个维度上被「状态注入方式」之争取代了：**axum �
 - 无状态速写闭包（`.server(f)`）保留。
 
 三分形态表作废，替换为两形态：**struct（带状态，规范）/ 闭包（无状态，速写）**。
+
+
+## 8.1 追加考证：run 记录的 workflowId「键漂移」不是 bug（上游同构）
+
+dub_sf_ocr_dag 示例初版把 `deliver_signal` 的 resume 失败定性为
+「FileExecutionStore 的潜在 bug」（注册键 `dub_sf_ocr` 被 run 记录里的
+`dub-sf-ocr` 覆盖）。**查上游后撤回**：
+
+- 上游 `run-workflow.ts:300`：`RunState.workflowId = workflow.id`——
+  **定义自身的 id**，不是 startRun 的注册键；`setRunState` 落盘同样
+  覆写 run 记录——键漂移行为**同构**；
+- 上游不视之为问题，因为**惯例是注册键 == 定义 id**
+  （`defineWorkflowRuntime({ workflows: { myWorkflow: .. } })` 的键与
+  `createWorkflow({ id: 'myWorkflow' })` 写同一字符串）；
+- 我们的偏差是**测试注册键与定义 id 不一致**——修正 = 注册键对齐
+  定义 id（`"dub-sf-ocr"`），与上游惯例一致；
+- 教训：定性为 bug 前先查上游——本例查证后从「store bug」变为
+  「测试键名不一致 + 注册惯例未成文」（惯例已补进测试与文档）。
