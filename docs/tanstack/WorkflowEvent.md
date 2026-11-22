@@ -340,3 +340,32 @@ for await (const ev of runWorkflow({
 
 `meta`（宿主元数据 + `importedFrom` 溯源）与 `audience`（internal/client/admin 投影视图）是上层扩展槽——engine 不读，只透传。
 
+---
+
+## 附录：run 身份由承载对象携带，不由事件 payload 携带
+
+（2026-11-23 核对：删 `Custom` 的 `run_id` 时对上游真源逐项确认。上面的类型已说明只有 3 个
+run 级事件带 `runId`，这里补的是"为什么其余事件不需要自带 run 身份"。）
+
+上游 18 个变体只有 3 个 run 级事件带 `runId`，其余 15 个（STEP_* / SIGNAL_* /
+APPROVAL_* / NOW_RECORDED / UUID_RECORDED / STATE_DELTA / **CUSTOM**）都不带。run 身份
+一律来自承载对象或调用参数——**主流路径是事件流**：
+
+| 消费方式 | run 身份来源 |
+|---|---|
+| `runWorkflow(opts)` → `AsyncIterable<WorkflowEvent>`（**主流**） | `opts.runId`，调用方本来就知道 |
+| `RunStore.getEvents(runId)` / `subscribe(runId, …)` | 参数 runId |
+| `RunStore.appendEvent(runId, index, event)` | 参数 runId |
+| `publish?: (runId, event)` | 参数 runId |
+
+主流路径返回的 iterable 只 yield 事件、不带 runId（`engine/handle-webhook.ts` 的 `for await`
+即此用法）。**讨论 parity 时别只列 publish/getEvents/subscribe 这类 API——主流是事件流，
+它把 run 身份放在 stream / options 对象上。** 也别把"事件自带 run_id"当成 durability 的
+必需品：本仓 `AppendEventsArgs { run_id, events }` 的 `run_id` 是外部参数，落盘归属靠它。
+
+对应本仓：`run_workflow.rs:26-29` / `1807-1810` 注释原话——`event.run_id()` 是宿主自己填的，
+引擎无从保证它对，run 身份必须能从回调参数拿到。这条注释在 `Custom` 还带 `run_id` 时是
+**错的**，删掉字段后才成立（commit `937ace8`）。其余 20 个变体目前仍带 `run_id`，同样冗余，
+但涉及数百处构造点，是更大的重构，未与"对齐 Custom"混为一个提交。要删时先确认
+`get_events(run_id)` 的按 run 分桶模型不变（它不变就安全）。
+
