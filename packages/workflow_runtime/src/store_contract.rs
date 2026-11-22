@@ -1127,7 +1127,6 @@ fn core_adapter_round_trips(f: &StoreFactory) {
 fn custom(name: &str, ts: i64) -> WorkflowEvent {
     WorkflowEvent::Custom {
         ts,
-        run_id: "run-1".into(),
         name: name.into(),
         value: serde_json::json!({}),
     }

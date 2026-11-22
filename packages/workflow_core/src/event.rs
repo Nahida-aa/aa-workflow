@@ -228,7 +228,6 @@ pub enum WorkflowEvent {
     /// (mirrors TanStack's `CUSTOM` event).
     Custom {
         ts: i64,
-        run_id: String,
         name: String,
         value: serde_json::Value,
     },

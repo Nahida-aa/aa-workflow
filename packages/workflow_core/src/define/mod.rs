@@ -91,7 +91,6 @@ impl<I, S> RunCtx<I, S> {
     pub fn emit(&self, name: impl AsRef<str>, value: serde_json::Value) {
         self.engine.publish(&WorkflowEvent::Custom {
             ts: crate::engine::now_ms(),
-            run_id: self.engine.run_id.clone(),
             name: name.as_ref().to_string(),
             value,
         });
@@ -485,7 +484,6 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
     pub fn emit(&self, name: impl AsRef<str>, value: serde_json::Value) {
         self.engine.publish(&WorkflowEvent::Custom {
             ts: crate::engine::now_ms(),
-            run_id: self.run_id.clone(),
             name: name.as_ref().to_string(),
             value,
         });

@@ -20,7 +20,6 @@ use example_store_file::FileExecutionStore;
 fn custom(step: &str, ts: i64) -> aa_workflow_core::WorkflowEvent {
     aa_workflow_core::WorkflowEvent::Custom {
         ts,
-        run_id: "run-1".into(),
         name: step.into(),
         value: serde_json::json!({ "step": step }),
     }
