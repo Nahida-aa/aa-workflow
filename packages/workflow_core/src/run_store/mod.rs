@@ -23,7 +23,7 @@ pub struct WaitForState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_id: Option<String>,
     pub signal_name: String,
-    pub deadline: Option<i64>,
+    pub deadline: Option<u64>,
     /// 自由元数据（对齐 TanStack `RunState.waitingFor.meta`，
     /// `types.ts:558`），host / UI 拿去渲染，不参与引擎判定。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -112,7 +112,7 @@ pub enum RunAwaitable {
         step_id: Option<String>,
         signal_name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        deadline: Option<i64>,
+        deadline: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         meta: Option<serde_json::Value>,
     },
@@ -207,8 +207,8 @@ pub struct RunState<TInput = serde_json::Value, TOutput = serde_json::Value> {
     /// 挂起等待审批。
     #[serde(default)]
     pub pending_approval: Option<PendingApproval>,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub created_at: u64,
+    pub updated_at: u64,
 }
 
 /// 把「键存在」读成 `Some(v)`——包括 `v` 本身是 JSON `null` 的情况。

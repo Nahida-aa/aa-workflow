@@ -52,7 +52,7 @@ pub struct every;
 
 impl every {
     /// 对齐上游 `every.milliseconds`。
-    pub fn milliseconds(every_ms: i64) -> WorkflowScheduleSpec {
+    pub fn milliseconds(every_ms: u64) -> WorkflowScheduleSpec {
         WorkflowScheduleSpec::Interval {
             every_ms,
             timezone: None,
@@ -60,17 +60,17 @@ impl every {
     }
 
     /// 对齐上游 `every.seconds`。
-    pub fn seconds(seconds: i64) -> WorkflowScheduleSpec {
+    pub fn seconds(seconds: u64) -> WorkflowScheduleSpec {
         Self::milliseconds(seconds * 1000)
     }
 
     /// 对齐上游 `every.minutes`。
-    pub fn minutes(minutes: i64) -> WorkflowScheduleSpec {
+    pub fn minutes(minutes: u64) -> WorkflowScheduleSpec {
         Self::milliseconds(minutes * 60 * 1000)
     }
 
     /// 对齐上游 `every.hours`。
-    pub fn hours(hours: i64) -> WorkflowScheduleSpec {
+    pub fn hours(hours: u64) -> WorkflowScheduleSpec {
         Self::milliseconds(hours * 60 * 60 * 1000)
     }
 }

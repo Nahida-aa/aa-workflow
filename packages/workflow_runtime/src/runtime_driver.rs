@@ -53,7 +53,7 @@ use aa_workflow_core::{
 use crate::types::*;
 
 /// 默认 lease 时长（对齐上游 `DEFAULT_LEASE_MS`）。
-pub const DEFAULT_LEASE_MS: i64 = 30_000;
+pub const DEFAULT_LEASE_MS: u64 = 30_000;
 /// 默认 sweep 每类上限（对齐上游 `DEFAULT_SWEEP_LIMIT`）。
 pub const DEFAULT_SWEEP_LIMIT: usize = 25;
 /// 默认 `min_yield_remaining_ms`（对齐上游）。
@@ -131,7 +131,7 @@ pub struct WorkflowRuntimeConfig<TWorkflows = HashMap<WorkflowId, WorkflowRegist
     /// 按 `workflow_id` 注册的 workflow。
     pub workflows: TWorkflows,
     /// lease 默认时长；单次调用可用 `lease_ms` 覆盖。
-    pub default_lease_ms: Option<i64>,
+    pub default_lease_ms: Option<u64>,
     /// 全局事件 fan-out（best-effort，不参与耐久执行）。
     pub publish: Option<WorkflowRuntimeEventPublisher>,
     /// 早到信号进收件箱（对齐上游 `bufferSignals`，`runtime-driver.ts:383`）。
@@ -227,13 +227,13 @@ pub struct WorkflowRuntimeStartRunArgs {
     /// 不重传——run 级参数属于启动决策。
     pub meta: Option<serde_json::Value>,
     /// 覆盖时钟（测试用）；缺省取当前时间。
-    pub now: Option<i64>,
-    pub deadline: Option<i64>,
+    pub now: Option<u64>,
+    pub deadline: Option<u64>,
     /// 本次 drive 的最大时长（与 [`Self::deadline`] 取较小者）。
-    pub max_duration_ms: Option<i64>,
+    pub max_duration_ms: Option<u64>,
     pub min_yield_remaining_ms: Option<u64>,
     pub lease_owner: Option<LeaseOwner>,
-    pub lease_ms: Option<i64>,
+    pub lease_ms: Option<u64>,
     /// 客户端关联标识（上游 `threadId`）。透传到 `RUN_STARTED` 事件；不落 store。
     pub thread_id: Option<String>,
     /// 默认 `true`：把 drive 观测到的事件带回结果。
@@ -259,13 +259,13 @@ pub struct WorkflowRuntimeDeliverSignalArgs {
     /// 与收件箱条目。此前投递方向没这个字段，而挂起方向（`exec_pause_with`）一直
     /// 收 `meta`——结果 `SignalResolved.meta` 恒为 `None`，是个空壳字段。
     pub meta: Option<serde_json::Value>,
-    pub now: Option<i64>,
+    pub now: Option<u64>,
     pub lease_owner: Option<LeaseOwner>,
-    pub lease_ms: Option<i64>,
+    pub lease_ms: Option<u64>,
     /// 客户端关联标识（上游 `threadId`）。透传到 `RUN_STARTED` 事件；不落 store。
     pub thread_id: Option<String>,
-    pub deadline: Option<i64>,
-    pub max_duration_ms: Option<i64>,
+    pub deadline: Option<u64>,
+    pub max_duration_ms: Option<u64>,
     pub min_yield_remaining_ms: Option<u64>,
     pub include_events: Option<bool>,
     pub max_events: Option<usize>,
@@ -278,13 +278,13 @@ pub struct WorkflowRuntimeDeliverSignalArgs {
 pub struct WorkflowRuntimeDeliverApprovalArgs {
     pub run_id: RunId,
     pub approval: ApprovalResult,
-    pub now: Option<i64>,
+    pub now: Option<u64>,
     pub lease_owner: Option<LeaseOwner>,
-    pub lease_ms: Option<i64>,
+    pub lease_ms: Option<u64>,
     /// 客户端关联标识（上游 `threadId`）。透传到 `RUN_STARTED` 事件；不落 store。
     pub thread_id: Option<String>,
-    pub deadline: Option<i64>,
-    pub max_duration_ms: Option<i64>,
+    pub deadline: Option<u64>,
+    pub max_duration_ms: Option<u64>,
     pub min_yield_remaining_ms: Option<u64>,
     pub include_events: Option<bool>,
     pub max_events: Option<usize>,
@@ -295,12 +295,12 @@ pub struct WorkflowRuntimeDeliverApprovalArgs {
 
 #[derive(Clone, Default)]
 pub struct WorkflowRuntimeSweepArgs {
-    pub now: Option<i64>,
-    pub deadline: Option<i64>,
-    pub max_duration_ms: Option<i64>,
+    pub now: Option<u64>,
+    pub deadline: Option<u64>,
+    pub max_duration_ms: Option<u64>,
     pub min_yield_remaining_ms: Option<u64>,
     pub lease_owner: Option<LeaseOwner>,
-    pub lease_ms: Option<i64>,
+    pub lease_ms: Option<u64>,
     pub max_recovered_runs: Option<usize>,
     pub max_scheduled_runs: Option<usize>,
     pub max_timers: Option<usize>,
@@ -366,10 +366,10 @@ pub fn define_workflow_runtime<TWorkflows>(
 
 static LEASE_OWNER_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-pub(crate) fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -381,7 +381,7 @@ fn create_lease_owner(prefix: &str) -> LeaseOwner {
     format!("{prefix}:{now}:{n}")
 }
 
-fn normalize_lease_ms(v: i64) -> anyhow::Result<i64> {
+fn normalize_lease_ms(v: u64) -> anyhow::Result<u64> {
     if v <= 0 {
         return Err(anyhow::anyhow!(
             "WorkflowDefinition runtime leaseMs must be a positive finite number."
@@ -432,8 +432,8 @@ fn combine_publishers(
 
 fn resolve_lease_ms<TWorkflows>(
     config: &WorkflowRuntimeConfig<TWorkflows>,
-    lease_ms: Option<i64>,
-) -> anyhow::Result<i64> {
+    lease_ms: Option<u64>,
+) -> anyhow::Result<u64> {
     normalize_lease_ms(
         lease_ms
             .or(config.default_lease_ms)
@@ -443,10 +443,10 @@ fn resolve_lease_ms<TWorkflows>(
 
 /// `deadline` 与 `max_duration_ms`（从 `started_at` 起算）取较小者。
 fn resolve_runtime_deadline(
-    deadline: Option<i64>,
-    max_duration_ms: Option<i64>,
-    started_at: i64,
-) -> anyhow::Result<Option<i64>> {
+    deadline: Option<u64>,
+    max_duration_ms: Option<u64>,
+    started_at: u64,
+) -> anyhow::Result<Option<u64>> {
     let duration_deadline = max_duration_ms.map(|d| started_at + d);
     Ok(match (deadline, duration_deadline) {
         (Some(a), Some(b)) => Some(a.min(b)),
@@ -456,9 +456,9 @@ fn resolve_runtime_deadline(
     })
 }
 
-fn should_stop_for_deadline(deadline: Option<i64>, min_yield_remaining_ms: u64) -> bool {
+fn should_stop_for_deadline(deadline: Option<u64>, min_yield_remaining_ms: u64) -> bool {
     deadline
-        .map(|d| d - now_ms() <= min_yield_remaining_ms as i64)
+        .map(|d| d - now_ms() <= min_yield_remaining_ms as u64)
         .unwrap_or(false)
 }
 
@@ -1216,7 +1216,7 @@ struct DriveArgs<'a> {
     /// 会预先生成** `sweep:{now}`（上游 `:416`）——那是批次标识，不是 per-run 的。
     lease_owner: Option<LeaseOwner>,
     /// `None` = 走 `config.default_lease_ms` → `DEFAULT_LEASE_MS`。
-    lease_ms: Option<i64>,
+    lease_ms: Option<u64>,
     /// 客户端关联标识，透传进 `RUN_STARTED`（上游 `DriveOptions.threadId`）。
     /// sweep 传 `None`——上游 `sweep` 不带 threadId（`types.ts:459-474`）。
     thread_id: Option<String>,
@@ -1227,13 +1227,13 @@ struct DriveArgs<'a> {
     /// 本次 drive 的「现在」，入口算一次一路传下去。**不要**在下游重读墙钟：
     /// 上游把 `args.now` 一路传到 `syncTimerFromRunState`
     /// （`runtime-driver.ts:761`）就是这个原因。
-    now: i64,
-    deadline: Option<i64>,
+    now: u64,
+    deadline: Option<u64>,
     /// 已归一（入口套了 [`normalize_min_yield_remaining_ms`]），所以不是
     /// `Option`。上游类型是 `Option<number>` 但同样在 `startRun` 顶部就归一了
     /// （`:73`）——归一过还用 `Option` 表示，等于把「已校验」只写在注释里。
     min_yield_remaining_ms: u64,
-    yield_resume_at: Option<i64>,
+    yield_resume_at: Option<u64>,
     include_events: Option<bool>,
     max_events: Option<usize>,
     /// 随本次 drive 投递的信号（上游 `driveClaimedRun` 的 `signalDelivery`）。
@@ -1269,7 +1269,7 @@ fn sync_timer_from_run_state<TWorkflows>(
     config: &WorkflowRuntimeConfig<TWorkflows>,
     run_id: &str,
     workflow_id: &str,
-    now: i64,
+    now: u64,
 ) -> anyhow::Result<()> {
     let Some(state) = config.store.load_run_state(run_id)? else {
         return Ok(());
@@ -1300,7 +1300,7 @@ fn start_lease_heartbeat(
     store: Arc<dyn WorkflowExecutionStore>,
     run_id: RunId,
     lease_owner: LeaseOwner,
-    lease_ms: i64,
+    lease_ms: u64,
 ) -> HeartbeatHandle {
     let interval_ms = (lease_ms / 3).max(1);
     let stop = Arc::new(AtomicBool::new(false));

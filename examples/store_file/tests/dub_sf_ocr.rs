@@ -123,7 +123,7 @@ fn finished_count(events: &[StoredWorkflowEvent], step: &str) -> usize {
 }
 
 /// 某 step 的 `StepFinished` 时间戳（用于断言「没被重跑」）。
-fn sf_ts(events: &[StoredWorkflowEvent], step: &str) -> i64 {
+fn sf_ts(events: &[StoredWorkflowEvent], step: &str) -> u64 {
     events
         .iter()
         .find(|e| e.event_type == "STEP_FINISHED" && e.step_id.as_deref() == Some(step))

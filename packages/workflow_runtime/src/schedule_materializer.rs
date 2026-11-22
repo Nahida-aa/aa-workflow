@@ -36,14 +36,14 @@ use crate::{WorkflowExecutionStore, WorkflowRegistration};
 ///
 /// 回看的用途：宿主可能停机一段时间，恢复后要补跑停机期间**本该触发**的那一次
 /// （而非直接跳到下一次）。窗口限制了这个补跑的追溯深度。
-pub const DEFAULT_CRON_LOOKBACK_MS: i64 = 32 * 24 * 60 * 60 * 1000;
+pub const DEFAULT_CRON_LOOKBACK_MS: u64 = 32 * 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Default)]
 pub struct MaterializeWorkflowSchedulesOptions {
     /// 覆盖当前时间（测试用）；缺省取 `now_ms()`。
-    pub now: Option<i64>,
+    pub now: Option<u64>,
     /// 覆盖 cron 回看窗口；缺省 [`DEFAULT_CRON_LOOKBACK_MS`]。
-    pub cron_lookback_ms: Option<i64>,
+    pub cron_lookback_ms: Option<u64>,
 }
 
 /// 一个 schedule 的物化结果（对齐上游 `MaterializedWorkflowSchedule`）。
@@ -53,7 +53,7 @@ pub enum MaterializedWorkflowSchedule {
     Materialized {
         workflow_id: String,
         schedule_id: ScheduleId,
-        fire_at: i64,
+        fire_at: u64,
         schedule: WorkflowScheduleSpec,
     },
     /// 声明为停用，已登记为 `enabled: false`（无 `next_fire_at`）。
@@ -168,9 +168,9 @@ fn schedule_id_of(
 /// 算出「该触发的时刻」；`None` = 回看窗口内没有（对齐上游 `getDueFireAt`）。
 fn due_fire_at(
     schedule: &WorkflowScheduleSpec,
-    now: i64,
-    lookback_ms: i64,
-) -> anyhow::Result<Option<i64>> {
+    now: u64,
+    lookback_ms: u64,
+) -> anyhow::Result<Option<u64>> {
     match schedule {
         WorkflowScheduleSpec::Interval { every_ms, .. } => {
             if *every_ms <= 0 {
@@ -191,9 +191,9 @@ fn due_fire_at(
 /// 贴合「补跑停机期间本该触发的那次」。
 fn previous_cron_fire_at(
     schedule: &WorkflowScheduleSpec,
-    now: i64,
-    lookback_ms: i64,
-) -> anyhow::Result<Option<i64>> {
+    now: u64,
+    lookback_ms: u64,
+) -> anyhow::Result<Option<u64>> {
     let WorkflowScheduleSpec::Cron {
         expression,
         timezone,
@@ -225,7 +225,7 @@ fn previous_cron_fire_at(
 }
 
 /// 向下取整到分钟（对齐上游 `floorToMinute`）。
-fn floor_to_minute(timestamp: i64) -> i64 {
+fn floor_to_minute(timestamp: u64) -> u64 {
     timestamp - timestamp.rem_euclid(60_000)
 }
 
@@ -245,7 +245,7 @@ struct ParsedCronField {
     /// 原始字段是否为 `*`——**只有整字段是 `*` 才算通配**（对齐上游：
     /// `*/2` 的 `wildcard` 是 false，因为 field 字符串不是 `"*"`）。
     wildcard: bool,
-    values: Vec<i64>,
+    values: Vec<u64>,
 }
 
 /// 五字段：分 时 日 月 周。
@@ -266,15 +266,15 @@ fn parse_cron_expression(expression: &str) -> anyhow::Result<ParsedCronExpressio
     })
 }
 
-fn parse_cron_field(field: &str, min: i64, max: i64) -> anyhow::Result<ParsedCronField> {
+fn parse_cron_field(field: &str, min: u64, max: u64) -> anyhow::Result<ParsedCronField> {
     parse_cron_field_with(field, min, max, None)
 }
 
 fn parse_cron_field_with(
     field: &str,
-    min: i64,
-    max: i64,
-    normalize: Option<fn(i64) -> i64>,
+    min: u64,
+    max: u64,
+    normalize: Option<fn(u64) -> u64>,
 ) -> anyhow::Result<ParsedCronField> {
     let mut values = Vec::new();
     for part in field.split(',') {
@@ -282,12 +282,12 @@ fn parse_cron_field_with(
             Some((r, s)) => (r, Some(s)),
             None => (part, None),
         };
-        let step: i64 = match step_part {
+        let step: u64 = match step_part {
             None => 1,
             Some(s) => s
                 .parse()
                 .map_err(|_| anyhow::anyhow!("Invalid cron step \"{part}\"."))
-                .and_then(|v: i64| {
+                .and_then(|v: u64| {
                     if v > 0 {
                         Ok(v)
                     } else {
@@ -316,7 +316,7 @@ fn parse_cron_field_with(
 }
 
 /// `*` / `N` / `N-M`（对齐上游 `parseCronRange`）。
-fn parse_cron_range(range: &str, min: i64, max: i64) -> anyhow::Result<(i64, i64)> {
+fn parse_cron_range(range: &str, min: u64, max: u64) -> anyhow::Result<(u64, u64)> {
     if range == "*" {
         return Ok((min, max));
     }
@@ -338,8 +338,8 @@ fn parse_cron_range(range: &str, min: i64, max: i64) -> anyhow::Result<(i64, i64
     }
 }
 
-fn parse_cron_number(value: &str, min: i64, max: i64) -> anyhow::Result<i64> {
-    let parsed: i64 = value
+fn parse_cron_number(value: &str, min: u64, max: u64) -> anyhow::Result<u64> {
+    let parsed: u64 = value
         .parse()
         .map_err(|_| anyhow::anyhow!("Invalid cron value \"{value}\"."))?;
     if parsed < min || parsed > max {
@@ -349,7 +349,7 @@ fn parse_cron_number(value: &str, min: i64, max: i64) -> anyhow::Result<i64> {
 }
 
 /// 7 → 0（周日两种写法，对齐上游）。
-fn normalize_day_of_week(value: i64) -> i64 {
+fn normalize_day_of_week(value: u64) -> u64 {
     if value == 7 { 0 } else { value }
 }
 
@@ -358,7 +358,7 @@ impl ParsedCronExpression {
     ///
     /// 日与星期的组合语义是 cron 的经典坑：**两个都非通配时取「或」**，
     /// 否则取「与」（POSIX 行为，上游照此实现）。
-    fn matches(&self, timestamp: i64) -> bool {
+    fn matches(&self, timestamp: u64) -> bool {
         let (year, month, day, hour, minute, weekday) = utc_parts(timestamp);
 
         let dom_matches = self.day_of_month.values.contains(&day);
@@ -388,7 +388,7 @@ impl ParsedCronExpression {
 ///
 /// 用 Howard Hinnant 的 `civil_from_days` 算法（days since 1970-01-01 →
 /// 公历年月日），纯整数运算、无分支预测问题、无依赖。
-fn utc_parts(timestamp_ms: i64) -> (i64, i64, i64, i64, i64, i64) {
+fn utc_parts(timestamp_ms: u64) -> (u64, u64, u64, u64, u64, u64) {
     let seconds = timestamp_ms.div_euclid(1000);
     let days = seconds.div_euclid(86_400);
     let secs_of_day = seconds.rem_euclid(86_400);
@@ -408,7 +408,7 @@ fn utc_parts(timestamp_ms: i64) -> (i64, i64, i64, i64, i64, i64) {
 /// 算法出处：Howard Hinnant, *chrono-Compatible Low-Level Date Algorithms*。
 /// 以 0000-03-01 为纪元原点，把闰年偏移到最后一个月之后，于是「闰日」总落在
 /// 年末，可以用一套线性公式处理。
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
+fn civil_from_days(days: u64) -> (u64, u64, u64) {
     // 移位到 0000-03-01 纪元。
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -424,10 +424,10 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (y, m, d)
 }
 
-fn now_ms() -> i64 {
+fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -455,7 +455,7 @@ mod tests {
     use std::collections::HashMap;
     use aa_workflow_core::{CreateWorkflowConfig, WorkflowCtx, create_workflow};
 
-    fn spec_interval(ms: i64) -> WorkflowScheduleSpec {
+    fn spec_interval(ms: u64) -> WorkflowScheduleSpec {
         WorkflowScheduleSpec::Interval {
             every_ms: ms,
             timezone: None,
@@ -470,7 +470,7 @@ mod tests {
     }
 
     /// 2026-09-14T12:34:56Z 的毫秒时间戳（周一）。
-    const T: i64 = 1_789_389_296_000;
+    const T: u64 = 1_789_389_296_000;
 
     #[test]
     fn utc_parts_decomposes_correctly() {
@@ -767,7 +767,7 @@ mod tests {
                 &workflows,
                 &MaterializeWorkflowSchedulesOptions {
                     now: Some(T),
-                    cron_lookback_ms: Some(-1),
+                    cron_lookback_ms: Some(1),
                 },
             )
             .is_err()

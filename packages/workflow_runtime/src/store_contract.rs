@@ -905,7 +905,7 @@ fn approval_delivery_is_idempotent(f: &StoreFactory) {
         })
         .unwrap();
 
-    let approval = |now: i64| DeliverApprovalArgs {
+    let approval = |now: u64| DeliverApprovalArgs {
         run_id: "run-1".into(),
         approval: ApprovalResult {
             approval_id: "approval-1".into(),
@@ -1124,7 +1124,7 @@ fn core_adapter_round_trips(f: &StoreFactory) {
 // 测试夹具
 // ============================================================
 
-fn custom(name: &str, ts: i64) -> WorkflowEvent {
+fn custom(name: &str, ts: u64) -> WorkflowEvent {
     WorkflowEvent::Custom {
         ts,
         name: name.into(),

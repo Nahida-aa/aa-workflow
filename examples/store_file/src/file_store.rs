@@ -50,14 +50,14 @@ fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), StoreEr
 
 /// lease 是否可认领（对齐 `in_memory_store.rs` 的 `can_claim`）：
 /// 无 lease / 是自己的 / 已过期。
-fn can_claim(existing: Option<&WorkflowLease>, owner: &LeaseOwner, now: i64) -> bool {
+fn can_claim(existing: Option<&WorkflowLease>, owner: &LeaseOwner, now: u64) -> bool {
     match existing {
         None => true,
         Some(l) => l.owner == *owner || l.expires_at <= now,
     }
 }
 
-fn new_lease(owner: LeaseOwner, lease_ms: i64, now: i64) -> WorkflowLease {
+fn new_lease(owner: LeaseOwner, lease_ms: u64, now: u64) -> WorkflowLease {
     WorkflowLease {
         owner,
         expires_at: now + lease_ms,
@@ -136,7 +136,7 @@ fn is_run_waiting_for_approval(run: &WorkflowExecution, approval: &ApprovalResul
 struct TimerRecord {
     timer: TimerWakeup,
     lease_owner: Option<LeaseOwner>,
-    lease_expires_at: Option<i64>,
+    lease_expires_at: Option<u64>,
 }
 
 impl TimerRecord {
@@ -158,7 +158,7 @@ struct BucketRecord {
     /// `claimed` / `started`
     status: String,
     lease_owner: Option<LeaseOwner>,
-    lease_expires_at: Option<i64>,
+    lease_expires_at: Option<u64>,
 }
 
 impl BucketRecord {
@@ -179,7 +179,7 @@ struct ScheduleRecord {
     schedule_id: ScheduleId,
     workflow_id: WorkflowId,
     workflow_version: Option<WorkflowVersion>,
-    next_fire_at: Option<i64>,
+    next_fire_at: Option<u64>,
     input: Option<serde_json::Value>,
     overlap_policy: WorkflowOverlapPolicy,
     enabled: bool,
@@ -918,7 +918,7 @@ impl WorkflowExecutionStore for FileExecutionStore {
     /// 按 `updated_at` 倒序；cursor 用同一字段做键集分页。
     fn list_runs(&self, args: ListRunsArgs) -> anyhow::Result<Vec<RunSummary>> {
         let _g = self.block();
-        let cursor: Option<i64> = args.cursor.as_deref().and_then(|c| c.parse().ok());
+        let cursor: Option<u64> = args.cursor.as_deref().and_then(|c| c.parse().ok());
 
         let dirs = match fs::read_dir(&self.base) {
             Ok(d) => d,

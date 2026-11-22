@@ -67,7 +67,7 @@ struct ScheduleRecord {
     schedule_id: ScheduleId,
     workflow_id: WorkflowId,
     workflow_version: Option<WorkflowVersion>,
-    next_fire_at: Option<i64>,
+    next_fire_at: Option<u64>,
     input: Option<serde_json::Value>,
     overlap_policy: WorkflowOverlapPolicy,
     enabled: bool,
@@ -101,7 +101,7 @@ pub fn in_memory_execution_store() -> InMemoryExecutionStore {
 }
 
 /// `can_claim` 三条件（对齐上游同名函数）：无 lease / 是自己的 / 已过期。
-fn can_claim(existing: Option<&WorkflowLease>, owner: &LeaseOwner, now: i64) -> bool {
+fn can_claim(existing: Option<&WorkflowLease>, owner: &LeaseOwner, now: u64) -> bool {
     match existing {
         None => true,
         Some(l) => l.owner == *owner || l.expires_at <= now,
@@ -109,7 +109,7 @@ fn can_claim(existing: Option<&WorkflowLease>, owner: &LeaseOwner, now: i64) -> 
 }
 
 /// 构造 lease（对齐上游 `lease()`）。
-fn new_lease(owner: LeaseOwner, lease_ms: i64, now: i64) -> WorkflowLease {
+fn new_lease(owner: LeaseOwner, lease_ms: u64, now: u64) -> WorkflowLease {
     WorkflowLease {
         owner,
         expires_at: now + lease_ms,
@@ -855,7 +855,7 @@ mod in_memory_tests {
         })
     }
 
-    fn paused_args(run_id: &str, signal: &str, now: i64) -> MarkRunPausedArgs {
+    fn paused_args(run_id: &str, signal: &str, now: u64) -> MarkRunPausedArgs {
         MarkRunPausedArgs {
             run_id: run_id.into(),
             waiting_for: waiting(signal),
@@ -865,7 +865,7 @@ mod in_memory_tests {
         }
     }
 
-    fn created(run_id: &str, now: i64) -> CreateRunArgs {
+    fn created(run_id: &str, now: u64) -> CreateRunArgs {
         CreateRunArgs {
             run_id: run_id.into(),
             workflow_id: "wf".into(),

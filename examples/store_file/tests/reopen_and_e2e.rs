@@ -17,7 +17,7 @@ use aa_workflow_runtime::types::*;
 use example_store_file::FileExecutionStore;
 
 /// 造一个带 `step_id` 的最小事件（契约套件里也有同名的本地 helper）。
-fn custom(step: &str, ts: i64) -> aa_workflow_core::WorkflowEvent {
+fn custom(step: &str, ts: u64) -> aa_workflow_core::WorkflowEvent {
     aa_workflow_core::WorkflowEvent::Custom {
         ts,
         name: step.into(),

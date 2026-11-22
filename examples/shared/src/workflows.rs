@@ -51,7 +51,7 @@ pub struct FulfillmentSagaInput {
 #[derive(serde::Deserialize, serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EmailDigestInput {
-    pub days: i64,
+    pub days: u64,
 }
 
 /// 履约流输入（对齐 wf-demo `FulfillmentInput`）。
@@ -59,7 +59,7 @@ pub struct EmailDigestInput {
 #[serde(rename_all = "camelCase")]
 pub struct FulfillmentInput {
     pub order_id: String,
-    pub ready_at: i64,
+    pub ready_at: u64,
 }
 
 /// 审批流输入。
@@ -67,7 +67,7 @@ pub struct FulfillmentInput {
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalOrderInput {
     pub order_id: String,
-    pub amount: i64,
+    pub amount: u64,
     #[serde(default = "default_currency")]
     pub currency: String,
 }
@@ -95,11 +95,11 @@ pub struct ComplianceInput {
 #[serde(rename_all = "camelCase")]
 pub struct RefundInput {
     pub order_id: String,
-    pub amount: i64,
+    pub amount: u64,
     #[serde(default = "default_currency")]
     pub currency: String,
     #[serde(default)]
-    pub refund_at: Option<i64>,
+    pub refund_at: Option<u64>,
 }
 
 fn default_currency() -> String {
@@ -291,11 +291,11 @@ pub fn approval_review() -> WorkflowDefinition {
     })
 }
 
-fn now_ms() -> i64 {
+fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_millis() as i64
+        .as_millis() as u64
 }
 
 /// 履约流（对齐官方 `fulfillmentWorkflow` / wf-demo `fulfillment`）：
@@ -356,7 +356,7 @@ pub fn fulfillment() -> WorkflowDefinition<FulfillmentInput, serde_json::Value> 
     )
 }
 
-const APPROVAL_THRESHOLD: i64 = 1_000;
+const APPROVAL_THRESHOLD: u64 = 1_000;
 
 /// 审批流（对齐 wf-demo `approval-order`）：`check-order` → 金额超过阈值才
 /// `approve`（拒绝走 `notify-rejected` 分支）→ `charge-payment`。
@@ -562,7 +562,7 @@ pub fn refund() -> WorkflowDefinition<RefundInput, serde_json::Value> {
 #[serde(rename_all = "camelCase")]
 pub struct StateDemoInput {
     pub order_id: String,
-    pub amount: i64,
+    pub amount: u64,
 }
 
 /// typed state 的形状（Rust 版 zod `stateSchema`）：`.state::<T>()`
@@ -571,7 +571,7 @@ pub struct StateDemoInput {
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CounterState {
-    pub total: i64,
+    pub total: u64,
     pub settle_events: Vec<String>,
 }
 
@@ -635,7 +635,7 @@ pub fn state_demo() -> WorkflowDefinition<StateDemoInput, serde_json::Value, Cou
 #[serde(rename_all = "camelCase")]
 pub struct EventGateInput {
     pub market: String,
-    pub predicted_at: i64,
+    pub predicted_at: u64,
 }
 
 pub fn event_gate() -> WorkflowDefinition<EventGateInput, serde_json::Value> {
@@ -692,7 +692,7 @@ mod tests {
             .count()
     }
 
-    fn sf_ts(events: &[WorkflowEvent], step: &str) -> i64 {
+    fn sf_ts(events: &[WorkflowEvent], step: &str) -> u64 {
         events
             .iter()
             .find_map(|e| match e {
@@ -1450,7 +1450,7 @@ mod tests {
                 .state_schema::<CounterState>()
                 .initialize(|input| {
                     Ok(serde_json::json!({
-                        "total": input["amount"].as_i64().unwrap_or(0),
+                        "total": input["amount"].as_u64().unwrap_or(0),
                         "settleEvents": [],
                     }))
                 }),
@@ -1511,7 +1511,7 @@ mod tests {
         assert_eq!(out.status, RunStatus::Finished);
         let o = out.output.unwrap();
         assert_eq!(
-            o["total"].as_i64().unwrap(),
+            o["total"].as_u64().unwrap(),
             5,
             "bump-inside 的 +1 在重启重放时丢失（闭包被短路），只保留 initialize 的 base"
         );

@@ -105,13 +105,13 @@ impl<I, S> RunCtx<I, S> {
             .unwrap_or(false)
     }
     /// 本次 drive 的预算上限（上游 `runtime.deadline`）；未设 = `None`。
-    pub fn deadline(&self) -> Option<i64> {
+    pub fn deadline(&self) -> Option<u64> {
         self.engine.deadline
     }
     /// Ms of runtime budget left (`u64::MAX` when no deadline).
     pub fn time_remaining(&self) -> u64 {
         match self.engine.deadline {
-            Some(d) => i64::saturating_sub(d, crate::engine::now_ms()).max(0) as u64,
+            Some(d) => u64::saturating_sub(d, crate::engine::now_ms()),
             None => u64::MAX,
         }
     }
@@ -149,7 +149,7 @@ impl<I, S> StepCtx<I, S> {
     pub fn is_cancelled(&self) -> bool {
         self.ctx.is_cancelled()
     }
-    pub fn deadline(&self) -> Option<i64> {
+    pub fn deadline(&self) -> Option<u64> {
         self.ctx.deadline()
     }
     pub fn time_remaining(&self) -> u64 {
@@ -415,7 +415,7 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
     {
         // 与上游同构：`sleep(ms)` 就是 `sleepUntil(now + ms)`
         // （`run-workflow.ts:992`）。deadline 一律**绝对时间戳**。
-        let due = crate::engine::now_ms() + dur.as_millis() as i64;
+        let due = crate::engine::now_ms() + dur.as_millis() as u64;
         self.sleep_until(key, due).await
     }
 
@@ -427,7 +427,7 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
     pub async fn sleep_until(
         &self,
         key: impl Into<String>,
-        ts_ms: i64,
+        ts_ms: u64,
     ) -> anyhow::Result<serde_json::Value>
     where
         TState: serde::Serialize,
@@ -492,7 +492,7 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
     /// Deterministic wall-clock (TanStack `ctx.now`): records the call's
     /// timestamp as a checkpoint; replay serves the recorded value, so a run
     /// sees the same clock across resumes. Returns `Err` only on store failure.
-    pub fn now(&self) -> anyhow::Result<i64> {
+    pub fn now(&self) -> anyhow::Result<u64> {
         crate::engine::exec_now(&self.engine, None)
     }
 
@@ -512,7 +512,7 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
     ///
     /// 同一个 id 调用两次会各取各的时间（第一次消费掉日志里那条记录，第二次
     /// 生成新值并追加），与上游 `consumed` 语义一致。
-    pub fn now_with(&self, id: &str) -> anyhow::Result<i64> {
+    pub fn now_with(&self, id: &str) -> anyhow::Result<u64> {
         crate::engine::exec_now(&self.engine, Some(id))
     }
 
@@ -538,14 +538,14 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
 
     /// Absolute UTC ms runtime budget for this drive (TanStack `deadline`);
     /// `None` when the host set no budget.
-    pub fn deadline(&self) -> Option<i64> {
+    pub fn deadline(&self) -> Option<u64> {
         self.engine.deadline
     }
 
     /// Ms of runtime budget left (`u64::MAX` when no deadline).
     pub fn time_remaining(&self) -> u64 {
         match self.engine.deadline {
-            Some(d) => i64::saturating_sub(d, crate::engine::now_ms()).max(0) as u64,
+            Some(d) => u64::saturating_sub(d, crate::engine::now_ms()),
             None => u64::MAX,
         }
     }
@@ -736,7 +736,7 @@ impl std::fmt::Debug for PayloadSchema {
 pub struct WaitForEventOptions {
     /// 绝对 UTC ms 唤醒期限。落进 `SignalAwaited.due_at` 和
     /// `RunState.waiting_for.deadline`，供 host 建时间索引的 worker job。
-    pub deadline: Option<i64>,
+    pub deadline: Option<u64>,
     /// 自由元数据，落进 `SignalAwaited.meta` 与 `RunState` 的三处 await 投影。
     pub meta: Option<serde_json::Value>,
     /// 恢复时对投递 payload 的形状校验（`schema`）。校验失败 → run 报错。
@@ -748,7 +748,7 @@ pub struct WaitForEventOptions {
 #[derive(Default, Clone, Debug)]
 pub struct ApproveOptions {
     /// 绝对 UTC ms 期限；`None` = 等人，无时间上限。
-    pub deadline: Option<i64>,
+    pub deadline: Option<u64>,
     /// 自由元数据（如审批单链接、金额、影响面），落进 checkpoint + 投影。
     pub meta: Option<serde_json::Value>,
     /// 恢复时对审批决定 payload 的形状校验。

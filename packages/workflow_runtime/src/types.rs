@@ -82,7 +82,7 @@ pub struct StoredWorkflowEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub step_id: Option<String>,
     pub event: WorkflowEvent,
-    pub created_at: i64,
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,12 +145,12 @@ pub struct WorkflowExecution {
     pub pending_approval: Option<aa_workflow_core::PendingApproval>,
     /// 下次该被唤醒的时间（timer 的投影），供 sweep 建时间索引。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub wake_at: Option<i64>,
+    pub wake_at: Option<u64>,
     /// 当前 lease；无 lease 为 `None`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease: Option<WorkflowLease>,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub created_at: u64,
+    pub updated_at: u64,
 }
 
 /// 一次执行认领（对齐 `types.ts:28` 的 `WorkflowLease`）。
@@ -161,7 +161,7 @@ pub struct WorkflowExecution {
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowLease {
     pub owner: LeaseOwner,
-    pub expires_at: i64,
+    pub expires_at: u64,
 }
 
 /// run 摘要（对齐 `types.ts:268` 的 `RunSummary`），供 `list_runs` 返回。
@@ -178,9 +178,9 @@ pub struct RunSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_approval: Option<aa_workflow_core::PendingApproval>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub wake_at: Option<i64>,
-    pub created_at: i64,
-    pub updated_at: i64,
+    pub wake_at: Option<u64>,
+    pub created_at: u64,
+    pub updated_at: u64,
 }
 
 /// 一个 run 的时间线：执行记录 + 全部事件（对齐 `types.ts:282`）。
@@ -217,7 +217,7 @@ pub struct CreateRunArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow_version: Option<WorkflowVersion>,
     pub input: serde_json::Value,
-    pub now: i64,
+    pub now: u64,
 }
 
 /// 幂等创建的两种结果（对齐 `types.ts:72`）。`Existing` 表示该 run_id 已存在，
@@ -244,8 +244,8 @@ pub struct MarkRunPausedArgs {
     pub pending_approval: Option<aa_workflow_core::PendingApproval>,
     /// 下次该被唤醒的时间（timer 投影），供 sweep 建索引。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub wake_at: Option<i64>,
-    pub now: i64,
+    pub wake_at: Option<u64>,
+    pub now: u64,
 }
 
 /// 对齐 `types.ts:124`。
@@ -254,7 +254,7 @@ pub struct MarkRunPausedArgs {
 pub struct MarkRunFinishedArgs {
     pub run_id: RunId,
     pub output: serde_json::Value,
-    pub now: i64,
+    pub now: u64,
 }
 
 /// 对齐 `types.ts:130`。`error` / `code` 对应我们的
@@ -265,7 +265,7 @@ pub struct MarkRunErroredArgs {
     pub run_id: RunId,
     pub error: aa_workflow_core::RunError,
     pub code: aa_workflow_core::RunErrorCode,
-    pub now: i64,
+    pub now: u64,
 }
 
 // ── lease ───────────────────────────────────────────────────
@@ -277,8 +277,8 @@ pub struct ClaimRunArgs {
     pub run_id: RunId,
     pub lease_owner: LeaseOwner,
     /// lease 时长（ms）。runtime 会按它的 1/3 续租。
-    pub lease_ms: i64,
-    pub now: i64,
+    pub lease_ms: u64,
+    pub now: u64,
 }
 
 /// 认领的三态结果（对齐 `types.ts:98`）。
@@ -299,8 +299,8 @@ pub enum ClaimRunResult {
 pub struct HeartbeatRunLeaseArgs {
     pub run_id: RunId,
     pub lease_owner: LeaseOwner,
-    pub lease_ms: i64,
-    pub now: i64,
+    pub lease_ms: u64,
+    pub now: u64,
 }
 
 /// 对齐 `types.ts:110`。
@@ -315,10 +315,10 @@ pub struct ReleaseRunLeaseArgs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaimStaleRunsArgs {
-    pub now: i64,
+    pub now: u64,
     pub limit: usize,
     pub lease_owner: LeaseOwner,
-    pub lease_ms: i64,
+    pub lease_ms: u64,
 }
 
 /// 一次 stale 认领的结果（对齐 `types.ts:256`）。
@@ -341,19 +341,19 @@ pub struct ScheduleTimerArgs {
     pub workflow_id: WorkflowId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow_version: Option<WorkflowVersion>,
-    pub wake_at: i64,
+    pub wake_at: u64,
     pub signal_id: String,
-    pub now: i64,
+    pub now: u64,
 }
 
 /// 对齐 `types.ts:146`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaimDueTimersArgs {
-    pub now: i64,
+    pub now: u64,
     pub limit: usize,
     pub lease_owner: LeaseOwner,
-    pub lease_ms: i64,
+    pub lease_ms: u64,
 }
 
 /// 一个到期的 timer（对齐 `types.ts:153`）。字段与 [`ScheduleTimerArgs`] 相同
@@ -365,7 +365,7 @@ pub struct TimerWakeup {
     pub workflow_id: WorkflowId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow_version: Option<WorkflowVersion>,
-    pub wake_at: i64,
+    pub wake_at: u64,
     pub signal_id: String,
 }
 
@@ -395,7 +395,7 @@ pub struct SignalDelivery {
 pub struct DeliverSignalArgs {
     pub run_id: RunId,
     pub delivery: SignalDelivery,
-    pub now: i64,
+    pub now: u64,
 }
 
 /// 审批决定（对齐 core `types.ts:312` 的 `ApprovalResult`）。
@@ -415,7 +415,7 @@ pub struct ApprovalResult {
 pub struct DeliverApprovalArgs {
     pub run_id: RunId,
     pub approval: ApprovalResult,
-    pub now: i64,
+    pub now: u64,
 }
 
 /// 投递的四态结果（对齐上游 `DeliverSignalResult` / `DeliverApprovalResult`）。
@@ -473,7 +473,7 @@ pub struct ConsumeBufferedSignalArgs {
     /// 泊车在这一信号上的 step（上游是必填 `string`）。
     pub step_id: String,
     pub expected_next_index: u64,
-    pub now: i64,
+    pub now: u64,
 }
 
 // ── 查询 ────────────────────────────────────────────────────
@@ -522,7 +522,7 @@ pub enum WorkflowScheduleSpec {
         timezone: Option<String>,
     },
     Interval {
-        every_ms: i64,
+        every_ms: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         timezone: Option<String>,
     },
@@ -562,9 +562,9 @@ pub struct UpsertScheduleArgs {
     pub input: Option<serde_json::Value>,
     /// 下次触发时间——由 host 计算（core 不管 cron 表达式解析）。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_fire_at: Option<i64>,
+    pub next_fire_at: Option<u64>,
     pub enabled: bool,
-    pub now: i64,
+    pub now: u64,
 }
 
 /// 一个到期的 schedule 桶（对齐 `types.ts:231`）。
@@ -578,7 +578,7 @@ pub struct ScheduleBucket {
     pub workflow_version: Option<WorkflowVersion>,
     /// 桶推导出的 runId：`{workflowId}:{scheduleId}:{bucketId}`。
     pub run_id: RunId,
-    pub fire_at: i64,
+    pub fire_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<serde_json::Value>,
     pub overlap_policy: WorkflowOverlapPolicy,
@@ -588,10 +588,10 @@ pub struct ScheduleBucket {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaimDueScheduleBucketsArgs {
-    pub now: i64,
+    pub now: u64,
     pub limit: usize,
     pub lease_owner: LeaseOwner,
-    pub lease_ms: i64,
+    pub lease_ms: u64,
 }
 
 /// 对齐 `types.ts:241` 附近（`MarkScheduleBucketStartedArgs`）。

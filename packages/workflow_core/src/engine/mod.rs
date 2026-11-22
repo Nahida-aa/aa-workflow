@@ -27,10 +27,10 @@ pub use run_workflow::{
 };
 pub use state_diff::{Operation, diff_state, snapshot_state};
 
-pub(crate) fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -140,7 +140,7 @@ pub(crate) struct PendingRetry {
     /// 已知的最后一次 attempt 序号。
     pub last_attempt: usize,
     /// 下次重试的绝对截止时间（UTC ms）。
-    pub next_attempt_at: i64,
+    pub next_attempt_at: u64,
 }
 
 /// Phase-1 补偿执行（undo 轴）：未捕获失败时由失败路径调用。逆序执行已登记
@@ -342,11 +342,11 @@ pub struct EngineRuntime {
     /// handler 代码在重放时拿到同一串 id——这是它必须确定的原因。
     pub(crate) counters: Counters,
     /// Runtime budget (TanStack `deadline`): absolute UTC ms for this drive.
-    pub deadline: Option<i64>,
+    pub deadline: Option<u64>,
     /// Headroom threshold for `should_yield()` (TanStack `minYieldRemainingMs`).
     pub min_yield_remaining_ms: u64,
     /// Absolute ms at which `ctx.yield_()` re-wakes (TanStack `yieldResumeAt`).
-    pub yield_resume_at: Option<i64>,
+    pub yield_resume_at: Option<u64>,
     /// 事件扇出通道，对应上游 `emit`（`run-workflow.ts:157` 的闭包捕获的
     /// `queue` + `resolveWait`）。
     ///
@@ -1120,7 +1120,7 @@ where
                         .as_ref()
                         .map(|p| p.backoff.delay_ms(attempt))
                         .unwrap_or(0);
-                    let next_attempt_at = now_ms() + (delay as i64).max(1);
+                    let next_attempt_at = now_ms() + (delay as u64).max(1);
                     let ev = WorkflowEvent::StepRetryScheduled {
                         ts: now_ms(),
                         run_id: engine.run_id.clone(),
@@ -1186,7 +1186,7 @@ pub const DEFAULT_MIN_YIELD_REMAINING_MS: u64 = 1000;
 /// sees the **same** clock across resumes. The checkpoint id uses a
 /// per-invocation atomic counter (`__now-0`, `__now-1`, …) so concurrent
 /// calls stay unique; replay permutes them to the same ids and reads the cache.
-pub fn exec_now(engine: &Arc<EngineRuntime>, id: Option<&str>) -> anyhow::Result<i64> {
+pub fn exec_now(engine: &Arc<EngineRuntime>, id: Option<&str>) -> anyhow::Result<u64> {
     // 上游：`options?.id ?? `__now-${engine.counters.now++}``
     let step_id = match id {
         Some(id) => id.to_string(),
@@ -1264,7 +1264,7 @@ pub async fn exec_pause(
     step_id: &str,
     signal_name: &str,
     reason: &str,
-    deadline: Option<i64>,
+    deadline: Option<u64>,
 ) -> anyhow::Result<serde_json::Value> {
     exec_pause_with(
         engine,
@@ -1292,7 +1292,7 @@ pub async fn exec_pause_with(
     step_id: &str,
     signal_name: &str,
     reason: &str,
-    deadline: Option<i64>,
+    deadline: Option<u64>,
     meta: Option<serde_json::Value>,
     validator: Option<crate::define::PayloadValidator>,
 ) -> anyhow::Result<serde_json::Value> {
@@ -1451,7 +1451,7 @@ enum WaitKind {
     Signal {
         step_id: String,
         signal_name: String,
-        deadline: Option<i64>,
+        deadline: Option<u64>,
         meta: Option<serde_json::Value>,
     },
     Approval {
@@ -1659,7 +1659,7 @@ mod tests {
     #[serde(rename_all = "camelCase")]
     struct Probe {
         ok: bool,
-        count: i64,
+        count: u64,
     }
 
     /// 故意**不对称**的类型：写出时把零值字段省掉，读回时却要求它存在。
@@ -1668,10 +1668,10 @@ mod tests {
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
     struct SkippedOnZero {
         #[serde(skip_serializing_if = "is_zero")]
-        n: i64,
+        n: u64,
     }
 
-    fn is_zero(n: &i64) -> bool {
+    fn is_zero(n: &u64) -> bool {
         *n == 0
     }
 
@@ -3290,7 +3290,7 @@ mod tests {
         assert_eq!(out.status, RunStatus::Finished);
         let v = out.output.unwrap();
         assert!(
-            v["a"].as_i64().is_some() && v["b"].as_i64().is_some(),
+            v["a"].as_u64().is_some() && v["b"].as_u64().is_some(),
             "两个 now 都应成功"
         );
         assert_eq!(
@@ -3538,7 +3538,7 @@ mod tests {
     #[tokio::test]
     async fn deadline_exhausted_flags_should_yield() {
         let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
-        let seen = Arc::new(Mutex::new((None::<Option<i64>>, false, false)));
+        let seen = Arc::new(Mutex::new((None::<Option<u64>>, false, false)));
         let sink = seen.clone();
         let wf = WorkflowDefinition::new("budget").handler(move |ctx: WorkflowCtx| {
             let sink = sink.clone();

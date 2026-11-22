@@ -43,6 +43,17 @@ use aa_workflow_core::{DeleteReason, RunState, StoreError, WaitForState, Workflo
 use aa_workflow_runtime::run_store_adapter::{WorkflowExecutionStore, WorkflowRunStoreAdapterStore};
 use aa_workflow_runtime::types::*;
 
+/// Postgres `bigint` 是有符号 i64，而本仓时间戳恒非负且远小于 i64::MAX（毫秒 epoch）。
+/// 落库/读回时在边界显式转换，schema 保持 bigint 不改。
+#[inline]
+fn db_i64_to_u64(v: i64) -> u64 {
+    v as u64
+}
+#[inline]
+fn u64_to_db_i64(v: u64) -> i64 {
+    v as i64
+}
+
 /// Postgres 上的 durable 执行存储。
 ///
 /// # 同步 trait + async sqlx 的桥
@@ -211,7 +222,9 @@ fn decode_opt_json_nullable(v: Option<serde_json::Value>) -> Option<serde_json::
 fn run_from_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<WorkflowExecution> {
     let status: String = row.try_get("status")?;
     let lease_owner: Option<String> = row.try_get("lease_owner")?;
-    let lease_expires_at: Option<i64> = row.try_get("lease_expires_at")?;
+    let lease_expires_at: Option<u64> = row
+        .try_get::<Option<i64>, _>("lease_expires_at")?
+        .map(db_i64_to_u64);
     let lease = match (lease_owner, lease_expires_at) {
         (Some(owner), Some(expires_at)) => Some(WorkflowLease { owner, expires_at }),
         _ => None,
@@ -231,10 +244,10 @@ fn run_from_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<WorkflowExecution
             .filter(|_| true),
         waiting_for: waiting_for.and_then(|v| serde_json::from_value(v).ok()),
         pending_approval: pending_approval.and_then(|v| serde_json::from_value(v).ok()),
-        wake_at: row.try_get("wake_at")?,
+        wake_at: row.try_get::<Option<i64>, _>("wake_at")?.map(db_i64_to_u64),
         lease,
-        created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
+        created_at: db_i64_to_u64(row.try_get::<i64, _>("created_at")?),
+        updated_at: db_i64_to_u64(row.try_get::<i64, _>("updated_at")?),
     })
 }
 
@@ -258,8 +271,8 @@ fn run_state_from_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<RunState> {
             .unwrap_or_default(),
         waiting_for: waiting_for.and_then(|v| serde_json::from_value(v).ok()),
         pending_approval: pending_approval.and_then(|v| serde_json::from_value(v).ok()),
-        created_at: row.try_get("created_at")?,
-        updated_at: row.try_get("updated_at")?,
+        created_at: db_i64_to_u64(row.try_get::<i64, _>("created_at")?),
+        updated_at: db_i64_to_u64(row.try_get::<i64, _>("updated_at")?),
     })
 }
 
@@ -273,19 +286,19 @@ fn stored_event_from_row(row: &sqlx::postgres::PgRow) -> anyhow::Result<StoredWo
         event_type: row.try_get("event_type")?,
         step_id: row.try_get("step_id")?,
         event: serde_json::from_value(event_json)?,
-        created_at: row.try_get("created_at")?,
+        created_at: db_i64_to_u64(row.try_get::<i64, _>("created_at")?),
     })
 }
 
 /// lease 是否可认领：无 lease / 是自己的 / 已过期（对齐 `can_claim`）。
-fn can_claim(existing: Option<&WorkflowLease>, owner: &LeaseOwner, now: i64) -> bool {
+fn can_claim(existing: Option<&WorkflowLease>, owner: &LeaseOwner, now: u64) -> bool {
     match existing {
         None => true,
         Some(l) => l.owner == *owner || l.expires_at <= now,
     }
 }
 
-fn new_lease(owner: LeaseOwner, lease_ms: i64, now: i64) -> WorkflowLease {
+fn new_lease(owner: LeaseOwner, lease_ms: u64, now: u64) -> WorkflowLease {
     WorkflowLease {
         owner,
         expires_at: now + lease_ms,
@@ -408,7 +421,7 @@ impl WorkflowRunStoreAdapterStore for SqlxPostgresStore {
                 .fetch_one(&mut *tx)
                 .await?;
                 let owner: Option<String> = row.try_get("lease_owner")?;
-                let expires: Option<i64> = row.try_get("lease_expires_at")?;
+                let expires: Option<u64> = row.try_get::<Option<i64>, _>("lease_expires_at")?.map(db_i64_to_u64);
                 match (owner, expires) {
                     (Some(owner), Some(expires_at)) => {
                         Some(WorkflowLease { owner, expires_at })
@@ -447,8 +460,8 @@ impl WorkflowRunStoreAdapterStore for SqlxPostgresStore {
         .bind(awaiting)
         .bind(waiting_for)
         .bind(pending_approval)
-        .bind(state.created_at)
-        .bind(state.updated_at)
+        .bind(u64_to_db_i64(state.created_at))
+        .bind(u64_to_db_i64(state.updated_at))
         .execute(&mut *tx)
         .await?;
 
@@ -486,11 +499,11 @@ impl WorkflowRunStoreAdapterStore for SqlxPostgresStore {
         .bind(serde_json::to_value(state.error.as_ref())?)
         .bind(serde_json::to_value(state.waiting_for.as_ref())?)
         .bind(serde_json::to_value(state.pending_approval.as_ref())?)
-        .bind(wake_at)
+        .bind(wake_at.map(u64_to_db_i64))
         .bind(lease.as_ref().map(|l| l.owner.clone()))
-        .bind(lease.as_ref().map(|l| l.expires_at))
-        .bind(state.created_at)
-        .bind(state.updated_at)
+        .bind(lease.as_ref().map(|l| u64_to_db_i64(l.expires_at)))
+        .bind(u64_to_db_i64(state.created_at))
+        .bind(u64_to_db_i64(state.updated_at))
         .execute(&mut *tx)
         .await?;
 
@@ -530,7 +543,7 @@ impl WorkflowRunStoreAdapterStore for SqlxPostgresStore {
              on conflict (run_id) do nothing",
         )
         .bind(&args.run_id)
-        .bind(now_ms())
+        .bind(u64_to_db_i64(now_ms()))
         .execute(&mut *tx)
         .await?;
 
@@ -570,7 +583,7 @@ impl WorkflowRunStoreAdapterStore for SqlxPostgresStore {
             .bind(event_type)
             .bind(step_id)
             .bind(serde_json::to_value(event)?)
-            .bind(event.ts())
+            .bind(u64_to_db_i64(event.ts()))
             .execute(&mut *tx)
             .await?;
             next_index += 1;
@@ -674,10 +687,10 @@ impl WorkflowRunStoreAdapterStore for SqlxPostgresStore {
 }
 
 /// 当前毫秒时间戳（对齐上游 `Date.now()`）。
-fn now_ms() -> i64 {
+fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -709,8 +722,8 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
             .bind(&args.workflow_id)
             .bind(&args.workflow_version)
             .bind(serde_json::to_value(&args.input)?)
-            .bind(args.now)
-            .bind(args.now)
+            .bind(u64_to_db_i64(args.now))
+            .bind(u64_to_db_i64(args.now))
             .fetch_optional(&mut *tx)
             .await?;
 
@@ -759,8 +772,8 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
             .bind(&args.run_id)
             .bind(serde_json::to_value(args.waiting_for.as_ref())?)
             .bind(serde_json::to_value(args.pending_approval.as_ref())?)
-            .bind(args.wake_at)
-            .bind(args.now)
+            .bind(args.wake_at.map(u64_to_db_i64))
+            .bind(u64_to_db_i64(args.now))
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
@@ -778,7 +791,7 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
             )
             .bind(&args.run_id)
             .bind(serde_json::to_value(&args.output)?)
-            .bind(args.now)
+            .bind(u64_to_db_i64(args.now))
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
@@ -796,7 +809,7 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
             )
             .bind(&args.run_id)
             .bind(serde_json::to_value(&args.error)?)
-            .bind(args.now)
+            .bind(u64_to_db_i64(args.now))
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
@@ -824,8 +837,8 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
             )
             .bind(&args.run_id)
             .bind(&lease.owner)
-            .bind(lease.expires_at)
-            .bind(args.now)
+            .bind(u64_to_db_i64(lease.expires_at))
+            .bind(u64_to_db_i64(args.now))
             .execute(&mut *tx)
             .await?;
             let row = sqlx::query(
@@ -852,8 +865,8 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
             )
             .bind(&args.run_id)
             .bind(&args.lease_owner)
-            .bind(args.now + args.lease_ms)
-            .bind(args.now)
+            .bind(u64_to_db_i64(args.now + args.lease_ms))
+            .bind(u64_to_db_i64(args.now))
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
@@ -894,7 +907,7 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
                  limit $2 \
                  for update skip locked",
             )
-            .bind(args.now)
+            .bind(u64_to_db_i64(args.now))
             .bind(args.limit as i64)
             .fetch_all(&mut *tx)
             .await?;
@@ -909,8 +922,8 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
                 )
                 .bind(&run_id)
                 .bind(&lease.owner)
-                .bind(lease.expires_at)
-                .bind(args.now)
+                .bind(u64_to_db_i64(lease.expires_at))
+                .bind(u64_to_db_i64(args.now))
                 .execute(&mut *tx)
                 .await?;
                 let updated = sqlx::query(
@@ -948,13 +961,13 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
             .bind(&args.signal_id)
             .bind(&args.workflow_id)
             .bind(&args.workflow_version)
-            .bind(args.wake_at)
+            .bind(u64_to_db_i64(args.wake_at))
             .execute(&mut *tx)
             .await?;
             sqlx::query("update workflow_runs set wake_at = $2, updated_at = $3 where run_id = $1")
                 .bind(&args.run_id)
-                .bind(args.wake_at)
-                .bind(args.now)
+                .bind(u64_to_db_i64(args.wake_at))
+                .bind(u64_to_db_i64(args.now))
                 .execute(&mut *tx)
                 .await?;
             tx.commit().await?;
@@ -979,7 +992,7 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
                  limit $3 \
                  for update skip locked",
             )
-            .bind(args.now)
+            .bind(u64_to_db_i64(args.now))
             .bind(&args.lease_owner)
             .bind(args.limit as i64)
             .fetch_all(&mut *tx)
@@ -996,7 +1009,7 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
                 .bind(&run_id)
                 .bind(&signal_id)
                 .bind(&args.lease_owner)
-                .bind(args.now + args.lease_ms)
+                .bind(u64_to_db_i64(args.now + args.lease_ms))
                 .execute(&mut *tx)
                 .await?;
                 due.push(TimerWakeup {
@@ -1004,7 +1017,7 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
                     signal_id,
                     workflow_id: row.try_get("workflow_id")?,
                     workflow_version: row.try_get("workflow_version")?,
-                    wake_at: row.try_get("wake_at")?,
+                    wake_at: row.try_get::<Option<i64>, _>("wake_at")?.map(db_i64_to_u64).unwrap_or(0),
                 });
             }
             tx.commit().await?;
@@ -1056,7 +1069,7 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
             .bind(&args.delivery.name)
             .bind(&args.delivery.step_id)
             .bind(&delivery_json)
-            .bind(args.now)
+            .bind(u64_to_db_i64(args.now))
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
@@ -1098,7 +1111,7 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
             )
             .bind(&args.run_id)
             .bind(&args.delivery.signal_id)
-            .bind(args.now)
+            .bind(u64_to_db_i64(args.now))
             .execute(&mut *tx)
             .await?;
             // 信号已投，对应 timer 不再需要。
@@ -1113,7 +1126,7 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
                     pending_approval = null, wake_at = null, updated_at = $2 where run_id = $1",
             )
             .bind(&args.run_id)
-            .bind(args.now)
+            .bind(u64_to_db_i64(args.now))
             .execute(&mut *tx)
             .await?;
             let row = sqlx::query(
@@ -1167,7 +1180,7 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
             )
             .bind(&args.run_id)
             .bind(&key)
-            .bind(args.now)
+            .bind(u64_to_db_i64(args.now))
             .execute(&mut *tx)
             .await?;
             sqlx::query(
@@ -1175,7 +1188,7 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
                     pending_approval = null, wake_at = null, updated_at = $2 where run_id = $1",
             )
             .bind(&args.run_id)
-            .bind(args.now)
+            .bind(u64_to_db_i64(args.now))
             .execute(&mut *tx)
             .await?;
             let row = sqlx::query(
@@ -1215,9 +1228,9 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
             .bind(serde_json::to_value(&args.schedule)?)
             .bind(overlap_policy_to_str(args.overlap_policy))
             .bind(serde_json::to_value(args.input.as_ref())?)
-            .bind(args.next_fire_at)
+            .bind(args.next_fire_at.map(u64_to_db_i64))
             .bind(args.enabled)
-            .bind(args.now)
+            .bind(u64_to_db_i64(args.now))
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
@@ -1240,7 +1253,7 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
                  order by next_fire_at asc \
                  limit $2",
             )
-            .bind(args.now)
+            .bind(u64_to_db_i64(args.now))
             .bind(args.limit as i64)
             .fetch_all(&mut *tx)
             .await?;
@@ -1250,7 +1263,7 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
                 let schedule_id: String = row.try_get("schedule_id")?;
                 let workflow_id: String = row.try_get("workflow_id")?;
                 let workflow_version: Option<String> = row.try_get("workflow_version")?;
-                let fire_at: i64 = row.try_get("next_fire_at")?;
+                let fire_at: u64 = row.try_get::<Option<i64>, _>("next_fire_at")?.map(db_i64_to_u64).unwrap_or(0);
                 let bucket_id = fire_at.to_string();
                 let input: Option<serde_json::Value> = row.try_get("input")?;
                 let overlap_policy: String = row.try_get("overlap_policy")?;
@@ -1271,7 +1284,7 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
                         continue;
                     }
                     let owner: Option<String> = b.try_get("lease_owner")?;
-                    let expires: Option<i64> = b.try_get("lease_expires_at")?;
+                    let expires: Option<u64> = b.try_get::<Option<i64>, _>("lease_expires_at")?.map(db_i64_to_u64);
                     let lease = match (owner, expires) {
                         (Some(owner), Some(expires_at)) => Some(WorkflowLease { owner, expires_at }),
                         _ => None,
@@ -1297,11 +1310,11 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
                 .bind(&workflow_id)
                 .bind(&workflow_version)
                 .bind(&run_id)
-                .bind(fire_at)
+                .bind(u64_to_db_i64(fire_at))
                 .bind(&input)
                 .bind(&overlap_policy)
                 .bind(&args.lease_owner)
-                .bind(args.now + args.lease_ms)
+                .bind(u64_to_db_i64(args.now + args.lease_ms))
                 .execute(&mut *tx)
                 .await?;
 
@@ -1344,7 +1357,7 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
     fn list_runs(&self, args: ListRunsArgs) -> anyhow::Result<Vec<RunSummary>> {
         self.block(async move {
             // cursor 是不透明字符串：这里用 `updated_at` 做键集分页（与排序键一致）。
-            let cursor: Option<i64> = args.cursor.as_deref().and_then(|c| c.parse().ok());
+            let cursor: Option<u64> = args.cursor.as_deref().and_then(|c| c.parse().ok());
             let rows = sqlx::query(
                 "select run_id, workflow_id, workflow_version, status, input, output, error, \
                         waiting_for, pending_approval, wake_at, lease_owner, lease_expires_at, \
@@ -1358,7 +1371,7 @@ impl WorkflowExecutionStore for SqlxPostgresStore {
             )
             .bind(args.workflow_id.as_deref())
             .bind(args.status.map(status_to_str))
-            .bind(cursor)
+            .bind(cursor.map(u64_to_db_i64))
             .bind(args.limit as i64)
             .fetch_all(&self.pool)
             .await?;

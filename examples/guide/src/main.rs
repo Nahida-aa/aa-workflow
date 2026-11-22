@@ -38,7 +38,7 @@ use aa_workflow_runtime::{InMemoryExecutionStore, WorkflowRuntimeRunResultKind, 
 pub struct FulfillmentInput {
     pub order_id: String,
     /// 支付就绪前的等待时长（ms）——对应 guide 的 `delayMs`。
-    pub delay_ms: i64,
+    pub delay_ms: u64,
 }
 
 /// 对齐 guide 的 fulfillmentWorkflow：
@@ -144,7 +144,7 @@ pub fn define_runtime() -> Fixture {
 
 /// 走到第一个挂起点：`start_run` 在 `ready-gate` 上挂起并**立即返回**
 /// `Paused`（不等那 `delay_ms`）。
-pub async fn step_start_and_pause(fx: &Fixture, run_id: &str, delay_ms: i64) -> StartOutcome {
+pub async fn step_start_and_pause(fx: &Fixture, run_id: &str, delay_ms: u64) -> StartOutcome {
     let started = fx
         .rt
         .start_run(WorkflowRuntimeStartRunArgs {
@@ -174,7 +174,7 @@ pub struct StartOutcome {
     pub kind: WorkflowRuntimeRunResultKind,
     pub status: WorkflowExecutionStatus,
     pub waiting_signal: Option<String>,
-    pub wake_at: Option<i64>,
+    pub wake_at: Option<u64>,
 }
 
 // ============================================================
@@ -191,7 +191,7 @@ pub struct StartOutcome {
 pub async fn drive_to_payment_wait(
     fx: &Fixture,
     run_id: &str,
-    delay_ms: i64,
+    delay_ms: u64,
 ) -> StartOutcome {
     let mut outcome = step_start_and_pause(fx, run_id, delay_ms).await;
 
@@ -211,7 +211,7 @@ pub async fn drive_to_payment_wait(
         // 等到点（示例里 delay 很小，通常会立刻到）。
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
+            .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         if deadline > now {
             tokio::time::sleep(std::time::Duration::from_millis((deadline - now) as u64)).await;

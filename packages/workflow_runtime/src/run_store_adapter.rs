@@ -702,7 +702,7 @@ mod adapter_tests {
                     "r1",
                     i as usize,
                     &WorkflowEvent::StepFinished {
-                        ts: i as i64,
+                        ts: i as u64,
                         run_id: "r1".into(),
                         step_id: format!("old{i}"),
                         result: None,

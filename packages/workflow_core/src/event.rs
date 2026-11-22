@@ -38,8 +38,8 @@ pub enum StepStatus {
 pub struct StepAttempt {
     /// 1-based attempt number.
     pub attempt: usize,
-    pub started_at: i64,
-    pub finished_at: i64,
+    pub started_at: u64,
+    pub finished_at: u64,
     pub result: Option<serde_json::Value>,
     /// 结构化错误（对齐 TanStack `StepAttempt.error?: SerializedError`，
     /// `types.ts:261`）。
@@ -103,7 +103,7 @@ pub struct ImportedFrom {
 pub enum WorkflowEvent {
     /// Observability only (not persisted): marks the start of a run.
     RunStarted {
-        ts: i64,
+        ts: u64,
         run_id: String,
         /// 客户端关联用的线程标识（上游 `threadId`，`types.ts:76`）。**只挂在
         /// `RUN_STARTED` 上**，别的事件不带——它不参与 resume，也不落进
@@ -113,13 +113,13 @@ pub enum WorkflowEvent {
     },
     /// Checkpoint (persisted): final state of a completed run.
     RunFinished {
-        ts: i64,
+        ts: u64,
         run_id: String,
         output: Option<serde_json::Value>,
     },
     /// Checkpoint (persisted): the run errored (a step failed terminally).
     RunErrored {
-        ts: i64,
+        ts: u64,
         run_id: String,
         error: RunError,
         /// 机器可读的终局原因（TanStack `RUN_ERRORED.code`）。用它分支，别去
@@ -128,14 +128,14 @@ pub enum WorkflowEvent {
     },
     /// Observability only (not persisted): a step began executing.
     StepStarted {
-        ts: i64,
+        ts: u64,
         run_id: String,
         step_id: String,
     },
     /// Checkpoint (persisted): a step finished successfully; the run may be
     /// resumed from here without re-execution.
     StepFinished {
-        ts: i64,
+        ts: u64,
         run_id: String,
         step_id: String,
         result: Option<serde_json::Value>,
@@ -147,7 +147,7 @@ pub enum WorkflowEvent {
     },
     /// Checkpoint (persisted): a step failed terminally.
     StepFailed {
-        ts: i64,
+        ts: u64,
         run_id: String,
         step_id: String,
         error: RunError,
@@ -161,12 +161,12 @@ pub enum WorkflowEvent {
     /// a user event name for named waits. `deadline` is `Some` (wall-clock
     /// ms) for sleep-like waits so a timer host could auto-deliver.
     SignalAwaited {
-        ts: i64,
+        ts: u64,
         run_id: String,
         step_id: String,
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        deadline: Option<i64>,
+        deadline: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         meta: Option<serde_json::Value>,
     },
@@ -176,7 +176,7 @@ pub enum WorkflowEvent {
     /// `approval_id` is the deterministic pause key (== the approval id the
     /// host delivers a decision for); `title` is what approvers see.
     ApprovalRequested {
-        ts: i64,
+        ts: u64,
         run_id: String,
         step_id: String,
         approval_id: String,
@@ -195,7 +195,7 @@ pub enum WorkflowEvent {
     /// a different one is a lost race. `payload` is what the
     /// `wait_for_event` call returns.
     SignalResolved {
-        ts: i64,
+        ts: u64,
         run_id: String,
         step_id: String,
         name: String,
@@ -213,7 +213,7 @@ pub enum WorkflowEvent {
     /// `feedback`），任意 payload 只属于 [`SignalResolved`]。见
     /// `docs/tanstack-alignment.md` 的事件分类对照。
     ApprovalResolved {
-        ts: i64,
+        ts: u64,
         run_id: String,
         step_id: String,
         approval_id: String,
@@ -227,7 +227,7 @@ pub enum WorkflowEvent {
     /// the publisher, never the log — so it never becomes part of replay
     /// (mirrors TanStack's `CUSTOM` event).
     Custom {
-        ts: i64,
+        ts: u64,
         name: String,
         value: serde_json::Value,
     },
@@ -235,15 +235,15 @@ pub enum WorkflowEvent {
     /// On replay the cached value is served so a run sees the same clock
     /// across resumes (TanStack `NOW_RECORDED`).
     NowRecorded {
-        ts: i64,
+        ts: u64,
         run_id: String,
         step_id: String,
-        value: i64,
+        value: u64,
     },
     /// Checkpoint (persisted): `ctx.uuid()` recorded a generated id. On
     /// replay the same id is served (TanStack `UUID_RECORDED`).
     UuidRecorded {
-        ts: i64,
+        ts: u64,
         run_id: String,
         step_id: String,
         value: String,
@@ -256,7 +256,7 @@ pub enum WorkflowEvent {
     /// delta 会在每次 invocation 重放时重复 append，或者需要重放时跳过。
     /// delta 语义见 [`crate::engine::state_diff`]。
     StateDelta {
-        ts: i64,
+        ts: u64,
         run_id: String,
         delta: Vec<crate::engine::state_diff::Operation>,
     },
@@ -268,7 +268,7 @@ pub enum WorkflowEvent {
     /// `CompensationStarted` / `Completed` / `Failed` 一致），故 `step_id()`
     /// 返回 `None`。
     CompensationRegistered {
-        ts: i64,
+        ts: u64,
         run_id: String,
         compensation_id: String,
     },
@@ -276,21 +276,21 @@ pub enum WorkflowEvent {
     /// 持久化，已登记的撤销 handler 将逆序执行。崩溃后恢复的驱动据此得知
     /// "补偿进行中"。
     CompensationStarted {
-        ts: i64,
+        ts: u64,
         run_id: String,
         error: RunError,
     },
     /// Checkpoint (persisted): 一个已登记的撤销 handler 成功完成——重启后
     /// 该补偿不再重复执行（幂等键 = 补偿 id）。
     CompensationCompleted {
-        ts: i64,
+        ts: u64,
         run_id: String,
         compensation_id: String,
     },
     /// Checkpoint (persisted): 一个撤销 handler 耗尽重试——补偿链就地停止
     /// （后续登记的补偿保持未执行，留给人工处置）。
     CompensationFailed {
-        ts: i64,
+        ts: u64,
         run_id: String,
         compensation_id: String,
         error: RunError,
@@ -300,13 +300,13 @@ pub enum WorkflowEvent {
     /// sweep/重驱以此恢复。重放规则：本事件后该步骤视同未完成（attempts 随
     /// 事件携带，耗尽前的 STEP_FAILED 不落日志）。
     StepRetryScheduled {
-        ts: i64,
+        ts: u64,
         run_id: String,
         step_id: String,
         /// 本次失败是第几次 attempt（重放时据此续算）。
         attempt: usize,
         /// 下次重试的绝对截止时间（UTC ms）。
-        next_attempt_at: i64,
+        next_attempt_at: u64,
         error: RunError,
         attempts: Vec<StepAttempt>,
     },
@@ -314,7 +314,7 @@ pub enum WorkflowEvent {
     /// Aligns with upstream `STEP_ATTEMPT_STARTED` — only emitted when the
     /// step's retry policy is `durable` (non-durable attempts stay in-memory).
     StepAttemptStarted {
-        ts: i64,
+        ts: u64,
         run_id: String,
         step_id: String,
         /// 1-based attempt number about to run.
@@ -349,7 +349,7 @@ impl WorkflowEvent {
     }
 
     /// 事件发生时间（每个变体都带 `ts`，对齐 TS 侧 `event.ts`）。
-    pub fn ts(&self) -> i64 {
+    pub fn ts(&self) -> u64 {
         match self {
             WorkflowEvent::RunStarted { ts, .. }
             | WorkflowEvent::RunFinished { ts, .. }
@@ -414,8 +414,8 @@ pub struct StepState {
     pub result: Option<serde_json::Value>,
     /// 与 [`StepAttempt::error`] 同构（都是 `RunError`）。
     pub error: Option<RunError>,
-    pub started_at: Option<i64>,
-    pub finished_at: Option<i64>,
+    pub started_at: Option<u64>,
+    pub finished_at: Option<u64>,
 }
 
 /// Replays an event log and folds it into per-step states.

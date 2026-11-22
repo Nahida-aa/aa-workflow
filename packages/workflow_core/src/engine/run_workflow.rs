@@ -142,11 +142,11 @@ where
     /// 本次 drive 的绝对 UTC ms 预算（上游 `deadline`）。设了之后
     /// `time_remaining()` / `should_yield()` / `ctx.yield_()` 才生效；
     /// 每次 resume 都可以给一个新的。
-    pub deadline: Option<i64>,
+    pub deadline: Option<u64>,
     /// 剩余预算低于此值时 `should_yield()` 翻真（上游 `minYieldRemainingMs`，默认 1000）。
     pub min_yield_remaining_ms: Option<u64>,
     /// `ctx.yield_()` 的重新唤醒时刻（上游 `yieldResumeAt`；默认每次调用「now+1ms」）。
-    pub yield_resume_at: Option<i64>,
+    pub yield_resume_at: Option<u64>,
     /// 客户端关联用的线程标识（上游 `threadId`，`run-workflow.ts:52`）。
     ///
     /// 只写进 `RUN_STARTED` 事件，**不落 store**、不参与 resume 判定。上游
@@ -346,7 +346,7 @@ where
     }
 
     /// 设置本次 drive 的绝对 UTC ms 预算。
-    pub fn deadline(mut self, v: i64) -> Self {
+    pub fn deadline(mut self, v: u64) -> Self {
         self.deadline = Some(v);
         self
     }
@@ -358,7 +358,7 @@ where
     }
 
     /// `ctx.yield_()` 的重新唤醒时刻。
-    pub fn yield_resume_at(mut self, v: i64) -> Self {
+    pub fn yield_resume_at(mut self, v: u64) -> Self {
         self.yield_resume_at = Some(v);
         self
     }
@@ -1613,7 +1613,7 @@ mod tests {
 
     #[derive(serde::Deserialize, Clone, serde::Serialize)]
     struct StrictState {
-        n: i64,
+        n: u64,
     }
 
     /// 未显式给 `run_id` 时引擎生成 `run_<now_ms>`，并照常写 RunState 信封。
