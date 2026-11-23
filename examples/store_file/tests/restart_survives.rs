@@ -59,7 +59,7 @@ fn base_dir(tag: &str) -> PathBuf {
         .await
         .unwrap();
         assert_eq!(out1.status, RunStatus::Finished);
-        let events_1 = store.get_events("digest:r").unwrap();
+        let events_1 = store.get_events("digest:r").await.unwrap();
         let scan_ts_1 = events_1
             .iter()
             .find_map(|e| match e {
@@ -84,7 +84,7 @@ fn base_dir(tag: &str) -> PathBuf {
         .await
         .unwrap();
         assert_eq!(out2.status, RunStatus::Finished);
-        let events_2 = store2.get_events("digest:r").unwrap();
+        let events_2 = store2.get_events("digest:r").await.unwrap();
         assert_eq!(
             events_2
                 .iter()
@@ -126,7 +126,7 @@ fn base_dir(tag: &str) -> PathBuf {
             .await
         });
         for _ in 0..2000 {
-            let evs = store.get_events("approve:r").unwrap();
+            let evs = store.get_events("approve:r").await.unwrap();
             if evs.iter().any(
                 |e| matches!(e, WorkflowEvent::SignalAwaited { step_id, .. } | WorkflowEvent::ApprovalRequested { step_id, .. } if step_id == "review"),
             ) {
@@ -155,7 +155,7 @@ fn base_dir(tag: &str) -> PathBuf {
         assert_eq!(
             store2
                 .get_events("approve:r")
-                .unwrap()
+                .await.unwrap()
                 .iter()
                 .filter(
                     |e| matches!(e, WorkflowEvent::SignalAwaited { step_id, .. } | WorkflowEvent::ApprovalRequested { step_id, .. } if step_id == "review")
@@ -188,7 +188,7 @@ fn base_dir(tag: &str) -> PathBuf {
             out.output,
             Some(serde_json::json!({ "approved": true, "feedback": null }))
         );
-        let events = store2b.get_events("approve:r").unwrap();
+        let events = store2b.get_events("approve:r").await.unwrap();
         let pauses = events
             .iter()
             .filter(
@@ -236,7 +236,7 @@ fn base_dir(tag: &str) -> PathBuf {
         assert_eq!(
             store
                 .get_run_state("invoice:r")
-                .unwrap()
+                .await.unwrap()
                 .unwrap()
                 .waiting_for
                 .unwrap()
@@ -251,7 +251,7 @@ fn base_dir(tag: &str) -> PathBuf {
         let store2 = core_store(&base);
         let mut out = None;
         for _ in 0..4 {
-            let st = store2.get_run_state("invoice:r").unwrap().unwrap();
+            let st = store2.get_run_state("invoice:r").await.unwrap().unwrap();
             if st.status != RunStatus::Paused {
                 break;
             }
@@ -284,7 +284,7 @@ fn base_dir(tag: &str) -> PathBuf {
         assert_eq!(out.status, RunStatus::Finished);
         assert_eq!(out.output.unwrap()["settled"], true);
 
-        let events = store2.get_events("invoice:r").unwrap();
+        let events = store2.get_events("invoice:r").await.unwrap();
         assert_eq!(
             events
                 .iter()

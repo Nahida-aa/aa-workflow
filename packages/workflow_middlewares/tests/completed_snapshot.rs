@@ -200,7 +200,10 @@ async fn completed_accumulates_across_drives() {
 
     let wf = create_workflow(CreateWorkflowConfig::new("acc").input::<serde_json::Value>())
         .middleware(interim_goals(move |run_id| {
-            Ok(store_for_hook.get_events(run_id)?)
+            use aa_workflow_core::RunStore;
+            let store = store_for_hook.clone();
+            Box::pin(async move { Ok(store.get_events(run_id).await?) })
+                as aa_workflow_core::define::BoxFuture<'_, _>
         }))
         .handler(move |ctx: WorkflowCtx| {
             let ran = ran_in.clone();

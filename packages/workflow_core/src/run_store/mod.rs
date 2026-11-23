@@ -499,14 +499,15 @@ mod tests {
         assert_eq!(back.step_id, None);
     }
 
-    #[test]
-    fn delete_run_accepts_reason() {
+    #[tokio::test]
+    async fn delete_run_accepts_reason() {
         let store = InMemoryStore::new();
         store
             .set_run_state("r", &erased(None))
+            .await
             .expect("写入 RunState");
-        store.delete_run("r", DeleteReason::Finished).unwrap();
-        assert!(store.get_run_state("r").unwrap().is_none());
+        store.delete_run("r", DeleteReason::Finished).await.unwrap();
+        assert!(store.get_run_state("r").await.unwrap().is_none());
     }
 
     // ── awaiting 规范形（对齐 TanStack RunState.awaiting）────────────────

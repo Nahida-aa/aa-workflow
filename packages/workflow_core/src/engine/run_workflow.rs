@@ -1541,7 +1541,7 @@ mod tests {
         .outcome()
         .await
         .unwrap();
-        crate::engine::cancel_run(store.as_ref(), "ab").unwrap();
+        crate::engine::cancel_run(store.as_ref(), "ab").await.unwrap();
 
         let events = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf), store.clone())
@@ -2203,7 +2203,7 @@ mod tests {
         })
     }
 
-    fn compensation_events(store: &InMemoryStore, run_id: &str) -> Vec<(String, String)> {
+    async fn compensation_events(store: &InMemoryStore, run_id: &str) -> Vec<(String, String)> {
         store
             .get_events(run_id).await
             .unwrap()
@@ -2400,7 +2400,7 @@ mod tests {
             vec!["undo-b", "undo-a"],
             "逆登记序执行（后登记先撤销）"
         );
-        let comp = compensation_events(&store, &out.run_id);
+        let comp = compensation_events(&store, &out.run_id).await;
         assert_eq!(comp.len(), 3, "STARTED + COMPLETED ×2");
         assert_eq!(comp[0].0, "COMPENSATION_STARTED");
         assert_eq!(
@@ -2457,7 +2457,7 @@ mod tests {
 
         assert_eq!(out.status, RunStatus::Errored);
         assert_eq!(*undo_log.lock().unwrap(), vec!["undo-b"], "链就地停止：undo-a 未执行");
-        let comp = compensation_events(&store, &out.run_id);
+        let comp = compensation_events(&store, &out.run_id).await;
         assert!(comp.iter().any(|(t, _)| t == "COMPENSATION_FAILED"));
         assert_eq!(comp.iter().filter(|(t, _)| t == "COMPENSATION_COMPLETED").count(), 0);
     }
@@ -2493,7 +2493,7 @@ mod tests {
 
         assert_eq!(out.status, RunStatus::Finished);
         assert!(
-            compensation_events(&store, &out.run_id).is_empty(),
+            compensation_events(&store, &out.run_id).await.is_empty(),
             "成功不触发补偿"
         );
     }

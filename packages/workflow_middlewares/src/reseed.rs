@@ -69,8 +69,11 @@ aa_workflow_core::impl_meta_accessors!(ReseedKey => ReseedAccess, reseed_plan, t
 ///
 /// 下标用于写 `STEP_FINISHED.meta.imported_from.index`——与引擎版
 /// `reseed_run` 的记录方式一致，丢了就只能事后重算。
-pub type LoadResults =
-    dyn Fn(&str) -> anyhow::Result<HashMap<String, SourceStep>> + Send + Sync;
+/// async（对齐 TanStack plugin hook 的 `Promise` 签名）：回调内部要从 async
+/// `RunStore` 读源 run 的事件日志，故返回 `BoxFuture`。
+pub type LoadResults = dyn for<'a> Fn(&'a str) -> aa_workflow_core::define::BoxFuture<'a, anyhow::Result<HashMap<String, SourceStep>>>
+    + Send
+    + Sync;
 
 /// 源 run 里一个 step 的结果与出处。
 #[derive(Clone, Debug)]
@@ -98,7 +101,10 @@ pub struct SourceStep {
 /// 没传 `ReseedKey` 时不装层（= 本次 run 不做播种，全部真跑）。
 pub fn reseed<F>(load_results: F) -> ReseedMw
 where
-    F: Fn(&str) -> anyhow::Result<HashMap<String, SourceStep>> + Send + Sync + 'static,
+    F: for<'a> Fn(&'a str) -> aa_workflow_core::define::BoxFuture<'a, anyhow::Result<HashMap<String, SourceStep>>>
+        + Send
+        + Sync
+        + 'static,
 {
     ReseedMw {
         load_results: Arc::new(load_results),
@@ -124,12 +130,16 @@ impl MiddlewareServer for ReseedMw {
         // 本 run 就是源 run？不做任何事（禁止自我播种）。
         if plan.source_run_id != args.ctx.run_id {
             // **drive 开始时加载一次**，而不是在包装层里懒加载 + 缓存：
-            // `load_results` 是同步函数，放在这里不会阻塞；省掉可变状态后
-            // 层就是纯的（只读 plan）。
+            // `load_results` 现在是 async（要从 async RunStore 读日志）；
+            // 省掉可变状态后层就是纯的（只读 plan）。
             //
             // 源读不到 → 空表，「没有可复用结果」→ 全部真跑
             // （与引擎版「导入 0 条」同义）。
-            let lookup = Arc::new((self.load_results)(&plan.source_run_id).unwrap_or_default());
+            let lookup = Arc::new(
+                (self.load_results)(&plan.source_run_id)
+                    .await
+                    .unwrap_or_default(),
+            );
 
             args.wrap_step(step_layer({
                 let redo = redo.clone();

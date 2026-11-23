@@ -2257,7 +2257,7 @@ mod tests {
     #[tokio::test]
     async fn progress_and_subscribe_fan_out() {
         let store = Arc::new(InMemoryStore::new());
-        let rx = store.subscribe("prog_run").unwrap();
+        let mut rx = store.subscribe("prog_run").await.unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = events.clone();
         let wf = WorkflowDefinition::new("w").handler(|ctx: WorkflowCtx| async move {
@@ -2298,8 +2298,9 @@ mod tests {
         // subscriber (store log) saw the checkpoint but not emit-only events
         let mut saw_finish = false;
         let mut saw_shared = false;
-        let first = rx
-            .recv_timeout(Duration::from_secs(2))
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("got first event within 2s")
             .expect("got first event");
         saw_finish |= matches!(first, WorkflowEvent::StepFinished { .. });
         assert!(saw_finish, "first appended event should be StepFinished");
@@ -2355,7 +2356,7 @@ mod tests {
         panic!("condition never met for run {run_id}");
     }
 
-    fn count_events(
+    async fn count_events(
         store: &Arc<dyn RunStore>,
         run_id: &str,
         pred: impl Fn(&WorkflowEvent) -> bool,
@@ -2405,7 +2406,7 @@ mod tests {
         assert_eq!(count_events(&store, "r1", |e| matches!(
             e,
             WorkflowEvent::RunFinished { .. } | WorkflowEvent::RunErrored { .. }
-        )), 0, "挂起不得写终态事件");
+        )).await, 0, "挂起不得写终态事件");
 
         let st = store.get_run_state("r1").await.unwrap().unwrap();
         assert_eq!(st.status, RunStatus::Paused);
@@ -2451,14 +2452,14 @@ mod tests {
             count_events(&store, "r1", |e| matches!(
                 e,
                 WorkflowEvent::SignalAwaited { step_id, .. } | WorkflowEvent::ApprovalRequested { step_id, .. } if step_id == "release"
-            )),
+            )).await,
             1
         );
         assert_eq!(
             count_events(&store, "r1", |e| matches!(
                 e,
                 WorkflowEvent::SignalResolved { step_id, .. } | WorkflowEvent::ApprovalResolved { step_id, .. } if step_id == "release"
-            )),
+            )).await,
             1
         );
         assert!(store.get_events("r1").await.unwrap().iter().any(|e| matches!(
@@ -2502,6 +2503,7 @@ mod tests {
                     meta: None,
                 },
             )
+            .await
             .unwrap();
         assert!(
             matches!(
@@ -2580,7 +2582,7 @@ mod tests {
             count_events(&store, "r2", |e| matches!(
                 e,
                 WorkflowEvent::SignalAwaited { step_id, .. } | WorkflowEvent::ApprovalRequested { step_id, .. } if step_id == "release"
-            )),
+            )).await,
             1,
             "replay must not re-append the pause checkpoint"
         );
@@ -2609,7 +2611,7 @@ mod tests {
             count_events(&store, "r2", |e| matches!(
                 e,
                 WorkflowEvent::StepFinished { step_id, .. } if step_id == "charge"
-            )),
+            )).await,
             1,
             "replay must short-circuit the succeeded step"
         );
@@ -2617,7 +2619,7 @@ mod tests {
             count_events(&store, "r2", |e| matches!(
                 e,
                 WorkflowEvent::SignalResolved { step_id, .. } | WorkflowEvent::ApprovalResolved { step_id, .. } if step_id == "release"
-            )),
+            )).await,
             1
         );
     }
@@ -2654,7 +2656,7 @@ mod tests {
         assert_eq!(count_events(&store, "s1", |e| matches!(
             e,
             WorkflowEvent::RunFinished { .. } | WorkflowEvent::RunErrored { .. }
-        )), 0, "挂起不得写终态事件");
+        )).await, 0, "挂起不得写终态事件");
 
         // sleep 的投影：status=Paused + waiting_for{signal_name:"__timer", deadline}
         let st = store.get_run_state("s1").await.unwrap().unwrap();
@@ -2761,14 +2763,14 @@ mod tests {
             count_events(&store, "r3", |e| matches!(
                 e,
                 WorkflowEvent::SignalAwaited { step_id, .. } | WorkflowEvent::ApprovalRequested { step_id, .. } if step_id == "gate"
-            )),
+            )).await,
             1
         );
         assert_eq!(
             count_events(&store, "r3", |e| matches!(
                 e,
                 WorkflowEvent::SignalResolved { step_id, .. } | WorkflowEvent::ApprovalResolved { step_id, .. } if step_id == "gate"
-            )),
+            )).await,
             1
         );
     }
@@ -2965,7 +2967,7 @@ mod tests {
             count_events(&store, "ne2", |e| matches!(
                 e,
                 WorkflowEvent::SignalAwaited { name: signal_name, .. } if signal_name == "go"
-            )),
+            )).await,
             1
         );
     }
@@ -3110,11 +3112,11 @@ mod tests {
         let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
         let wf = WorkflowDefinition::new("det").handler(|ctx: WorkflowCtx| async move {
             // 两个调用位点各自拿到稳定值；approve 强制产生一次 replay 边界。
-            let t1 = ctx.now()?;
-            let u1 = ctx.uuid()?;
+            let t1 = ctx.now().await?;
+            let u1 = ctx.uuid().await?;
             ctx.approve("gate", "go").await?;
-            let t2 = ctx.now()?;
-            let u2 = ctx.uuid()?;
+            let t2 = ctx.now().await?;
+            let u2 = ctx.uuid().await?;
             Ok(serde_json::json!({ "now": t1, "uuid": u1, "now2": t2, "uuid2": u2 }))
         });
         // Drive #1：跑到 approve 挂起就返回。
@@ -3160,7 +3162,7 @@ mod tests {
             count_events(&store, "det1", |e| matches!(
                 e,
                 WorkflowEvent::NowRecorded { .. }
-            )),
+            )).await,
             2,
             "每个调用位点只记录一次，replay 不重复 append"
         );
@@ -3168,7 +3170,7 @@ mod tests {
             count_events(&store, "det1", |e| matches!(
                 e,
                 WorkflowEvent::UuidRecorded { .. }
-            )),
+            )).await,
             2
         );
         // 两对 now/uuid 都用独立的确定性 id（__now-0/__now-1、__uuid-0/__uuid-1）。
@@ -3200,10 +3202,10 @@ mod tests {
         let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
         let wf = WorkflowDefinition::new("named").handler(|ctx: WorkflowCtx| async move {
             // 同一个语义名调两次 → 两条独立记录。
-            let t1 = ctx.now_with("t")?;
-            let t2 = ctx.now_with("t")?;
+            let t1 = ctx.now_with("t").await?;
+            let t2 = ctx.now_with("t").await?;
             ctx.approve("gate", "go").await?; // 制造 replay 边界
-            let t3 = ctx.now_with("t")?;
+            let t3 = ctx.now_with("t").await?;
             Ok(serde_json::json!({ "t1": t1, "t2": t2, "t3": t3 }))
         });
 
@@ -3238,7 +3240,7 @@ mod tests {
             count_events(&store, "named1", |e| matches!(
                 e,
                 WorkflowEvent::NowRecorded { .. }
-            )),
+            )).await,
             3,
             "同 id 三次调用落三条记录（consumed 让第二次不复用第一条）"
         );
@@ -3266,7 +3268,7 @@ mod tests {
             count_events(&store, "named1", |e| matches!(
                 e,
                 WorkflowEvent::NowRecorded { .. }
-            )),
+            )).await,
             3,
             "重放不重复 append"
         );
@@ -3278,7 +3280,7 @@ mod tests {
         let wf = WorkflowDefinition::new("conc").handler(|ctx: WorkflowCtx| async move {
             let (a, b) = {
                 let (a, b) = (ctx.clone(), ctx.clone());
-                tokio::join!(async move { a.now() }, async move { b.now() },)
+                tokio::join!(async move { a.now().await }, async move { b.now().await },)
             };
             Ok(serde_json::json!({ "a": a?, "b": b? }))
         });
@@ -3298,7 +3300,7 @@ mod tests {
             count_events(&store, &out.run_id, |e| matches!(
                 e,
                 WorkflowEvent::NowRecorded { .. }
-            )),
+            )).await,
             2,
             "并发调用各自落一个 NowRecorded，无重复 id"
         );
@@ -3319,7 +3321,7 @@ mod tests {
             count_events(&store, &out.run_id, |e| matches!(
                 e,
                 WorkflowEvent::NowRecorded { .. }
-            )),
+            )).await,
             2
         );
     }
@@ -3351,7 +3353,7 @@ mod tests {
         let st = store.get_run_state("ca1").await.unwrap().unwrap();
         assert_eq!(st.status, RunStatus::Paused);
 
-        cancel_run(store.as_ref(), "ca1").unwrap();
+        cancel_run(store.as_ref(), "ca1").await.unwrap();
         assert_eq!(
             store.get_run_state("ca1").await.unwrap().unwrap().status,
             RunStatus::Aborted,
@@ -3421,7 +3423,7 @@ mod tests {
                     .step("a", move |sc: StepCtx| async move {
                         started3.notify_one();
                         gate3.notified().await;
-                        let cancelled = sc.is_cancelled();
+                        let cancelled = sc.is_cancelled().await;
                         let id = sc.id.clone();
                         let attempt = sc.attempt;
                         Ok(serde_json::json!({ "id": id, "attempt": attempt, "cancelled": cancelled }))
@@ -3441,7 +3443,7 @@ mod tests {
             .outcome().await
         });
         started.notified().await;
-        cancel_run(store.as_ref(), "sig1").unwrap();
+        cancel_run(store.as_ref(), "sig1").await.unwrap();
         gate.notify_one();
         let out = task.await.unwrap().unwrap();
         assert_eq!(
@@ -3479,7 +3481,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(500));
 
         // 挂起期间 cancel：只翻 RunState，没人「立刻」响应。
-        cancel_run(store.as_ref(), "ca2").unwrap();
+        cancel_run(store.as_ref(), "ca2").await.unwrap();
         assert_eq!(
             store.get_run_state("ca2").await.unwrap().unwrap().status,
             RunStatus::Aborted
@@ -3496,9 +3498,9 @@ mod tests {
         assert_eq!(out2.status, RunStatus::Aborted);
 
         // 重复 cancel：已终局 → no-op Ok
-        cancel_run(store.as_ref(), "ca2").unwrap();
+        cancel_run(store.as_ref(), "ca2").await.unwrap();
         // 未知 run → RunNotFound
-        let err = cancel_run(store.as_ref(), "missing").unwrap_err();
+        let err = cancel_run(store.as_ref(), "missing").await.unwrap_err();
         assert!(matches!(err, crate::error::WorkflowError::RunNotFound(_)));
 
         // `Aborted` 是锁存终态：投递 resume 也唤不回来（上游 `resumeRun`
@@ -3524,7 +3526,7 @@ mod tests {
     async fn ctx_reports_not_cancelled_in_normal_run() {
         let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
         let wf = WorkflowDefinition::new("not-cancelled").handler(|ctx: WorkflowCtx| async move {
-            assert!(!ctx.is_cancelled());
+            assert!(!ctx.is_cancelled().await);
             Ok(serde_json::json!({ "ok": true }))
         });
         let out = run_workflow(
@@ -3644,7 +3646,7 @@ mod tests {
             count_events(&store, "y1", |e| matches!(
                 e,
                 WorkflowEvent::SignalAwaited { .. } | WorkflowEvent::ApprovalRequested { .. }
-            )),
+            )).await,
             1,
             "replay 不重复 yield 的 pause"
         );
@@ -3740,7 +3742,7 @@ mod tests {
             count_events(&store, out.run_id.as_str(), |e| matches!(
                 e,
                 WorkflowEvent::StepFinished { attempts, .. } if attempts.len() == 2
-            )),
+            )).await,
             1,
             "flaky step 应留 2 次 attempt"
         );
@@ -3788,7 +3790,7 @@ mod tests {
                 && count_events(&store2, &out2.run_id, |e| matches!(
                     e,
                     WorkflowEvent::StepFailed { attempts, .. } if attempts.len() == 1
-                )) == 1,
+                )).await == 1,
             "per-step retry 覆盖 workflow 兜底"
         );
     }
@@ -3864,7 +3866,7 @@ mod tests {
             count_events(&store, "sd", |e| matches!(
                 e,
                 WorkflowEvent::StateDelta { .. }
-            )),
+            )).await,
             0
         );
     }

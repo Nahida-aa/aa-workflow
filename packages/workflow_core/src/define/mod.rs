@@ -1327,7 +1327,7 @@ mod tests {
         );
         assert_ne!(format!("{:?}", out.status), "Finished");
 
-        let events = store.get_events("mi:1").unwrap();
+        let events = store.get_events("mi:1").await.unwrap();
         assert!(
             events.iter().any(|e| matches!(
                 e,

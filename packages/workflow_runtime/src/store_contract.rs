@@ -1101,23 +1101,31 @@ fn core_adapter_round_trips(f: &StoreFactory) {
     let run_store: StdArc<dyn aa_workflow_core::RunStore> =
         crate::run_store_adapter::create_run_store_adapter(store.clone());
 
-    let mut st = paused_state("run-1", "adapter-workflow");
-    st.status = RunStatus::Running;
-    run_store.set_run_state("run-1", &st).unwrap();
-    run_store
-        .append_event("run-1", 0, &custom("adapter", 1))
-        .unwrap();
+    // core 的 RunStore 现在是 async；本用例由同步契约 harness 驱动，用
+    // current-thread runtime block_on（非 tokio::test，无嵌套 runtime 风险）。
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut st = paused_state("run-1", "adapter-workflow");
+            st.status = RunStatus::Running;
+            run_store.set_run_state("run-1", &st).await.unwrap();
+            run_store
+                .append_event("run-1", 0, &custom("adapter", 1))
+                .await
+                .unwrap();
 
-    // CAS 冲突要**原样**穿过适配层（core 靠它做乐观并发）。
-    let conflict = run_store.append_event("run-1", 0, &custom("conflict", 2));
-    assert!(
-        matches!(conflict, Err(StoreError::Conflict { .. })),
-        "适配层应透传 Conflict，实际 {conflict:?}"
-    );
+            // CAS 冲突要**原样**穿过适配层（core 靠它做乐观并发）。
+            let conflict = run_store.append_event("run-1", 0, &custom("conflict", 2)).await;
+            assert!(
+                matches!(conflict, Err(StoreError::Conflict { .. })),
+                "适配层应透传 Conflict，实际 {conflict:?}"
+            );
 
-    let back = run_store.get_run_state("run-1").unwrap().unwrap();
-    assert_eq!(back.run_id, "run-1");
-    assert_eq!(run_store.get_events("run-1").unwrap().len(), 1);
+            let back = run_store.get_run_state("run-1").await.unwrap().unwrap();
+            assert_eq!(back.run_id, "run-1");
+            assert_eq!(run_store.get_events("run-1").await.unwrap().len(), 1);
+        });
 }
 
 // ============================================================

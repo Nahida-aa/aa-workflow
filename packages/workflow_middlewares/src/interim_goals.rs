@@ -57,9 +57,10 @@ aa_workflow_core::impl_meta_accessors!(
     try_interim_goals
 );
 
-/// 读某个 run 的日志（引擎事件数组）。
-pub type GetEvents =
-    dyn Fn(&str) -> anyhow::Result<Vec<aa_workflow_core::event::WorkflowEvent>> + Send + Sync;
+/// 读某个 run 的日志（引擎事件数组）。async 对齐 TanStack hook + async RunStore。
+pub type GetEvents = dyn for<'a> Fn(&'a str) -> aa_workflow_core::define::BoxFuture<'a, anyhow::Result<Vec<aa_workflow_core::event::WorkflowEvent>>>
+    + Send
+    + Sync;
 
 /// 目标全部 checkpoint 后在下一个 step 入口泊车（后续 step 不执行）。
 ///
@@ -76,7 +77,7 @@ pub type GetEvents =
 /// 而不是泊在空目标上。
 pub fn interim_goals<F>(get_events: F) -> InterimGoalsMw
 where
-    F: Fn(&str) -> anyhow::Result<Vec<aa_workflow_core::event::WorkflowEvent>>
+    F: for<'a> Fn(&'a str) -> aa_workflow_core::define::BoxFuture<'a, anyhow::Result<Vec<aa_workflow_core::event::WorkflowEvent>>>
         + Send
         + Sync
         + 'static,
@@ -104,7 +105,8 @@ impl MiddlewareServer for InterimGoalsMw {
         // 开局已完成的目标（续驱 / reseed 导入）——不该为它们泊车。
         // `&self.get_events` 直接借字段——server_state/闭包形态里这曾是
         // 「async move 前 clone 一行」的仪式位。
-        let finished_at_start: HashSet<String> = (self.get_events)(&args.ctx.run_id)?
+        let finished_at_start: HashSet<String> = (self.get_events)(&args.ctx.run_id)
+            .await?
             .iter()
             .filter_map(|e| match e {
                 aa_workflow_core::event::WorkflowEvent::StepFinished { step_id, .. } => {

@@ -448,7 +448,6 @@ impl RunStore for RunStoreAdapter {
     async fn get_run_state(&self, run_id: &str) -> Result<Option<RunState>, StoreError> {
         self.inner
             .load_run_state(&run_id.to_string())
-            .await
             .map_err(to_store_error)
     }
 
@@ -458,14 +457,12 @@ impl RunStore for RunStoreAdapter {
             .save_run_state(SaveRunStateArgs {
                 state: state.clone(),
             })
-            .await
             .map_err(to_store_error)
     }
 
     async fn delete_run(&self, run_id: &str, reason: DeleteReason) -> Result<(), StoreError> {
         self.inner
             .delete_run(&run_id.to_string(), reason)
-            .await
             .map_err(to_store_error)
     }
 
@@ -481,7 +478,6 @@ impl RunStore for RunStoreAdapter {
                 expected_next_index: expected_next_index as u64,
                 events: vec![event.clone()],
             })
-            .await
             .map(|_| ())
             .map_err(to_store_error)
     }
@@ -492,7 +488,6 @@ impl RunStore for RunStoreAdapter {
                 run_id: run_id.to_string(),
                 from_index: None,
             })
-            .await
             .map(|stored| stored.into_iter().map(|e| e.event).collect())
             .map_err(to_store_error)
     }
@@ -515,7 +510,6 @@ impl RunStore for RunStoreAdapter {
                 run_id: run_id.to_string(),
                 from_index: None,
             })
-            .await
             .ok()?
             .last()
             .map_or(0, |e| e.event_index.saturating_add(1));
@@ -582,7 +576,6 @@ impl RunStore for RunStoreAdapter {
                 run_id: run_id.to_string(),
                 from_index: None,
             })
-            .await
             .map(|v| v.len() as u64)
             .map_err(to_store_error)?;
         self.inner
@@ -593,7 +586,6 @@ impl RunStore for RunStoreAdapter {
                 expected_next_index: log_len,
                 now: crate::runtime_driver::now_ms(),
             })
-            .await
             .map_err(to_store_error)
     }
 }
@@ -643,29 +635,29 @@ mod adapter_tests {
         (create_run_store_adapter(exec), mem)
     }
 
-    #[test]
-    fn get_run_state_projects_through() {
+    #[tokio::test]
+    async fn get_run_state_projects_through() {
         let (store, mem) = adapted();
-        assert!(store.get_run_state("r1").unwrap().is_none());
+        assert!(store.get_run_state("r1").await.unwrap().is_none());
         mem.save_run_state(SaveRunStateArgs { state: state("r1") })
             .unwrap();
         assert_eq!(
-            store.get_run_state("r1").unwrap().map(|s| s.run_id),
+            store.get_run_state("r1").await.unwrap().map(|s| s.run_id),
             Some("r1".into())
         );
     }
 
-    #[test]
-    fn set_run_state_reaches_inner() {
+    #[tokio::test]
+    async fn set_run_state_reaches_inner() {
         let (store, mem) = adapted();
-        store.set_run_state("r1", &state("r1")).unwrap();
+        store.set_run_state("r1", &state("r1")).await.unwrap();
         assert!(mem.load_run_state(&"r1".to_string()).unwrap().is_some());
     }
 
-    #[test]
-    fn append_event_wraps_single_into_batch() {
+    #[tokio::test]
+    async fn append_event_wraps_single_into_batch() {
         let (store, mem) = adapted();
-        store.append_event("r1", 0, &event("r1")).unwrap();
+        store.append_event("r1", 0, &event("r1")).await.unwrap();
         let stored = mem
             .read_events(ReadEventsArgs {
                 run_id: "r1".into(),
@@ -676,22 +668,22 @@ mod adapter_tests {
         assert_eq!(stored[0].event_index, 0);
     }
 
-    #[test]
-    fn get_events_strips_index_envelope() {
+    #[tokio::test]
+    async fn get_events_strips_index_envelope() {
         let (store, _mem) = adapted();
-        store.append_event("r1", 0, &event("r1")).unwrap();
-        store.append_event("r1", 1, &event("r1")).unwrap();
-        let events = store.get_events("r1").unwrap();
+        store.append_event("r1", 0, &event("r1")).await.unwrap();
+        store.append_event("r1", 1, &event("r1")).await.unwrap();
+        let events = store.get_events("r1").await.unwrap();
         assert_eq!(events.len(), 2);
     }
 
     /// 关键回归：CAS 冲突经适配器后**仍是 `StoreError::Conflict`**，
     /// core 的 rebase-retry 循环才不会把它当普通 IO 错误。
-    #[test]
-    fn cas_conflict_survives_adaptation() {
+    #[tokio::test]
+    async fn cas_conflict_survives_adaptation() {
         let (store, _mem) = adapted();
-        store.append_event("r1", 0, &event("r1")).unwrap();
-        let err = store.append_event("r1", 0, &event("r1")).unwrap_err();
+        store.append_event("r1", 0, &event("r1")).await.unwrap();
+        let err = store.append_event("r1", 0, &event("r1")).await.unwrap_err();
         assert!(
             matches!(err, StoreError::Conflict { .. }),
             "应保留 Conflict，实际为 {err:?}"
@@ -701,8 +693,8 @@ mod adapter_tests {
     /// 桥接后：订阅者只收到**订阅之后**新增的事件，**不补发**存量——与 core 的
     /// `InMemoryStore::subscribe` 语义一致（底层 `subscribe_events` 本身是补发的，
     /// 适配器靠「先读尾部索引、再从那里接」把这个差别抹平）。
-    #[test]
-    fn subscribe_bridges_callback_to_channel_without_replaying_backlog() {
+    #[tokio::test]
+    async fn subscribe_bridges_callback_to_channel_without_replaying_backlog() {
         let (store, _mem) = adapted();
 
         // 先造两条存量事件，它们**不该**被补发。
@@ -720,10 +712,11 @@ mod adapter_tests {
                         meta: None,
                     },
                 )
+                .await
                 .unwrap();
         }
 
-        let rx = store.subscribe("r1").expect("in-memory store 支持订阅");
+        let mut rx = store.subscribe("r1").await.expect("in-memory store 支持订阅");
         assert!(
             rx.try_recv().is_err(),
             "存量事件不得补发：底层会补发，适配器必须靠 tail_index 挡掉"
@@ -743,9 +736,12 @@ mod adapter_tests {
                     meta: None,
                 },
             )
+            .await
             .unwrap();
 
-        let got = rx.recv_timeout(std::time::Duration::from_secs(2))
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("2s 内应收到订阅之后的新增事件")
             .expect("应收到订阅之后的新增事件");
         assert!(
             matches!(&got, WorkflowEvent::StepFinished { step_id, .. } if step_id == "new"),
@@ -755,10 +751,10 @@ mod adapter_tests {
 
     /// Receiver 被 drop 后，适配器必须退订——否则 store 侧的订阅永久留存，
     /// 之后每次 append 都会往一条死链上白 clone 事件。
-    #[test]
-    fn dropping_receiver_unsubscribes() {
+    #[tokio::test]
+    async fn dropping_receiver_unsubscribes() {
         let (store, mem) = adapted();
-        let rx = store.subscribe("r1").expect("in-memory store 支持订阅");
+        let rx = store.subscribe("r1").await.expect("in-memory store 支持订阅");
         assert_eq!(subscriber_count(&mem, "r1"), 1, "订阅已注册");
 
         drop(rx);
@@ -778,6 +774,7 @@ mod adapter_tests {
                     meta: None,
                 },
             )
+            .await
             .unwrap();
 
         // 退订发生在转发线程上，轮询等它落地。

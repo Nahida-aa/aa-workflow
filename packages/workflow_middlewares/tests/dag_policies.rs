@@ -36,7 +36,9 @@ fn shape() -> Arc<DagShape> {
 fn loader(store: Arc<InMemoryStore>) -> Arc<aa_workflow_middlewares::GetEvents> {
     Arc::new(move |run_id: &str| {
         use aa_workflow_core::RunStore;
-        Ok(store.get_events(run_id)?)
+        let store = store.clone();
+        Box::pin(async move { Ok(store.get_events(run_id).await?) })
+            as aa_workflow_core::define::BoxFuture<'_, _>
     })
 }
 
@@ -158,7 +160,7 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
     assert!(
         store
             .get_events("r2")
-            .unwrap()
+            .await.unwrap()
             .iter()
             .any(|e| matches!(
                 e,
@@ -170,7 +172,7 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
     // rev2 日志里 load/enrich 也有 checkpoint（复用提交的）→ 重放可短路
     let mut finished: Vec<String> = store
         .get_events("r2")
-        .unwrap()
+        .await.unwrap()
         .iter()
         .filter_map(|e| match e {
             WorkflowEvent::StepFinished { step_id, .. } => Some(step_id.clone()),

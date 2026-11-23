@@ -1354,8 +1354,8 @@ mod in_memory_tests {
     }
 
     /// delete_run 连带清 timer 与 signal 投递记录。
-    #[test]
-    fn delete_run_cleans_timers_and_deliveries() {
+    #[tokio::test]
+    async fn delete_run_cleans_timers_and_deliveries() {
         let s = in_memory_execution_store();
         s.create_run(created("r", 0)).unwrap();
         s.mark_run_paused(paused_args("r", "payment", 0)).unwrap();

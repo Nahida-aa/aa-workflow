@@ -72,7 +72,7 @@ pub fn fulfillment_workflow() -> WorkflowDefinition<FulfillmentInput, serde_json
 
             // 耐久等待（定时器）：挂起 → 落 checkpoint → 进程可以退出。
             // 唤醒由外部 timer 投递完成（见 §6 的 sweep）。
-            let now = ctx.now()?;
+            let now = ctx.now().await?;
             ctx.sleep_until("ready-gate", now + delay_ms).await?;
 
             // 耐久等待（外部信号）：等支付 webhook。

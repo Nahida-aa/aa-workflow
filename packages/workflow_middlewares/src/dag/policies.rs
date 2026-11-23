@@ -85,9 +85,10 @@ impl aa_workflow_core::define::MetaKey for DagPlanKey {
 aa_workflow_core::impl_meta_accessors!(DagPlanKey => DagPlanAccess, dag_plan, try_dag_plan);
 
 
-/// 读某个 run 的日志（引擎事件数组）。
-pub type GetEvents =
-    dyn Fn(&str) -> anyhow::Result<Vec<aa_workflow_core::event::WorkflowEvent>> + Send + Sync;
+/// 读某个 run 的日志（引擎事件数组）。async 对齐 TanStack hook + async RunStore。
+pub type GetEvents = dyn for<'a> Fn(&'a str) -> aa_workflow_core::define::BoxFuture<'a, anyhow::Result<Vec<aa_workflow_core::event::WorkflowEvent>>>
+    + Send
+    + Sync;
 
 /// drive 开始时从 meta 解析出的计划（**不可变**，整条 drive 内只读）。
 ///
@@ -138,7 +139,7 @@ impl MiddlewareServer for DagPoliciesMw {
             // redo：source_run_id 存在才启用；from 闭包展开交给
             // DagShape::reseed_plan（库有图，含缺省种子计算）。
             if let Some(source_run_id) = plan.source_run_id.as_deref() {
-                let source_log = (self.get_events)(source_run_id)?;
+                let source_log = (self.get_events)(source_run_id).await?;
                 let from = plan.from.clone();
                 let reseed_run = self.shape.reseed_plan(&source_log, from)?;
                 let mut redo: HashSet<String> = reseed_run.redo_set.iter().cloned().collect();

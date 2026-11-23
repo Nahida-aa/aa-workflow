@@ -22,20 +22,24 @@ fn reseed_meta(plan: ReseedPlan) -> MetaBag {
 /// 供 `STEP_FINISHED.meta.imported_from.index` 使用）。
 fn loader(
     store: Arc<InMemoryStore>,
-) -> impl Fn(&str) -> anyhow::Result<HashMap<String, SourceStep>> + Send + Sync + 'static {
+) -> impl for<'a> Fn(&'a str) -> aa_workflow_core::define::BoxFuture<'a, anyhow::Result<HashMap<String, SourceStep>>> + Send + Sync + 'static {
     move |run_id: &str| {
-        let mut m = HashMap::new();
-        for (index, e) in store.get_events(run_id)?.into_iter().enumerate() {
-            if let WorkflowEvent::StepFinished {
-                step_id,
-                result: Some(r),
-                ..
-            } = e
-            {
-                m.insert(step_id, SourceStep { result: r, index });
+        let store = store.clone();
+        Box::pin(async move {
+            use aa_workflow_core::RunStore;
+            let mut m = HashMap::new();
+            for (index, e) in store.get_events(run_id).await?.into_iter().enumerate() {
+                if let WorkflowEvent::StepFinished {
+                    step_id,
+                    result: Some(r),
+                    ..
+                } = e
+                {
+                    m.insert(step_id, SourceStep { result: r, index });
+                }
             }
-        }
-        Ok(m)
+            Ok(m)
+        }) as aa_workflow_core::define::BoxFuture<'_, _>
     }
 }
 
@@ -117,7 +121,7 @@ async fn redo_reuses_steps_outside_redo_set() {
     // 但 rev2 的日志里 a/b/c 都有 checkpoint（重放可短路）
     let finished: Vec<String> = store
         .get_events("rev2")
-        .unwrap()
+        .await.unwrap()
         .iter()
         .filter_map(|e| match e {
             WorkflowEvent::StepFinished { step_id, .. } => Some(step_id.clone()),
@@ -129,7 +133,7 @@ async fn redo_reuses_steps_outside_redo_set() {
     // 复用的 checkpoint 必须带**导入溯源**（与引擎版 `reseed_run` 一致）
     let imported: Vec<(String, String, usize)> = store
         .get_events("rev2")
-        .unwrap()
+        .await.unwrap()
         .iter()
         .filter_map(|e| match e {
             WorkflowEvent::StepFinished {

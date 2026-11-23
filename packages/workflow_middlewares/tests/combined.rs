@@ -20,20 +20,24 @@ use aa_workflow_middlewares::{
 /// 把源 run 的 STEP_FINISHED 收成 map（带日志下标）。
 fn loader(
     store: Arc<InMemoryStore>,
-) -> impl Fn(&str) -> anyhow::Result<HashMap<String, SourceStep>> + Send + Sync + 'static {
+) -> impl for<'a> Fn(&'a str) -> aa_workflow_core::define::BoxFuture<'a, anyhow::Result<HashMap<String, SourceStep>>> + Send + Sync + 'static {
     move |run_id: &str| {
-        let mut m = HashMap::new();
-        for (index, e) in store.get_events(run_id)?.into_iter().enumerate() {
-            if let WorkflowEvent::StepFinished {
-                step_id,
-                result: Some(r),
-                ..
-            } = e
-            {
-                m.insert(step_id, SourceStep { result: r, index });
+        let store = store.clone();
+        Box::pin(async move {
+            use aa_workflow_core::RunStore;
+            let mut m = HashMap::new();
+            for (index, e) in store.get_events(run_id).await?.into_iter().enumerate() {
+                if let WorkflowEvent::StepFinished {
+                    step_id,
+                    result: Some(r),
+                    ..
+                } = e
+                {
+                    m.insert(step_id, SourceStep { result: r, index });
+                }
             }
-        }
-        Ok(m)
+            Ok(m)
+        }) as aa_workflow_core::define::BoxFuture<'_, _>
     }
 }
 
@@ -86,7 +90,7 @@ async fn outer_reseed_short_circuits_before_interim_goals_can_park() {
         reseed(loader(store.clone())),
         interim_goals({
             let store = store.clone();
-            move |run_id| Ok(store.get_events(run_id)?)
+            move |run_id: &str| { let store = store.clone(); Box::pin(async move { use aa_workflow_core::RunStore; Ok(store.get_events(run_id).await?) }) as aa_workflow_core::define::BoxFuture<'_, _> }
         }),
     ));
 
@@ -145,7 +149,7 @@ async fn outer_reseed_short_circuits_before_interim_goals_can_park() {
     assert!(
         !store
             .get_events("c2")
-            .unwrap()
+            .await.unwrap()
             .iter()
             .any(|e| matches!(
                 e,
@@ -180,7 +184,7 @@ async fn outer_interim_goals_parks_before_reseed_short_circuits() {
         ran.clone(),
         interim_goals({
             let store = store.clone();
-            move |run_id| Ok(store.get_events(run_id)?)
+            move |run_id: &str| { let store = store.clone(); Box::pin(async move { use aa_workflow_core::RunStore; Ok(store.get_events(run_id).await?) }) as aa_workflow_core::define::BoxFuture<'_, _> }
         }),
         reseed(loader(store.clone())),
     ));
@@ -236,8 +240,9 @@ fn linear_shape() -> Arc<DagShape> {
 }
 
 /// 读出泊车事件的 meta（`None` = 没泊车）。
-fn park_meta(store: &InMemoryStore, run_id: &str) -> Option<serde_json::Value> {
-    store.get_events(run_id).ok()?.into_iter().find_map(|e| match e {
+async fn park_meta(store: &InMemoryStore, run_id: &str) -> Option<serde_json::Value> {
+    use aa_workflow_core::RunStore;
+    store.get_events(run_id).await.ok()?.into_iter().find_map(|e| match e {
         WorkflowEvent::SignalAwaited { name, meta, .. } if name == INTERIM_GOAL_SIGNAL => meta,
         _ => None,
     })
@@ -253,13 +258,13 @@ async fn outer_interim_goals_wins_the_park_race() {
         ran.clone(),
         interim_goals({
             let store = store.clone();
-            move |run_id| Ok(store.get_events(run_id)?)
+            move |run_id: &str| { let store = store.clone(); Box::pin(async move { use aa_workflow_core::RunStore; Ok(store.get_events(run_id).await?) }) as aa_workflow_core::define::BoxFuture<'_, _> }
         }),
         dag_policies(
             linear_shape(),
             Arc::new({
                 let store = store.clone();
-                move |run_id: &str| Ok(store.get_events(run_id)?)
+                move |run_id: &str| { let store = store.clone(); Box::pin(async move { use aa_workflow_core::RunStore; Ok(store.get_events(run_id).await?) }) as aa_workflow_core::define::BoxFuture<'_, _> }
             }),
         ),
     ));
@@ -283,7 +288,7 @@ async fn outer_interim_goals_wins_the_park_race() {
 
     assert_eq!(ran.lock().unwrap().clone(), vec!["a".to_string()]);
     assert_eq!(out.status, RunStatus::Paused);
-    let m = park_meta(&store, "p1").expect("应泊车");
+    let m = park_meta(&store, "p1").await.expect("应泊车");
     assert!(
         m.get("__interimGoals").is_some(),
         "应由 interim_goals 触发（meta 带 __interimGoals），实际 {m}"
@@ -302,12 +307,12 @@ async fn outer_dag_policies_wins_the_park_race() {
             linear_shape(),
             Arc::new({
                 let store = store.clone();
-                move |run_id: &str| Ok(store.get_events(run_id)?)
+                move |run_id: &str| { let store = store.clone(); Box::pin(async move { use aa_workflow_core::RunStore; Ok(store.get_events(run_id).await?) }) as aa_workflow_core::define::BoxFuture<'_, _> }
             }),
         ),
         interim_goals({
             let store = store.clone();
-            move |run_id| Ok(store.get_events(run_id)?)
+            move |run_id: &str| { let store = store.clone(); Box::pin(async move { use aa_workflow_core::RunStore; Ok(store.get_events(run_id).await?) }) as aa_workflow_core::define::BoxFuture<'_, _> }
         }),
     ));
 
@@ -330,7 +335,7 @@ async fn outer_dag_policies_wins_the_park_race() {
 
     assert_eq!(ran.lock().unwrap().clone(), vec!["a".to_string()]);
     assert_eq!(out.status, RunStatus::Paused);
-    let m = park_meta(&store, "q1").expect("应泊车");
+    let m = park_meta(&store, "q1").await.expect("应泊车");
     assert!(
         m.get("goals").is_some() && m.get("__interimGoals").is_none(),
         "应由 dag_policies 触发（meta 带 goals），实际 {m}"

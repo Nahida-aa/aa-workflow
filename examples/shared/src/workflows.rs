@@ -735,7 +735,7 @@ mod tests {
         // 按挂起类型分派：审批是结构化决定（无 payload），信号有 payload。
         // 载荷**随 drive 一起给**（`approval` / `signal_delivery`），引擎在重放
         // handler 之前把它落成事件——与 runtime 的投递路径同形。
-        let is_approval = store.get_events(&run_id).unwrap().iter().any(|e| {
+        let is_approval = store.get_events(&run_id).await.unwrap().iter().any(|e| {
             matches!(e, WorkflowEvent::ApprovalRequested { step_id: id, .. } if id == step_id)
         });
         let options = opts(wf.clone().into(), store.clone());
@@ -807,7 +807,7 @@ mod tests {
             }
             // 挂起投影有两种：signal（含 sleep 的 `__timer`）走 `waiting_for`，
             // 审批走 `pending_approval`。只有前者是计时器。
-            let st = store.get_run_state(&run_id).unwrap().unwrap();
+            let st = store.get_run_state(&run_id).await.unwrap().unwrap();
             let Some(w) = st.waiting_for else {
                 return out;
             };
@@ -856,7 +856,7 @@ mod tests {
 
         // charge 重试 3 次成功（前 2 次失败）
         assert_eq!(payment_gateway::attempts(), 3);
-        let events = store.get_events(&out.run_id).unwrap();
+        let events = store.get_events(&out.run_id).await.unwrap();
         let charge_fin = events
             .iter()
             .find_map(|e| match e {
@@ -903,7 +903,7 @@ mod tests {
             Some(serde_json::json!({ "approved": true, "feedback": null }))
         );
 
-        let evs = store.get_events("approve:r").unwrap();
+        let evs = store.get_events("approve:r").await.unwrap();
         assert_eq!(finished_count(&evs, "draft"), 1);
         assert_eq!(finished_count(&evs, "publish"), 1);
         assert_eq!(
@@ -949,7 +949,7 @@ mod tests {
         .await;
         assert_eq!(out.status, RunStatus::Finished);
 
-        let events = store.get_events("fulfill:p").unwrap();
+        let events = store.get_events("fulfill:p").await.unwrap();
         assert_eq!(finished_count(&events, "reserve-inventory"), 1);
         assert_eq!(finished_count(&events, "ship-order"), 1);
         let ready_sleep = events
@@ -983,10 +983,10 @@ mod tests {
             }))
         );
         assert_eq!(
-            finished_count(&store.get_events(&out.run_id).unwrap(), "charge-payment"),
+            finished_count(&store.get_events(&out.run_id).await.unwrap(), "charge-payment"),
             1
         );
-        let events = store.get_events(&out.run_id).unwrap();
+        let events = store.get_events(&out.run_id).await.unwrap();
         assert!(
             !events
                 .iter()
@@ -1018,7 +1018,7 @@ mod tests {
         assert_eq!(out.status, RunStatus::Finished);
         assert_eq!(out.output.clone().unwrap()["status"], "rejected");
         assert_eq!(out.output.clone().unwrap()["reason"], "budget overrun");
-        let events = store.get_events("approve:o").unwrap();
+        let events = store.get_events("approve:o").await.unwrap();
         assert_eq!(finished_count(&events, "notify-rejected"), 1);
         assert_eq!(finished_count(&events, "charge-payment"), 0);
     }
@@ -1043,7 +1043,7 @@ mod tests {
         assert_eq!(out.status, RunStatus::Finished);
         assert_eq!(out.output.unwrap()["settled"], true);
 
-        let events = store.get_events(&out.run_id).unwrap();
+        let events = store.get_events(&out.run_id).await.unwrap();
         assert_eq!(finished_count(&events, "settle-invoice"), 1);
         for step in ["settle-due-1", "settle-due-2"] {
             let paused = events
@@ -1094,7 +1094,7 @@ mod tests {
         assert_eq!(out.status, RunStatus::Finished);
         assert_eq!(out.output.unwrap()["archived"], true);
 
-        let events = store.get_events("comp:r").unwrap();
+        let events = store.get_events("comp:r").await.unwrap();
         assert_eq!(finished_count(&events, "archive-record"), 1);
     }
 
@@ -1130,7 +1130,7 @@ mod tests {
         .await;
         assert_eq!(out.status, RunStatus::Finished);
         assert_eq!(out.output.clone().unwrap()["status"], "declined");
-        let events = store.get_events("refund:d").unwrap();
+        let events = store.get_events("refund:d").await.unwrap();
         assert_eq!(finished_count(&events, "disburse-refund"), 0);
     }
 
@@ -1182,7 +1182,7 @@ mod tests {
         assert_eq!(out.status, RunStatus::Finished);
         assert_eq!(out.output.clone().unwrap()["status"], "refunded");
 
-        let events = store.get_events("refund:q").unwrap();
+        let events = store.get_events("refund:q").await.unwrap();
         assert_eq!(finished_count(&events, "disburse-refund"), 1);
         let timer_sleep = events
             .iter()
@@ -1250,7 +1250,7 @@ mod tests {
             err.contains("missing field") || err.contains("total") || err.contains("settle_events"),
             "错误应指向 state 形状: {err}"
         );
-        let st = store.get_run_state(&out.run_id).unwrap().unwrap();
+        let st = store.get_run_state(&out.run_id).await.unwrap().unwrap();
         assert_eq!(
             st.status,
             RunStatus::Errored,
@@ -1336,7 +1336,7 @@ mod tests {
             drive_to_pause(&store_b, &wf, opts_b).await,
             RunStatus::Paused
         );
-        let paused_b = store_b.get_run_state("state:gated").unwrap().unwrap();
+        let paused_b = store_b.get_run_state("state:gated").await.unwrap().unwrap();
         assert_eq!(paused_b.status, RunStatus::Paused, "gate 应把 run 挂起");
         let out_b = drive_after_signal(
             &store_b,
@@ -1548,7 +1548,7 @@ mod tests {
         assert_eq!(first.status, RunStatus::Paused);
 
         // 挂起投影：waiting_for.signal_name = 事件通道（≠ pause key）。
-        let st = store.get_run_state("event:gate").unwrap().unwrap();
+        let st = store.get_run_state("event:gate").await.unwrap().unwrap();
         assert_eq!(st.status, RunStatus::Paused);
         let w = st.waiting_for.as_ref().unwrap();
         assert_eq!(w.step_id.as_deref(), Some("price-wait"));
@@ -1588,7 +1588,7 @@ mod tests {
         assert!(
             store
                 .get_events("event:gate")
-                .unwrap()
+                .await.unwrap()
                 .iter()
                 .all(|e| !matches!(e, WorkflowEvent::Custom { .. }))
         );
@@ -1628,7 +1628,7 @@ mod tests {
         assert_eq!(
             store
                 .get_events("event:crash")
-                .unwrap()
+                .await.unwrap()
                 .iter()
                 .filter(
                     |e| matches!(e, WorkflowEvent::SignalAwaited { step_id, .. } | WorkflowEvent::ApprovalRequested { step_id, .. } if step_id == "price-wait")

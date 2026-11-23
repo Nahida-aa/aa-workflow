@@ -44,7 +44,9 @@ fn get_runtime_with_env(
     // `get_events` 闭包持有 adapter（Arc<dyn RunStore>，Clone ✓）
     let adapter = create_run_store_adapter(store.clone());
     let get_events: Arc<GetEvents> = Arc::new(move |run_id: &str| {
-        adapter.get_events(run_id).map_err(Into::into)
+        let adapter = adapter.clone();
+        Box::pin(async move { adapter.get_events(run_id).await.map_err(Into::into) })
+            as aa_workflow_core::define::BoxFuture<'_, _>
     });
     let mut workflows = HashMap::new();
     workflows.insert(
@@ -254,7 +256,11 @@ async fn mismatched_registration_key_still_drives_start() {
 /// get_events（读日志闭包）从 store 组装的公共提取——避免与上面重复。
 fn get_events_of(store: Arc<dyn WorkflowExecutionStore>) -> Arc<GetEvents> {
     let adapter = create_run_store_adapter(store);
-    Arc::new(move |run_id: &str| adapter.get_events(run_id).map_err(Into::into))
+    Arc::new(move |run_id: &str| {
+        let adapter = adapter.clone();
+        Box::pin(async move { adapter.get_events(run_id).await.map_err(Into::into) })
+            as aa_workflow_core::define::BoxFuture<'_, _>
+    })
 }
 
 /// 场景 ④：**步骤抛错 → reseed 型恢复（不指定目标的续驱）**——
