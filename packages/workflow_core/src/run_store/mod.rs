@@ -3,7 +3,7 @@
 //! - 契约本身（[`RunStore`] + [`RunState`] 信封）在本文件；
 //! - 各实现按后端分文件（[`InMemoryStore`] 在 `in_memory`）。
 
-use std::sync::mpsc::Receiver;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use serde::{Deserialize, Serialize};
 
@@ -329,27 +329,34 @@ impl DeleteReason {
 /// 该函数的入参是 `Arc<dyn RunStore>`（具体 trait 对象），而 supertrait 只保证
 /// `WorkflowRunStoreAdapterStore` 的父关系，跟本 trait 无关。
 /// 完整论证见 `docs/runtime-design.md` 的 D1。
+/// 存储操作全部异步（对齐上游 `RunStore` 的 `Promise` 接口）：store 内部可用
+/// 单写者 actor 串行化读写（等价上游 JS 事件循环），不靠锁。
+///
+/// 用 `async_trait` 而非原生 `async fn in trait`：本 trait 要以
+/// `Arc<dyn RunStore>` 使用（引擎入参），原生 async fn 不 dyn-compatible。
+#[async_trait::async_trait]
 pub trait RunStore: Send + Sync {
-    fn get_run_state(&self, run_id: &str) -> Result<Option<RunState>, StoreError>;
-    fn set_run_state(&self, run_id: &str, state: &RunState) -> Result<(), StoreError>;
-    fn delete_run(&self, run_id: &str, reason: DeleteReason) -> Result<(), StoreError>;
+    async fn get_run_state(&self, run_id: &str) -> Result<Option<RunState>, StoreError>;
+    async fn set_run_state(&self, run_id: &str, state: &RunState) -> Result<(), StoreError>;
+    async fn delete_run(&self, run_id: &str, reason: DeleteReason) -> Result<(), StoreError>;
 
     /// Appends an event at `expected_next_index`. Implementations MUST reject
     /// the write with [`StoreError::Conflict`] if the current log length
     /// differs — this is the optimistic-concurrency guard that lets a
     /// coordinator serialize concurrent writers.
-    fn append_event(
+    async fn append_event(
         &self,
         run_id: &str,
         expected_next_index: usize,
         event: &WorkflowEvent,
     ) -> Result<(), StoreError>;
-    fn get_events(&self, run_id: &str) -> Result<Vec<WorkflowEvent>, StoreError>;
+    async fn get_events(&self, run_id: &str) -> Result<Vec<WorkflowEvent>, StoreError>;
 
 
     /// Live subscription: a receiver that sees every future event appended to
     /// this run's log. `None` if the store does not support subscriptions.
-    fn subscribe(&self, run_id: &str) -> Option<Receiver<WorkflowEvent>> {
+    /// Async 是因为 adapter 可能要先读日志尾部索引（对齐上游 `fromIndex` 参数）。
+    async fn subscribe(&self, run_id: &str) -> Option<UnboundedReceiver<WorkflowEvent>> {
         let _ = run_id;
         None
     }
@@ -363,7 +370,7 @@ pub trait RunStore: Send + Sync {
     ///
     /// **默认实现返回 `None`**（对应上游的可选 `?`）：不实现收件箱的 store
     /// 无需改代码，行为即上游的 legacy adapter。
-    fn consume_buffered_signal(
+    async fn consume_buffered_signal(
         &self,
         _run_id: &str,
         _step_id: &str,

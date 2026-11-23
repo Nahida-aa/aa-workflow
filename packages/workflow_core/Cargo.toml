@@ -13,6 +13,9 @@ uuid = { version = "1", features = ["v4"] }
 # `Stream` trait only (no executor, no combinators) — `RunEventStream` 手写
 # `poll_next`，对齐上游 `AsyncIterable<WorkflowEvent>`。
 futures-core = "0.3"
+# RunStore trait 要用作 Arc<dyn RunStore>（trait object）——原生 async fn in trait
+# 不 dyn-compatible，必须 box 成 dyn Future（async-trait）。
+async-trait = "0.1"
 tower = { version = "0.5.3", features = ["util", "timeout", "limit"] }
 
 [dev-dependencies]

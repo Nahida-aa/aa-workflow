@@ -95,10 +95,11 @@ impl<I, S> RunCtx<I, S> {
             value,
         });
     }
-    pub fn is_cancelled(&self) -> bool {
+    pub async fn is_cancelled(&self) -> bool {
         self.engine
             .store
             .get_run_state(&self.engine.run_id)
+            .await
             .ok()
             .flatten()
             .map(|st| st.status == crate::event::RunStatus::Aborted)
@@ -146,8 +147,8 @@ impl<I, S> StepCtx<I, S> {
     /// Cooperative poll counterpart to TanStack's per-attempt `signal` — Rust
     /// cannot interrupt an in-flight future, so long steps must self-check on
     /// their own cadence (same granularity as `BaseCtx::is_cancelled`).
-    pub fn is_cancelled(&self) -> bool {
-        self.ctx.is_cancelled()
+    pub async fn is_cancelled(&self) -> bool {
+        self.ctx.is_cancelled().await
     }
     pub fn deadline(&self) -> Option<u64> {
         self.ctx.deadline()
@@ -285,7 +286,7 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
     /// 保护效果；内存登记 + 重放重建（handler 重跑确定性重登记，回调不
     /// 序列化）。未捕获失败时引擎逆序执行已登记补偿；名单由使用者提供，
     /// 不校验封闭性（"unsafe" 语义：名单外下游的处置由调用者负责）。
-    pub fn compensate(
+    pub async fn compensate(
         &self,
         id: impl Into<String>,
         undo: impl Fn(StepCtx<TInput, TState>) -> std::pin::Pin<
@@ -343,7 +344,7 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
         }
         // 登记落成耐久事件（对齐上游 `COMPENSATION_REGISTERED`）：handler 重放时
         // 这一步不会重复写日志，崩溃后也从日志看得见"登记过什么"。
-        self.engine.register_compensation(&id)?;
+        self.engine.register_compensation(&id).await?;
         Ok(())
     }
 
@@ -492,15 +493,15 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
     /// Deterministic wall-clock (TanStack `ctx.now`): records the call's
     /// timestamp as a checkpoint; replay serves the recorded value, so a run
     /// sees the same clock across resumes. Returns `Err` only on store failure.
-    pub fn now(&self) -> anyhow::Result<u64> {
-        crate::engine::exec_now(&self.engine, None)
+    pub async fn now(&self) -> anyhow::Result<u64> {
+        crate::engine::exec_now(&self.engine, None).await
     }
 
     /// Deterministic id (TanStack `ctx.uuid`): records a generated UUIDv4 as a
     /// checkpoint; replay serves the recorded id, so the same value is seen
     /// across resumes. Returns `Err` only on store failure.
-    pub fn uuid(&self) -> anyhow::Result<String> {
-        crate::engine::exec_uuid(&self.engine, None)
+    pub async fn uuid(&self) -> anyhow::Result<String> {
+        crate::engine::exec_uuid(&self.engine, None).await
     }
 
     /// [`now`](Self::now) with an **explicit checkpoint id**（上游
@@ -512,24 +513,25 @@ impl<TInput, TState> BaseCtx<TInput, TState> {
     ///
     /// 同一个 id 调用两次会各取各的时间（第一次消费掉日志里那条记录，第二次
     /// 生成新值并追加），与上游 `consumed` 语义一致。
-    pub fn now_with(&self, id: &str) -> anyhow::Result<u64> {
-        crate::engine::exec_now(&self.engine, Some(id))
+    pub async fn now_with(&self, id: &str) -> anyhow::Result<u64> {
+        crate::engine::exec_now(&self.engine, Some(id)).await
     }
 
     /// [`uuid`](Self::uuid) with an explicit checkpoint id. 定位与二次调用的
     /// 语义同 [`now_with`](Self::now_with)。
-    pub fn uuid_with(&self, id: &str) -> anyhow::Result<String> {
-        crate::engine::exec_uuid(&self.engine, Some(id))
+    pub async fn uuid_with(&self, id: &str) -> anyhow::Result<String> {
+        crate::engine::exec_uuid(&self.engine, Some(id)).await
     }
 
     /// Whether this run was cancelled via [`cancel_run`](crate::engine::cancel_run).
     /// Polled at step boundaries only — the engine cannot interrupt a step's
     /// in-flight `await` (same granularity as JS `AbortSignal`: the closure
     /// must check cooperatively).
-    pub fn is_cancelled(&self) -> bool {
+    pub async fn is_cancelled(&self) -> bool {
         self.engine
             .store
             .get_run_state(&self.run_id)
+            .await
             .ok()
             .flatten()
             .map(|st| st.status == crate::event::RunStatus::Aborted)

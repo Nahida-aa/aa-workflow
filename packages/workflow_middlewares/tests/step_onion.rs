@@ -251,7 +251,7 @@ async fn inner_skip_short_circuits_base_but_outer_still_wraps() {
         "外层包装层照常执行——短路只跳过内层"
     );
     // 短路仍然落 checkpoint（replay / 续驱可复用）
-    let events = store.get_events("onion:skip").unwrap();
+    let events = store.get_events("onion:skip").await.unwrap();
     assert!(
         events.iter().any(|e| matches!(
             e,
@@ -289,7 +289,7 @@ async fn wrapper_order_decides_who_wins() {
     .await
     .unwrap();
 
-    let events = store.get_events("onion:win").unwrap();
+    let events = store.get_events("onion:win").await.unwrap();
     let b_result = events.iter().find_map(|e| match e {
         WorkflowEvent::StepFinished { step_id, result, .. } if step_id == "b" => result.clone(),
         _ => None,

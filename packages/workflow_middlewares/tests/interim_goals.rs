@@ -79,7 +79,7 @@ async fn parks_at_the_goal_step_and_does_not_run_later_steps() {
     assert_eq!(out.status, RunStatus::Paused, "目标达成后应泊车");
 
     // 日志里有一条 __interim-goal 的 SignalAwaited，meta 带目标
-    let has_await = store.get_events("g:1").unwrap().iter().any(|e| {
+    let has_await = store.get_events("g:1").await.unwrap().iter().any(|e| {
         matches!(e, WorkflowEvent::SignalAwaited { name, .. } if name == INTERIM_GOAL_SIGNAL)
     });
     assert!(has_await, "应有 __interim-goal 的 SignalAwaited");

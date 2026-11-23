@@ -84,7 +84,8 @@
 //! [`RunStore`]: aa_workflow_core::RunStore
 
 use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc;
+use tokio::sync::mpsc as tokio_mpsc;
 
 use aa_workflow_core::{DeleteReason, RunState, RunStore, StoreError, WorkflowEvent};
 
@@ -442,29 +443,33 @@ pub fn create_run_store_adapter(store: Arc<dyn WorkflowExecutionStore>) -> Arc<d
     Arc::new(RunStoreAdapter { inner: store })
 }
 
+#[async_trait::async_trait]
 impl RunStore for RunStoreAdapter {
-    fn get_run_state(&self, run_id: &str) -> Result<Option<RunState>, StoreError> {
+    async fn get_run_state(&self, run_id: &str) -> Result<Option<RunState>, StoreError> {
         self.inner
             .load_run_state(&run_id.to_string())
+            .await
             .map_err(to_store_error)
     }
 
-    fn set_run_state(&self, _run_id: &str, state: &RunState) -> Result<(), StoreError> {
+    async fn set_run_state(&self, _run_id: &str, state: &RunState) -> Result<(), StoreError> {
         // 上游同样忽略 runId：状态信封里自带 `run_id`。
         self.inner
             .save_run_state(SaveRunStateArgs {
                 state: state.clone(),
             })
+            .await
             .map_err(to_store_error)
     }
 
-    fn delete_run(&self, run_id: &str, reason: DeleteReason) -> Result<(), StoreError> {
+    async fn delete_run(&self, run_id: &str, reason: DeleteReason) -> Result<(), StoreError> {
         self.inner
             .delete_run(&run_id.to_string(), reason)
+            .await
             .map_err(to_store_error)
     }
 
-    fn append_event(
+    async fn append_event(
         &self,
         run_id: &str,
         expected_next_index: usize,
@@ -476,22 +481,24 @@ impl RunStore for RunStoreAdapter {
                 expected_next_index: expected_next_index as u64,
                 events: vec![event.clone()],
             })
+            .await
             .map(|_| ())
             .map_err(to_store_error)
     }
 
-    fn get_events(&self, run_id: &str) -> Result<Vec<WorkflowEvent>, StoreError> {
+    async fn get_events(&self, run_id: &str) -> Result<Vec<WorkflowEvent>, StoreError> {
         self.inner
             .read_events(ReadEventsArgs {
                 run_id: run_id.to_string(),
                 from_index: None,
             })
+            .await
             .map(|stored| stored.into_iter().map(|e| e.event).collect())
             .map_err(to_store_error)
     }
 
     /// 往日志里追加 `SignalResolved`（对齐 core 上游 `deliverSignal`）。
-    fn subscribe(&self, run_id: &str) -> Option<Receiver<WorkflowEvent>> {
+    async fn subscribe(&self, run_id: &str) -> Option<tokio_mpsc::UnboundedReceiver<WorkflowEvent>> {
         // 底层 `subscribe_events` 是回调式（`Box<dyn Fn>`）+ 返回退订句柄，core
         // 要的是 `mpsc::Receiver`。用一条转发链弥合：
         //
@@ -508,6 +515,7 @@ impl RunStore for RunStoreAdapter {
                 run_id: run_id.to_string(),
                 from_index: None,
             })
+            .await
             .ok()?
             .last()
             .map_or(0, |e| e.event_index.saturating_add(1));
@@ -516,7 +524,7 @@ impl RunStore for RunStoreAdapter {
         // 一次。用「关掉 sender」当作「没人要这些事件了」的信号：Receiver 被 drop
         // 之后第一次 `tx.send` 失败 → 置位 → 转发线程退订。否则 store 侧的订阅会
         // 永久留着（内存泄漏），此后每次 append 还会往一条死链上白 clone 事件。
-        let (tx, rx) = mpsc::channel::<WorkflowEvent>();
+        let (tx, rx) = tokio_mpsc::unbounded_channel::<WorkflowEvent>();
         let (gone_tx, gone_rx) = mpsc::channel::<()>();
         let gone = Arc::new(Mutex::new(Some(gone_tx)));
 
@@ -562,7 +570,7 @@ impl RunStore for RunStoreAdapter {
     ///
     /// 注意 `expected_next_index` 用**当前日志长度**：这是消费的并发闸门，
     /// 底层发现长度不符会拒绝（上游抛 `LogConflictError`），由驱动重试。
-    fn consume_buffered_signal(
+    async fn consume_buffered_signal(
         &self,
         run_id: &str,
         step_id: &str,
@@ -574,6 +582,7 @@ impl RunStore for RunStoreAdapter {
                 run_id: run_id.to_string(),
                 from_index: None,
             })
+            .await
             .map(|v| v.len() as u64)
             .map_err(to_store_error)?;
         self.inner
@@ -584,6 +593,7 @@ impl RunStore for RunStoreAdapter {
                 expected_next_index: log_len,
                 now: crate::runtime_driver::now_ms(),
             })
+            .await
             .map_err(to_store_error)
     }
 }

@@ -79,7 +79,7 @@ async fn typed_input_rejects_missing_field() {
     );
 
     // 校验失败不该留下半个 run：没有 STEP_* 事件。
-    let events = store.get_events(&outcome.run_id).unwrap();
+    let events = store.get_events(&outcome.run_id).await.unwrap();
     assert!(
         !events
             .iter()

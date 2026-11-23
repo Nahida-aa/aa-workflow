@@ -127,17 +127,17 @@ async fn demo_compensate_reverse_undo() {
                     "undo-a",
                     move |sc: StepCtx| undo_a(sc),
                     aa_workflow_core::RetryPolicy::new(1, aa_workflow_core::Backoff::Fixed { base_ms: 1 }),
-                )?;
+                ).await?;
                 ctx.compensate(
                     "undo-b",
                     move |sc: StepCtx| undo_b(sc),
                     aa_workflow_core::RetryPolicy::new(1, aa_workflow_core::Backoff::Fixed { base_ms: 1 }),
-                )?;
+                ).await?;
                 ctx.compensate(
                     "undo-c",
                     move |sc: StepCtx| undo_c(sc),
                     aa_workflow_core::RetryPolicy::new(1, aa_workflow_core::Backoff::Fixed { base_ms: 1 }),
-                )?;
+                ).await?;
                 let _ = ctx
                     .step("a", move |_sc: StepCtx| async move { Ok(serde_json::Value::Null) })
                     .await?;

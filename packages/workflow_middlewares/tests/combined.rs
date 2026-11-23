@@ -155,7 +155,7 @@ async fn outer_reseed_short_circuits_before_interim_goals_can_park() {
     );
 
     // a 在 c2 的日志里有 checkpoint（被复用），且带溯源。
-    let imported_a = store.get_events("c2").unwrap().into_iter().any(|e| {
+    let imported_a = store.get_events("c2").await.unwrap().into_iter().any(|e| {
         matches!(
             e,
             WorkflowEvent::StepFinished { step_id, meta: Some(m), .. }
@@ -221,7 +221,7 @@ async fn outer_interim_goals_parks_before_reseed_short_circuits() {
         out.status,
         RunStatus::Paused,
         "反序（interim_goals 在外层）应能泊车；实际 err={:?}",
-        store.get_run_state("d2").unwrap().unwrap().error
+        store.get_run_state("d2").await.unwrap().unwrap().error
     );
 }
 /// 两个**都能泊车**的中间件同时挂：外层先判定，内层被遮蔽。

@@ -73,9 +73,9 @@ impl std::error::Error for WorkflowCancelled {}
 /// Checked at step entry and at attempt boundaries; store-agnostic (works for
 /// any [`RunStore`], including filesystem stores without a notification
 /// channel).
-fn is_cancelled(store: &Arc<dyn RunStore>, run_id: &str) -> bool {
+async fn is_cancelled(store: &Arc<dyn RunStore>, run_id: &str) -> bool {
     store
-        .get_run_state(run_id)
+        .get_run_state(run_id).await
         .ok()
         .flatten()
         .map(|st| st.status == RunStatus::Aborted)
@@ -89,8 +89,8 @@ fn is_cancelled(store: &Arc<dyn RunStore>, run_id: &str) -> bool {
 /// only observed when a driver re-invokes `run_workflow`, which then ends the
 /// run `Aborted` at its first boundary. A second cancel on an already-terminal
 /// run is a no-op `Ok(())`.
-pub fn cancel_run(store: &dyn RunStore, run_id: &str) -> Result<(), WorkflowError> {
-    let Some(mut st) = store.get_run_state(run_id)? else {
+pub async fn cancel_run(store: &dyn RunStore, run_id: &str) -> Result<(), WorkflowError> {
+    let Some(mut st) = store.get_run_state(run_id).await? else {
         return Err(WorkflowError::RunNotFound(run_id.to_string()));
     };
     if matches!(
@@ -104,7 +104,7 @@ pub fn cancel_run(store: &dyn RunStore, run_id: &str) -> Result<(), WorkflowErro
     st.waiting_for = None;
     st.pending_approval = None;
     st.updated_at = now_ms();
-    store.set_run_state(run_id, &st)?;
+    store.set_run_state(run_id, &st).await?;
     Ok(())
 }
 
@@ -164,14 +164,14 @@ pub(crate) async fn run_compensations(
         run_id: run_id.to_string(),
         error: RunError::from_anyhow(original),
     };
-    if let Err(e) = engine.append(&started) {
+    if let Err(e) = engine.append(&started).await {
         return Err((String::new(), RunError::from_anyhow(&anyhow::anyhow!(e))));
     }
 
     // 跨重启跳过：日志里已有 COMPENSATION_COMPLETED 的补偿不再重复。
     let log = engine
         .store
-        .get_events(run_id)
+        .get_events(run_id).await
         .map_err(|e| (String::new(), RunError::from_anyhow(&anyhow::anyhow!(e))))?;
     let done = |cid: &str| {
         log.iter().any(|e| {
@@ -204,7 +204,7 @@ pub(crate) async fn run_compensations(
                         run_id: run_id.to_string(),
                         compensation_id: comp.id.clone(),
                     };
-                    if let Err(e) = engine.append(&ev) {
+                    if let Err(e) = engine.append(&ev).await {
                         return Err((
                             comp.id.clone(),
                             RunError::from_anyhow(&anyhow::anyhow!(e)),
@@ -221,7 +221,7 @@ pub(crate) async fn run_compensations(
                             compensation_id: comp.id.clone(),
                             error: err.clone(),
                         };
-                        if let Err(e) = engine.append(&ev) {
+                        if let Err(e) = engine.append(&ev).await {
                             return Err((
                                 comp.id.clone(),
                                 RunError::from_anyhow(&anyhow::anyhow!(e)),
@@ -272,7 +272,7 @@ pub struct EngineRuntime {
     ///
     /// **它不是权威长度。** 并发 step（`try_join!`）会同时读到同一个值，第二个
     /// 落盘时 store 返回 `Conflict { actual }`——那时以 `actual` 为准（见
-    /// [`Self::append`]）。权威长度永远是 `store.get_events(run_id).len()`；
+    /// [`Self::append`]）。权威长度永远是 `store.get_events(run_id).await.len()`；
     /// 这个字段只是一份缓存，避免每次追加都扫一遍日志。
     ///
     /// 叫 `next_log_index` 而不是 `log_len`：代码里它的每个用处都是「作为
@@ -496,14 +496,14 @@ fn is_terminal_of(step_id: &str) -> impl Fn(&WorkflowEvent) -> bool + '_ {
 /// **本函数不碰 live 表**。live 投影是本仓独有的派生状态（上游的重放短路
 /// 直接查 `history` 数组，日志就是内存状态），它的同步由调用方做——
 /// [`EngineRuntime::append`] 知道自己在为哪个 engine 记账。
-pub(crate) fn emit_and_append(
+pub(crate) async fn emit_and_append(
     run_store: &dyn crate::run_store::RunStore,
     run_id: &str,
     index: usize,
-    emit: &dyn Fn(&WorkflowEvent),
+    emit: &(dyn Fn(&WorkflowEvent) + Sync),
     event: &WorkflowEvent,
 ) -> Result<(), WorkflowError> {
-    run_store.append_event(run_id, index, event)?;
+    run_store.append_event(run_id, index, event).await?;
     emit(event);
     Ok(())
 }
@@ -529,12 +529,12 @@ impl EngineRuntime {
     ///
     /// 落盘成功后追加进 [`Self::history`]（内存日志副本），失败时**不 emit、
     /// 不进 history**——订阅者与重放短路都不该看到日志里没有的事件。
-    fn append(&self, ev: &WorkflowEvent) -> Result<(), WorkflowError> {
+    async fn append(&self, ev: &WorkflowEvent) -> Result<(), WorkflowError> {
         {
             let emit = |e: &WorkflowEvent| self.publish(e);
             loop {
                 let idx = self.next_log_index.load(Ordering::Acquire);
-                match emit_and_append(self.store.as_ref(), &self.run_id, idx, &emit, ev) {
+                match emit_and_append(self.store.as_ref(), &self.run_id, idx, &emit, ev).await {
                     Ok(()) => {
                         self.next_log_index.store(idx + 1, Ordering::Release);
                         break;
@@ -593,7 +593,7 @@ impl EngineRuntime {
     /// 日志的原因（与上游 `findCheckpoint` 那一步同义）。
     ///
     /// [registerCompensation]: https://github.com/TanStack/workflow/blob/main/packages/workflow-core/src/engine/run-workflow.ts
-    pub(crate) fn register_compensation(
+    pub(crate) async fn register_compensation(
         &self,
         compensation_id: &str,
     ) -> Result<(), WorkflowError> {
@@ -628,7 +628,7 @@ impl EngineRuntime {
             run_id: self.run_id.clone(),
             compensation_id: compensation_id.to_string(),
         };
-        self.append(&ev)
+        self.append(&ev).await
     }
 
     /// Diff [`prev_state_snapshot`](Self::prev_state_snapshot) vs
@@ -765,7 +765,7 @@ let ev = WorkflowEvent::StepFinished {
     }],
     meta,
 };
-engine.append(&ev)?;
+engine.append(&ev).await?;
 Ok(result)
 }
 
@@ -820,7 +820,7 @@ where
     Fut: Future<Output = anyhow::Result<T>> + Send + 'static,
 {
     // Cancelled run → stop driving at this boundary.
-    if is_cancelled(&engine.store, &engine.run_id) {
+    if is_cancelled(&engine.store, &engine.run_id).await {
         return Err(WorkflowCancelled.into());
     }
     // **Step 中间件层**（本仓有意扩展：TS 靠覆盖 ctx.step 达到同样能力）。
@@ -1042,7 +1042,7 @@ where
                 step_id: step_id.to_string(),
                 attempt,
             };
-            engine.append(&ev)?;
+            engine.append(&ev).await?;
         }
         // 保留 `anyhow::Error` 而非提前字符串化，这样 attempt 能记下结构化的
         // `RunError`（attempts 会落进 STEP_FAILED，供重试与审计回看）。
@@ -1091,7 +1091,7 @@ where
                     attempts: attempts.clone(),
                     meta: None,
                 };
-                engine.append(&step_finished_event)?;
+                engine.append(&step_finished_event).await?;
                 return Ok(result);
             }
             Err(err) => {
@@ -1113,7 +1113,7 @@ where
                 let retrying = retry.is_some() && attempt < max_attempts;
                 let durable = retry.as_ref().map(|p| p.durable).unwrap_or(false);
                 if retrying && durable {
-                    if is_cancelled(&engine.store, &engine.run_id) {
+                    if is_cancelled(&engine.store, &engine.run_id).await {
                         return Err(WorkflowCancelled.into());
                     }
                     let delay = retry
@@ -1130,7 +1130,7 @@ where
                         error: run_err.clone(),
                         attempts: attempts.clone(),
                     };
-                    engine.append(&ev)?;
+                    engine.append(&ev).await?;
                     // 泊车（__timer + deadline）：本 drive 结束，驱动循环到期
                     // 重驱（自轮询 25ms 或 sweep）→ exec_step 入口的 pending
                     // 检查以到期后的时间放行 → 该步骤以携带的 attempts 续跑。
@@ -1147,7 +1147,7 @@ where
                     return Err(WorkflowParked.into());
                 }
                 if retrying {
-                    if is_cancelled(&engine.store, &engine.run_id) {
+                    if is_cancelled(&engine.store, &engine.run_id).await {
                         return Err(WorkflowCancelled.into());
                     }
                     let delay = retry
@@ -1164,7 +1164,7 @@ where
                     error: run_err.clone(),
                     attempts,
                 };
-                engine.append(&ev)?;
+                engine.append(&ev).await?;
                 // 原样上抛，不加 `step `x` failed:` 前缀：step 身份已经在
                 // `step_id` 字段里（结构化），再包一层会让同一个错误的 message
                 // 在 step 层与 run 层变成两个值。TanStack 也是直接 rethrow
@@ -1186,7 +1186,7 @@ pub const DEFAULT_MIN_YIELD_REMAINING_MS: u64 = 1000;
 /// sees the **same** clock across resumes. The checkpoint id uses a
 /// per-invocation atomic counter (`__now-0`, `__now-1`, …) so concurrent
 /// calls stay unique; replay permutes them to the same ids and reads the cache.
-pub fn exec_now(engine: &Arc<EngineRuntime>, id: Option<&str>) -> anyhow::Result<u64> {
+pub async fn exec_now(engine: &Arc<EngineRuntime>, id: Option<&str>) -> anyhow::Result<u64> {
     // 上游：`options?.id ?? `__now-${engine.counters.now++}``
     let step_id = match id {
         Some(id) => id.to_string(),
@@ -1207,14 +1207,14 @@ pub fn exec_now(engine: &Arc<EngineRuntime>, id: Option<&str>) -> anyhow::Result
         step_id,
         value,
     };
-    engine.append(&ev)?;
+    engine.append(&ev).await?;
     Ok(value)
 }
 
 /// Deterministic id behind [`WorkflowCtx::uuid`](crate::define::WorkflowCtx::uuid)
 /// (TanStack `ctx.uuid`): a generated UUIDv4, recorded as a `UuidRecorded`
 /// checkpoint. On replay the recorded id is served — stable across resumes.
-pub fn exec_uuid(engine: &Arc<EngineRuntime>, id: Option<&str>) -> anyhow::Result<String> {
+pub async fn exec_uuid(engine: &Arc<EngineRuntime>, id: Option<&str>) -> anyhow::Result<String> {
     let step_id = match id {
         Some(id) => id.to_string(),
         None => format!(
@@ -1235,7 +1235,7 @@ pub fn exec_uuid(engine: &Arc<EngineRuntime>, id: Option<&str>) -> anyhow::Resul
         step_id,
         value: value.clone(),
     };
-    engine.append(&ev)?;
+    engine.append(&ev).await?;
     Ok(value)
 }
 
@@ -1304,7 +1304,7 @@ pub async fn exec_pause_with(
     } else {
         engine
             .store
-            .consume_buffered_signal(&engine.run_id, step_id, signal_name)
+            .consume_buffered_signal(&engine.run_id, step_id, signal_name).await
             .ok()
             .flatten()
     };
@@ -1316,7 +1316,7 @@ pub async fn exec_pause_with(
         //
         // 走 `emit_and_append`（经 [`EngineRuntime::append`]）而不是自己写
         // CAS 循环：游标管理、索引推进、live 同步都只该有一份实现。
-        engine.append(&ev)?;
+        engine.append(&ev).await?;
         let payload = match ev {
             WorkflowEvent::SignalResolved { payload, .. } => payload,
             // 收件箱只应产出 SignalResolved；别的形状按空处理。
@@ -1334,7 +1334,7 @@ pub async fn exec_pause_with(
         }
         return Ok(payload);
     }
-    if let Some(payload) = find_resume(&engine.store, &engine.run_id, step_id) {
+    if let Some(payload) = find_resume(&engine.store, &engine.run_id, step_id).await {
         // 恢复路径：投递进来的 payload 先过声明的 schema 再交给 workflow。
         // 校验失败 = run 报错（不是 park），因为数据已经在这了、run 不会
         // 重新等待。
@@ -1349,12 +1349,12 @@ pub async fn exec_pause_with(
     }
     // 被取消的 run 不该再挂起——直接以 Aborted 展开（原来由轮询循环里的检查
     // 负责，轮询删掉后移到这里：挂起是最后一个还能观察 flag 的边界）。
-    if is_cancelled(&engine.store, &engine.run_id) {
+    if is_cancelled(&engine.store, &engine.run_id).await {
         return Err(WorkflowCancelled.into());
     }
 
     let already_paused = {
-        let events = engine.store.get_events(&engine.run_id)?;
+        let events = engine.store.get_events(&engine.run_id).await?;
         events.iter().any(
             |ev| match ev {
                 WorkflowEvent::SignalAwaited { step_id: id, .. }
@@ -1386,7 +1386,7 @@ pub async fn exec_pause_with(
                 meta: meta.clone(),
             }
         };
-        engine.append(&ev)?;
+        engine.append(&ev).await?;
     }
     // 投影 RunState 信封（fresh 与崩溃后 replay 一致：都展示 Paused + 等待说明）。
     project_run_wait(
@@ -1408,7 +1408,8 @@ pub async fn exec_pause_with(
                 meta,
             }
         },
-    );
+    )
+    .await;
 
     // Park: hand control back to the drive. Everything the outside world needs
     // (checkpoint, `deadline`, RunState projection) is already durable.
@@ -1420,12 +1421,12 @@ pub async fn exec_pause_with(
 /// 恢复事件已按类型拆开（对齐上游 `SIGNAL_RESOLVED` / `APPROVAL_RESOLVED`）：
 /// 信号返回其 `payload`；审批返回结构化的 `{approved, feedback}`（上游审批
 /// 事件没有 payload 字段）。
-fn find_resume(
+async fn find_resume(
     store: &Arc<dyn RunStore>,
     run_id: &str,
     step_id: &str,
 ) -> Option<serde_json::Value> {
-    let events = store.get_events(run_id).ok()?;
+    let events = store.get_events(run_id).await.ok()?;
     events.iter().find_map(|ev| match ev {
         WorkflowEvent::SignalResolved {
             step_id: id,
@@ -1505,8 +1506,8 @@ impl WaitKind {
 /// 数据派生，两个镜像分别填对应的一个、清另一个。上游
 /// `run-workflow.ts:950`/`:1059` 也是三处同写。四处赋值（规范形 + 两镜像 ×2
 /// 互清）都在这里，**别在别处再单独改镜像** —— 漂移了就对不上了。
-fn project_run_wait(store: &Arc<dyn RunStore>, run_id: &str, kind: WaitKind) {
-    if let Ok(Some(mut st)) = store.get_run_state(run_id) {
+async fn project_run_wait(store: &Arc<dyn RunStore>, run_id: &str, kind: WaitKind) {
+    if let Ok(Some(mut st)) = store.get_run_state(run_id).await {
         // 已终局（含被 cancel_run 置为 Aborted）——不覆盖成 Paused。
         if matches!(
             st.status,
@@ -1550,7 +1551,7 @@ fn project_run_wait(store: &Arc<dyn RunStore>, run_id: &str, kind: WaitKind) {
                 st.waiting_for = None;
             }
         }
-        let _ = store.set_run_state(run_id, &st);
+        let _ = store.set_run_state(run_id, &st).await;
     }
 }
 
@@ -1560,14 +1561,14 @@ fn project_run_wait(store: &Arc<dyn RunStore>, run_id: &str, kind: WaitKind) {
 /// 这是 [`emit_and_append`] 去掉 `emit` 的版本：runtime 层没有 `EngineRuntime`
 /// （拿不到那个扇出通道），它只需要「把事件写进日志」——事件本身由
 /// [`run_workflow`] 之后的 drive 从日志读出来再广播。
-pub(crate) fn append_with_cas(
+pub(crate) async fn append_with_cas(
     store: &dyn RunStore,
     run_id: &str,
     event: WorkflowEvent,
 ) -> Result<(), StoreError> {
     loop {
-        let n = store.get_events(run_id)?.len();
-        match store.append_event(run_id, n, &event) {
+        let n = store.get_events(run_id).await?.len();
+        match store.append_event(run_id, n, &event).await {
             Ok(()) => return Ok(()),
             Err(StoreError::Conflict { .. }) => continue,
             Err(e) => return Err(e),
@@ -1812,7 +1813,7 @@ mod tests {
         assert_eq!(out.status, RunStatus::Errored);
         // 关键：step 走了既有的失败路径，所以 STEP_FAILED 落了日志。
         // 若当初用 `?` 提前返回，step 会永远停在 Running 且零事件。
-        let events = store.get_events(&out.run_id).unwrap();
+        let events = store.get_events(&out.run_id).await.unwrap();
         assert!(
             events
                 .iter()
@@ -2133,7 +2134,7 @@ mod tests {
         .outcome().await
         .unwrap();
         assert_eq!(out.status, RunStatus::Finished);
-        let events = store.get_events(&out.run_id).unwrap();
+        let events = store.get_events(&out.run_id).await.unwrap();
         let fin = events.iter().find_map(|e| match e {
             WorkflowEvent::StepFinished {
                 step_id, attempts, ..
@@ -2164,7 +2165,7 @@ mod tests {
         .unwrap();
         assert_eq!(out.status, RunStatus::Errored);
 
-        let events = store.get_events(&out.run_id).unwrap();
+        let events = store.get_events(&out.run_id).await.unwrap();
         let attempts = events
             .iter()
             .find_map(|e| match e {
@@ -2186,7 +2187,7 @@ mod tests {
         }
 
         // 结构化错误会随事件日志持久化，replay 能读回。
-        let back: Vec<WorkflowEvent> = store.get_events(&out.run_id).unwrap();
+        let back: Vec<WorkflowEvent> = store.get_events(&out.run_id).await.unwrap();
         let again = back.iter().find_map(|e| match e {
             WorkflowEvent::StepFailed { attempts, .. } => Some(attempts),
             _ => None,
@@ -2217,7 +2218,7 @@ mod tests {
         .unwrap();
         assert_eq!(out.status, RunStatus::Errored);
         assert!(out.error.unwrap().message.contains("boom"));
-        let events = store.get_events(&out.run_id).unwrap();
+        let events = store.get_events(&out.run_id).await.unwrap();
         let failed = events.iter().find_map(|e| match e {
             WorkflowEvent::StepFailed {
                 step_id, attempts, ..
@@ -2326,9 +2327,9 @@ mod tests {
             attempts: vec![],
             meta: None,
         };
-        store.append_event("r1", 0, &ev).unwrap();
-        store.append_event("r1", 1, &ev).unwrap();
-        let err = store.append_event("r1", 1, &ev).unwrap_err();
+        store.append_event("r1", 0, &ev).await.unwrap();
+        store.append_event("r1", 1, &ev).await.unwrap();
+        let err = store.append_event("r1", 1, &ev).await.unwrap_err();
         match err {
             crate::error::StoreError::Conflict {
                 expected, actual, ..
@@ -2346,7 +2347,7 @@ mod tests {
         pred: impl Fn(&WorkflowEvent) -> bool,
     ) {
         for _ in 0..2000 {
-            if store.get_events(run_id).unwrap().iter().any(|e| pred(e)) {
+            if store.get_events(run_id).await.unwrap().iter().any(|e| pred(e)) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2360,7 +2361,7 @@ mod tests {
         pred: impl Fn(&WorkflowEvent) -> bool,
     ) -> usize {
         store
-            .get_events(run_id)
+            .get_events(run_id).await
             .unwrap()
             .iter()
             .filter(|e| pred(e))
@@ -2406,7 +2407,7 @@ mod tests {
             WorkflowEvent::RunFinished { .. } | WorkflowEvent::RunErrored { .. }
         )), 0, "挂起不得写终态事件");
 
-        let st = store.get_run_state("r1").unwrap().unwrap();
+        let st = store.get_run_state("r1").await.unwrap().unwrap();
         assert_eq!(st.status, RunStatus::Paused);
         let pa = st
             .pending_approval
@@ -2437,7 +2438,7 @@ mod tests {
             Some(serde_json::json!({ "approved": true, "feedback": null })),
             "审批恢复是结构化的 approved/feedback，不是任意 payload"
         );
-        let st = store.get_run_state("r1").unwrap().unwrap();
+        let st = store.get_run_state("r1").await.unwrap().unwrap();
         assert!(
             st.waiting_for.is_none() && st.pending_approval.is_none(),
             "恢复后投影应被清除"
@@ -2460,7 +2461,7 @@ mod tests {
             )),
             1
         );
-        assert!(store.get_events("r1").unwrap().iter().any(|e| matches!(
+        assert!(store.get_events("r1").await.unwrap().iter().any(|e| matches!(
             e,
             WorkflowEvent::StepFinished { step_id, .. } if step_id == "ship"
         )));
@@ -2504,7 +2505,7 @@ mod tests {
             .unwrap();
         assert!(
             matches!(
-                &store.get_events("r1").unwrap()[0],
+                &store.get_events("r1").await.unwrap()[0],
                 WorkflowEvent::SignalResolved { .. }
             ),
             "SignalResolved 是日志第一条"
@@ -2656,7 +2657,7 @@ mod tests {
         )), 0, "挂起不得写终态事件");
 
         // sleep 的投影：status=Paused + waiting_for{signal_name:"__timer", deadline}
-        let st = store.get_run_state("s1").unwrap().unwrap();
+        let st = store.get_run_state("s1").await.unwrap().unwrap();
         assert_eq!(st.status, RunStatus::Paused);
         let w = st
             .waiting_for
@@ -2683,13 +2684,13 @@ mod tests {
         .outcome().await
         .unwrap();
         assert_eq!(out.status, RunStatus::Finished);
-        let st = store.get_run_state("s1").unwrap().unwrap();
+        let st = store.get_run_state("s1").await.unwrap().unwrap();
         assert!(
             st.waiting_for.is_none() && st.pending_approval.is_none(),
             "恢复后投影应清除"
         );
 
-        let evs = store.get_events("s1").unwrap();
+        let evs = store.get_events("s1").await.unwrap();
         let resume = evs.iter().find_map(|e| match e {
             WorkflowEvent::SignalResolved {
                 step_id, payload, ..
@@ -2794,7 +2795,7 @@ mod tests {
         .outcome().await
         .unwrap();
         assert_eq!(out.status, RunStatus::Paused);
-        let st = store.get_run_state("ne1").unwrap().unwrap();
+        let st = store.get_run_state("ne1").await.unwrap().unwrap();
         assert_eq!(st.status, RunStatus::Paused);
         let w = st
             .waiting_for
@@ -2871,7 +2872,7 @@ mod tests {
 
         // 事件只落一条（重放不重复 append）。
         let n = store
-            .get_events("os1")
+            .get_events("os1").await
             .unwrap()
             .iter()
             .filter(|e| matches!(e, WorkflowEvent::SignalResolved { .. }))
@@ -2990,7 +2991,7 @@ mod tests {
         .outcome().await
         .unwrap();
         assert_eq!(out.status, RunStatus::Paused);
-        let st = store.get_run_state(&out.run_id).unwrap().unwrap();
+        let st = store.get_run_state(&out.run_id).await.unwrap().unwrap();
         let w = st.waiting_for.as_ref().expect("应投影 waiting_for");
         assert_eq!(
             w.deadline,
@@ -3013,7 +3014,7 @@ mod tests {
         .outcome().await
         .unwrap();
         assert_eq!(out.status, RunStatus::Finished);
-        let evs = store.get_events(&out.run_id).unwrap();
+        let evs = store.get_events(&out.run_id).await.unwrap();
         assert!(evs.iter().any(|e| matches!(
             e,
             WorkflowEvent::StepFinished { step_id, .. } if step_id == "after"
@@ -3041,7 +3042,7 @@ mod tests {
         .unwrap();
         assert_eq!(out.status, RunStatus::Paused);
 
-        let st = store.get_run_state("stu1").unwrap().unwrap();
+        let st = store.get_run_state("stu1").await.unwrap().unwrap();
         let w = st.waiting_for.as_ref().expect("sleep_until 应投影 waiting_for");
         assert_eq!(w.step_id.as_deref(), Some("cooldown"));
         assert_eq!(w.signal_name, "__timer");
@@ -3096,7 +3097,7 @@ mod tests {
         );
         assert!(
             store
-                .get_events("em1")
+                .get_events("em1").await
                 .unwrap()
                 .iter()
                 .all(|e| !matches!(e, WorkflowEvent::Custom { .. }))
@@ -3172,7 +3173,7 @@ mod tests {
         );
         // 两对 now/uuid 都用独立的确定性 id（__now-0/__now-1、__uuid-0/__uuid-1）。
         let ids: Vec<String> = store
-            .get_events("det1")
+            .get_events("det1").await
             .unwrap()
             .iter()
             .filter_map(|e| match e {
@@ -3243,7 +3244,7 @@ mod tests {
         );
         assert!(
             store
-                .get_events("named1")
+                .get_events("named1").await
                 .unwrap()
                 .iter()
                 .filter(|e| matches!(e, WorkflowEvent::NowRecorded { .. }))
@@ -3347,12 +3348,12 @@ mod tests {
         .outcome().await
         .unwrap();
         assert_eq!(out.status, RunStatus::Paused);
-        let st = store.get_run_state("ca1").unwrap().unwrap();
+        let st = store.get_run_state("ca1").await.unwrap().unwrap();
         assert_eq!(st.status, RunStatus::Paused);
 
         cancel_run(store.as_ref(), "ca1").unwrap();
         assert_eq!(
-            store.get_run_state("ca1").unwrap().unwrap().status,
+            store.get_run_state("ca1").await.unwrap().unwrap().status,
             RunStatus::Aborted,
             "cancel 只翻 RunState——挂起中没人执行"
         );
@@ -3373,7 +3374,7 @@ mod tests {
         assert_eq!(out.error.unwrap().name, "Aborted");
         assert!(out.output.is_none());
 
-        let st = store.get_run_state("ca1").unwrap().unwrap();
+        let st = store.get_run_state("ca1").await.unwrap().unwrap();
         assert_eq!(st.status, RunStatus::Aborted, "RunState 终态应为 Aborted");
         // 结构化错误名 + 机器可读 code，不用再去匹配 message 字符串。
         assert_eq!(
@@ -3394,7 +3395,7 @@ mod tests {
         assert_eq!(again.status, RunStatus::Aborted, "Aborted 是锁存的终态");
 
         // 日志没有 Finished 终态，也不应落在 running/paused（cancel 后不再驱动）
-        let evs = store.get_events("ca1").unwrap();
+        let evs = store.get_events("ca1").await.unwrap();
         let terminal_finished = evs
             .iter()
             .any(|e| matches!(e, WorkflowEvent::RunFinished { .. }));
@@ -3480,7 +3481,7 @@ mod tests {
         // 挂起期间 cancel：只翻 RunState，没人「立刻」响应。
         cancel_run(store.as_ref(), "ca2").unwrap();
         assert_eq!(
-            store.get_run_state("ca2").unwrap().unwrap().status,
+            store.get_run_state("ca2").await.unwrap().unwrap().status,
             RunStatus::Aborted
         );
 
@@ -3604,7 +3605,7 @@ mod tests {
         .outcome().await
         .unwrap();
         assert_eq!(out.status, RunStatus::Paused);
-        let st = store.get_run_state("y1").unwrap().unwrap();
+        let st = store.get_run_state("y1").await.unwrap().unwrap();
         let w = st.waiting_for.as_ref().expect("yield 应投影 waiting_for");
         assert!(w.step_id.as_deref().unwrap().starts_with("__yield-"));
         assert_eq!(w.signal_name, "__timer");
@@ -3626,7 +3627,7 @@ mod tests {
         .outcome().await
         .unwrap();
         assert_eq!(out.status, RunStatus::Finished);
-        assert!(store.get_events("y1").unwrap().iter().any(
+        assert!(store.get_events("y1").await.unwrap().iter().any(
             |e| matches!(e, WorkflowEvent::StepFinished { step_id, .. } if step_id == "after")
         ));
 
@@ -3669,7 +3670,7 @@ mod tests {
         .outcome().await
         .unwrap();
         assert_eq!(out.status, RunStatus::Paused);
-        let st = store.get_run_state("y2").unwrap().unwrap();
+        let st = store.get_run_state("y2").await.unwrap().unwrap();
         assert_eq!(
             st.waiting_for.as_ref().unwrap().deadline,
             Some(resume_at),
@@ -3781,7 +3782,7 @@ mod tests {
             RunStatus::Errored,
             "step 自己的 retry=1 → 失败"
         );
-        let st = store2.get_run_state(&out2.run_id).unwrap().unwrap();
+        let st = store2.get_run_state(&out2.run_id).await.unwrap().unwrap();
         assert!(
             st.status == RunStatus::Errored
                 && count_events(&store2, &out2.run_id, |e| matches!(
@@ -3946,7 +3947,7 @@ mod tests {
         .unwrap();
         assert_eq!(out.status, RunStatus::Paused);
 
-        let st = store.get_run_state("aw1").unwrap().unwrap();
+        let st = store.get_run_state("aw1").await.unwrap().unwrap();
         // 规范形：一个元素，带 type 判别式
         assert_eq!(st.awaiting.len(), 1, "awaiting 应恰好一个元素");
         let crate::run_store::RunAwaitable::Signal {
@@ -3972,7 +3973,7 @@ mod tests {
         assert!(st.pending_approval.is_none(), "signal 等待不该有 approval 镜像");
 
         // meta 同时落进 SignalAwaited checkpoint（观察者只读日志也能拿到）
-        let evs = store.get_events("aw1").unwrap();
+        let evs = store.get_events("aw1").await.unwrap();
         let paused = evs
             .iter()
             .find_map(|e| match e {
@@ -4010,7 +4011,7 @@ mod tests {
         .unwrap();
         assert_eq!(out.status, RunStatus::Paused);
 
-        let st = store.get_run_state("ap1").unwrap().unwrap();
+        let st = store.get_run_state("ap1").await.unwrap().unwrap();
         assert!(matches!(
             st.awaiting[0],
             crate::run_store::RunAwaitable::Approval { .. }
@@ -4136,7 +4137,7 @@ mod tests {
         )
         .outcome().await
         .unwrap();
-        let st = store.get_run_state("pl1").unwrap().unwrap();
+        let st = store.get_run_state("pl1").await.unwrap().unwrap();
         let w = st.waiting_for.as_ref().unwrap();
         assert_eq!(w.deadline, None, "无选项时不该有 deadline");
         assert_eq!(w.meta, None, "无选项时不该有 meta");
