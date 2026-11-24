@@ -150,16 +150,21 @@ impl MiddlewareServer for DagPoliciesMw {
                 }
 
                 // 源结果 → lookup（排除重跑名单），带源下标（溯源）。
+                // 不要求 result 非 null：有些工作流（如 LocalDub）刻意让节点返回
+                // Value::Null，数据走盘上文件；复用只表示「这步跑过了、不入边数据」。
+                // null 时导入的也是 Value::Null，消费方 body 不读 deps 即可。
                 for (index, e) in source_log.iter().enumerate() {
                     if let aa_workflow_core::event::WorkflowEvent::StepFinished {
                         step_id,
-                        result: Some(result),
+                        result,
                         ..
                     } = e
                     {
                         if !redo.contains(step_id) {
-                            st.lookup
-                                .insert(step_id.clone(), (result.clone(), index));
+                            st.lookup.insert(
+                                step_id.clone(),
+                                (result.clone().unwrap_or(serde_json::Value::Null), index),
+                            );
                         }
                     }
                 }
