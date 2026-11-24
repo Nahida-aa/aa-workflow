@@ -13,62 +13,44 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aa_workflow_middlewares::{DagPlan, DagShape, GetEvents};
 use aa_workflow_runtime::run_store_adapter::WorkflowExecutionStore;
 use aa_workflow_core::{StepMeta, WorkflowEvent};
 use aa_workflow_runtime::types::ReadEventsArgs;
 use aa_workflow_runtime::{
     WorkflowRegistration, WorkflowRuntimeConfig, WorkflowRuntimeDefinition,
     WorkflowRuntimeRunResult, WorkflowRuntimeRunResultKind, WorkflowRuntimeStartRunArgs,
-    create_run_store_adapter, define_workflow_runtime,
+    define_workflow_runtime,
 };
 use example_store_file::dub_sf_ocr::dub_sf_ocr_dag;
 use example_store_file::dub_sf_ocr::{DubEnv, DubService};
 use example_store_file::FileExecutionStore;
 
-/// runtime 组装：FileExecutionStore + dag 策略版 dub 注册 + `get_events` 注入。
+/// runtime 组装：FileExecutionStore + dag 策略版 dub 注册。
 ///
-/// `get_events` 从同一把 store 读（adapter 升格到 core `RunStore` 面）——
-/// `dag_policies` 靠它读 run1 的日志算 redo 名单。缺省环境（全健康）。
-fn get_runtime(base: &PathBuf) -> (Arc<WorkflowRuntimeDefinition>, Arc<GetEvents>) {
+/// `dag_policies` 现在经 `args.get_events` 读源 run 日志（引擎自带 store），
+/// 不再需要外部注入读日志闭包。缺省环境（全健康）。
+fn get_runtime(base: &PathBuf) -> Arc<WorkflowRuntimeDefinition> {
     get_runtime_with_env(base, &DubEnv::default())
 }
 
 /// 同上，但环境由调用方注入：测试持一份 [`DubEnv`] handle，`load` 闭包克隆
 /// 同一柄进定义——「服务故障 / 恢复」由测试改环境表达，对后续 run 生效。
-fn get_runtime_with_env(
-    base: &PathBuf,
-    env: &DubEnv,
-) -> (Arc<WorkflowRuntimeDefinition>, Arc<GetEvents>) {
+fn get_runtime_with_env(base: &PathBuf, env: &DubEnv) -> Arc<WorkflowRuntimeDefinition> {
     let store: Arc<dyn WorkflowExecutionStore> = Arc::new(FileExecutionStore::new(base));
-    // `get_events` 闭包持有 adapter（Arc<dyn RunStore>，Clone ✓）
-    let adapter = create_run_store_adapter(store.clone());
-    let get_events: Arc<GetEvents> = Arc::new(move |run_id: &str| {
-        let adapter = adapter.clone();
-        Box::pin(async move { adapter.get_events(run_id).await.map_err(Into::into) })
-            as aa_workflow_core::define::BoxFuture<'_, _>
-    });
     let mut workflows = HashMap::new();
     workflows.insert(
         "dub-sf-ocr".to_string(),
         WorkflowRegistration {
             load: {
-                let get_events = Arc::clone(&get_events);
                 let env = env.clone();
-                Arc::new(move || {
-                    let get_events = Arc::clone(&get_events);
-                    dub_sf_ocr_dag(get_events, env.clone()).into()
-                })
+                Arc::new(move || dub_sf_ocr_dag(env.clone()).into())
             },
             previous_versions: HashMap::new(),
             version: None,
             schedules: vec![],
         },
     );
-    (
-        Arc::new(define_workflow_runtime(WorkflowRuntimeConfig::new(store, workflows)).unwrap()),
-        get_events,
-    )
+    Arc::new(define_workflow_runtime(WorkflowRuntimeConfig::new(store, workflows)).unwrap())
 }
 
 async fn start(
@@ -126,7 +108,7 @@ fn imported_steps(rt: &WorkflowRuntimeDefinition, run_id: &str) -> Vec<String> {
 /// 场景 ①：全量首跑——无 meta，中间件透明，10 步全真跑。
 #[tokio::test]
 async fn full_first_run() {
-    let (rt, _ge) = get_runtime(&temp_base("dag-full"));
+    let rt = get_runtime(&temp_base("dag-full"));
     let out = start(&rt, "dag:r1", serde_json::json!({ "video_dir": "/w/exp" }), None).await;
     assert!(matches!(out.kind, WorkflowRuntimeRunResultKind::Completed));
     let executed = executed_steps(&rt, "dag:r1");
@@ -137,7 +119,7 @@ async fn full_first_run() {
 /// 下游闭包 → 翻译轴 5 步真跑；人声轴 + OCR 链 5 步复用（带溯源）。
 #[tokio::test]
 async fn redo_reruns_the_translation_axis() {
-    let (rt, _ge) = get_runtime(&temp_base("dag-redo"));
+    let rt = get_runtime(&temp_base("dag-redo"));
     start(&rt, "dag:r1", serde_json::json!({ "video_dir": "/w/exp" }), None).await;
 
     let out = start(
@@ -172,7 +154,7 @@ async fn redo_reruns_the_translation_axis() {
 /// `split_audio` 入口泊车；`deliver_signal(__interim-goal)` 续驱补齐。
 #[tokio::test]
 async fn interim_goal_parks_then_resumes() {
-    let (rt, _ge) = get_runtime(&temp_base("dag-goal"));
+    let rt = get_runtime(&temp_base("dag-goal"));
     let out = start(
         &rt,
         "dag:g1",
@@ -225,13 +207,7 @@ async fn mismatched_registration_key_still_drives_start() {
     workflows.insert(
         "mismatched_key".to_string(),
         WorkflowRegistration {
-            load: {
-                let get_events = get_events_of(store.clone());
-                Arc::new(move || {
-                    let get_events = Arc::clone(&get_events);
-                    dub_sf_ocr_dag(get_events, DubEnv::default()).into()
-                })
-            },
+            load: Arc::new(|| dub_sf_ocr_dag(DubEnv::default()).into()),
             previous_versions: HashMap::new(),
             version: None,
             schedules: vec![],
@@ -253,16 +229,6 @@ async fn mismatched_registration_key_still_drives_start() {
     assert!(matches!(out.kind, WorkflowRuntimeRunResultKind::Completed));
 }
 
-/// get_events（读日志闭包）从 store 组装的公共提取——避免与上面重复。
-fn get_events_of(store: Arc<dyn WorkflowExecutionStore>) -> Arc<GetEvents> {
-    let adapter = create_run_store_adapter(store);
-    Arc::new(move |run_id: &str| {
-        let adapter = adapter.clone();
-        Box::pin(async move { adapter.get_events(run_id).await.map_err(Into::into) })
-            as aa_workflow_core::define::BoxFuture<'_, _>
-    })
-}
-
 /// 场景 ④：**步骤抛错 → reseed 型恢复（不指定目标的续驱）**——
 /// run1：**环境**故障（`service_down(Translate)`，翻译服务 503）→
 /// translate 抛错 → `Errored`（人声轴 + OCR 链 5 步成功在案，
@@ -281,7 +247,7 @@ fn get_events_of(store: Arc<dyn WorkflowExecutionStore>) -> Arc<GetEvents> {
 #[tokio::test]
 async fn errored_run_recovers_via_reseed_run() {
     let env = DubEnv::default();
-    let (rt, _ge) = get_runtime_with_env(&temp_base("dag-err"), &env);
+    let rt = get_runtime_with_env(&temp_base("dag-err"), &env);
 
     // run1：翻译服务故障（环境事件）→ errored（5 步成功在案）
     env.service_down(DubService::Translate);
@@ -341,7 +307,7 @@ async fn errored_run_recovers_via_reseed_run() {
 ///    `"zh"`）——节点读错 state 这里立即红。
 #[tokio::test]
 async fn dag_state_is_a_run_constant_zero_delta_events() {
-    let (rt, _ge) = get_runtime(&temp_base("dag-state"));
+    let rt = get_runtime(&temp_base("dag-state"));
     let out = start(&rt, "dag:s1", serde_json::json!({ "video_dir": "/w/const" }), None).await;
     assert!(matches!(out.kind, WorkflowRuntimeRunResultKind::Completed));
 

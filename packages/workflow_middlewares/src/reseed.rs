@@ -26,6 +26,12 @@
 //! 同一件事，Rust 版对齐为可叠加的
 //! [`MiddlewareServerFnArgs::wrap_step`]——装一个 tower `Layer`，
 //! 用 [`StepCall::skip`] 把源结果作为本 step 的 checkpoint 落盘。
+//!
+//! # 读源日志
+//!
+//! 引擎自带 store：`args.get_events(&plan.source_run_id)` 直接读源 run 的
+//! 事件日志，不需要构造期注入读闭包。事件 → 结果的转换见
+//! [`step_results_from_events`]（与 [`crate::dag_policies`] 共用一份）。
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -61,16 +67,12 @@ impl aa_workflow_core::define::MetaKey for ReseedKey {
 
 aa_workflow_core::impl_meta_accessors!(ReseedKey => ReseedAccess, reseed_plan, try_reseed_plan);
 
-/// 从源 run 读「step_id → 结果」。
+/// 从源 run 读「step_id → (结果, 源日志下标)」的读日志闭包。
 ///
-/// 返回的 map 应只包含该 run 日志里 `STEP_FINISHED` 的结果；`redo_set` 过滤由本
-/// 中间件负责（保持读函数简单）。
-/// 从源 run 读「step_id → (结果, 该事件在源日志里的下标)」。
-///
-/// 下标用于写 `STEP_FINISHED.meta.imported_from.index`——与引擎版
-/// `reseed_run` 的记录方式一致，丢了就只能事后重算。
-/// async（对齐 TanStack plugin hook 的 `Promise` 签名）：回调内部要从 async
-/// `RunStore` 读源 run 的事件日志，故返回 `BoxFuture`。
+/// 内置 [`reseed`] 已改走 [`MiddlewareServerFnArgs::get_events`] +
+/// [`step_results_from_events`]；这个别名留给**自写中间件**做构造期注入
+/// （仍是合法写法，与 [`crate::GetEvents`] 同款逃生门），输出形状应与
+/// [`step_results_from_events`] 一致。
 pub type LoadResults = dyn for<'a> Fn(&'a str) -> aa_workflow_core::define::BoxFuture<'a, anyhow::Result<HashMap<String, SourceStep>>>
     + Send
     + Sync;
@@ -84,13 +86,43 @@ pub struct SourceStep {
     pub index: usize,
 }
 
+/// 把源 run 的事件日志收成「step_id → 结果 + 源下标」。
+///
+/// 只取 `STEP_FINISHED`；`redo_set` 过滤由调用方负责。
+///
+/// `result: None` 记为 `Value::Null`——有些工作流（如 LocalDub）刻意让节点
+/// 返回 Null、数据走盘上文件，复用只表示「这步跑过了、不入边数据」，消费方
+/// 不读 deps 即可。
+///
+/// 内置的 [`reseed`] 与 [`crate::dag_policies`] 共用这一份，避免两处解析漂移。
+pub fn step_results_from_events(
+    events: &[aa_workflow_core::event::WorkflowEvent],
+) -> HashMap<String, SourceStep> {
+    let mut m = HashMap::with_capacity(events.len());
+    for (index, e) in events.iter().enumerate() {
+        if let aa_workflow_core::event::WorkflowEvent::StepFinished {
+            step_id, result, ..
+        } = e
+        {
+            m.insert(
+                step_id.clone(),
+                SourceStep {
+                    result: result.clone().unwrap_or(Value::Null),
+                    index,
+                },
+            );
+        }
+    }
+    m
+}
+
 /// 按 `ctx.meta` 里的 [`ReseedKey`] 复用源 run 的 step 结果。
 ///
 /// 计划本身**不在这里给**——它属于 run 级参数，调用方每次 drive 通过
 /// `RunWorkflowOptions.meta` 传：
 ///
 /// ```ignore
-/// .middleware(reseed(load_results))            // 挂一次
+/// .middleware(reseed())            // 挂一次
 /// RunWorkflowOptions::new(wf, store)
 ///     .meta(MetaBag::new().with::<ReseedKey>(ReseedPlan {
 ///         source_run_id: "rev1".into(),
@@ -99,24 +131,14 @@ pub struct SourceStep {
 /// ```
 ///
 /// 没传 `ReseedKey` 时不装层（= 本次 run 不做播种，全部真跑）。
-pub fn reseed<F>(load_results: F) -> ReseedMw
-where
-    F: for<'a> Fn(&'a str) -> aa_workflow_core::define::BoxFuture<'a, anyhow::Result<HashMap<String, SourceStep>>>
-        + Send
-        + Sync
-        + 'static,
-{
-    ReseedMw {
-        load_results: Arc::new(load_results),
-    }
+pub fn reseed() -> ReseedMw {
+    ReseedMw
 }
 
-/// struct 形态（tower `Service` 同款）：参数是**字段**，`serve<'a>(&'a self)`
+/// struct 形态（tower `Service` 同款）：无构造期状态，`call<'a>(&'a self)`
 /// 的 future 借 `&self`——零捕获仪式、零 per-call 克隆。
 #[derive(Clone)]
-pub struct ReseedMw {
-    load_results: Arc<LoadResults>,
-}
+pub struct ReseedMw;
 
 impl MiddlewareServer for ReseedMw {
     async fn call(&self, mut args: MiddlewareServerFnArgs) -> Result<Value> {
@@ -130,16 +152,13 @@ impl MiddlewareServer for ReseedMw {
         // 本 run 就是源 run？不做任何事（禁止自我播种）。
         if plan.source_run_id != args.ctx.run_id {
             // **drive 开始时加载一次**，而不是在包装层里懒加载 + 缓存：
-            // `load_results` 现在是 async（要从 async RunStore 读日志）；
             // 省掉可变状态后层就是纯的（只读 plan）。
             //
-            // 源读不到 → 空表，「没有可复用结果」→ 全部真跑
-            // （与引擎版「导入 0 条」同义）。
-            let lookup = Arc::new(
-                (self.load_results)(&plan.source_run_id)
-                    .await
-                    .unwrap_or_default(),
-            );
+            // 源 run 不存在 → store 返回空日志 → 空表 → 全部真跑
+            // （与引擎版「导入 0 条」同义）；**读失败**则传播错误，与
+            // `dag_policies` 一致，不再静默降级。
+            let events = args.get_events(&plan.source_run_id).await?;
+            let lookup = Arc::new(step_results_from_events(&events));
 
             args.wrap_step(step_layer({
                 let redo = redo.clone();

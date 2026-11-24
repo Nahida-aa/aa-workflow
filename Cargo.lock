@@ -28,6 +28,7 @@ dependencies = [
  "aa_graph",
  "aa_workflow_core",
  "anyhow",
+ "async-trait",
  "serde",
  "serde_json",
  "tokio",

@@ -1,6 +1,5 @@
 //! 验证 redo：不在 redoSet 里的 step 不执行闭包、复用源 run 的结果。
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -11,36 +10,11 @@ use aa_workflow_core::{
     RunWorkflowOptions, WorkflowCtx,
 };
 
-use aa_workflow_middlewares::{ReseedKey, ReseedPlan, SourceStep, reseed};
+use aa_workflow_middlewares::{ReseedKey, ReseedPlan, reseed};
 
 /// redo 的 plan 走 run 级参数（`RunWorkflowOptions.meta`），不在中间件构造处。
 fn reseed_meta(plan: ReseedPlan) -> MetaBag {
     MetaBag::new().with::<ReseedKey>(plan)
-}
-
-/// 源 run 的结果提取器：把日志里的 STEP_FINISHED 收成 map（带日志下标，
-/// 供 `STEP_FINISHED.meta.imported_from.index` 使用）。
-fn loader(
-    store: Arc<InMemoryStore>,
-) -> impl for<'a> Fn(&'a str) -> aa_workflow_core::define::BoxFuture<'a, anyhow::Result<HashMap<String, SourceStep>>> + Send + Sync + 'static {
-    move |run_id: &str| {
-        let store = store.clone();
-        Box::pin(async move {
-            use aa_workflow_core::RunStore;
-            let mut m = HashMap::new();
-            for (index, e) in store.get_events(run_id).await?.into_iter().enumerate() {
-                if let WorkflowEvent::StepFinished {
-                    step_id,
-                    result: Some(r),
-                    ..
-                } = e
-                {
-                    m.insert(step_id, SourceStep { result: r, index });
-                }
-            }
-            Ok(m)
-        }) as aa_workflow_core::define::BoxFuture<'_, _>
-    }
 }
 
 /// 造一个挂了 `reseed` 的 workflow。**同一个定义跑多次 run**——
@@ -79,7 +53,7 @@ async fn redo_reuses_steps_outside_redo_set() {
 
     // **一个 workflow 定义跑两次 run**——这才是 redo 的真实形态。
     // 中间件挂在上面（挂一次），plan 走 meta（每次 run 各自给）。
-    let wf = Arc::new(make_wf(exec.clone(), reseed(loader(store.clone()))));
+    let wf = Arc::new(make_wf(exec.clone(), reseed()));
 
     // rev1：不给 plan → 中间件不装层 → 全跑
     run_workflow(
@@ -169,7 +143,7 @@ async fn redo_with_empty_redo_set_reuses_everything() {
     let exec = Arc::new(Mutex::new(Vec::new()));
 
     // 一个 workflow 定义跑两次 run（同上一个测试）。
-    let wf = Arc::new(make_wf(exec.clone(), reseed(loader(store.clone()))));
+    let wf = Arc::new(make_wf(exec.clone(), reseed()));
 
     // s1：不给 plan → 全跑
     run_workflow(
@@ -212,7 +186,7 @@ async fn redo_with_missing_source_runs_everything() {
     let ran_in = ran.clone();
 
     let wf = create_workflow(CreateWorkflowConfig::new("redo2").input::<serde_json::Value>())
-        .middleware(reseed(loader(store.clone())))
+        .middleware(reseed())
         .handler(move |ctx: WorkflowCtx| {
             let ran = ran_in.clone();
             async move {
@@ -243,6 +217,199 @@ async fn redo_with_missing_source_runs_everything() {
     assert_eq!(format!("{:?}", out.status), "Finished");
     assert_eq!(ran.load(Ordering::SeqCst), 1, "源不存在 → 业务函数真跑");
     void(exec);
+}
+
+/// 只在读**指定源 run** 的日志时失败；本 run 的正常读写仍委托 `InMemoryStore`。
+///
+/// 这样引擎自己的 replay 读取不受影响，故障只落在 reseed 读源那一步。
+struct FailsOnSourceRun {
+    inner: InMemoryStore,
+    fail_for: String,
+}
+
+#[async_trait::async_trait]
+impl RunStore for FailsOnSourceRun {
+    async fn get_run_state(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<aa_workflow_core::RunState>, aa_workflow_core::StoreError> {
+        self.inner.get_run_state(run_id).await
+    }
+
+    async fn set_run_state(
+        &self,
+        run_id: &str,
+        state: &aa_workflow_core::RunState,
+    ) -> Result<(), aa_workflow_core::StoreError> {
+        self.inner.set_run_state(run_id, state).await
+    }
+
+    async fn delete_run(
+        &self,
+        run_id: &str,
+        reason: aa_workflow_core::DeleteReason,
+    ) -> Result<(), aa_workflow_core::StoreError> {
+        self.inner.delete_run(run_id, reason).await
+    }
+
+    async fn append_event(
+        &self,
+        run_id: &str,
+        expected_next_index: usize,
+        event: &WorkflowEvent,
+    ) -> Result<(), aa_workflow_core::StoreError> {
+        self.inner
+            .append_event(run_id, expected_next_index, event)
+            .await
+    }
+
+    async fn get_events(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<WorkflowEvent>, aa_workflow_core::StoreError> {
+        if run_id == self.fail_for {
+            return Err(aa_workflow_core::StoreError::Io(
+                "source log unavailable".into(),
+            ));
+        }
+        self.inner.get_events(run_id).await
+    }
+}
+
+/// 读源日志**失败**（非「源不存在」）→ 传播错误、run `Errored`，
+/// 不再静默降级成「全部真跑」——与 `dag_policies` 的 `args.get_events(..)?` 一致。
+#[tokio::test]
+async fn source_read_failure_is_propagated() {
+    let store: Arc<dyn RunStore> = Arc::new(FailsOnSourceRun {
+        inner: InMemoryStore::new(),
+        fail_for: "ghost".into(),
+    });
+    let ran = Arc::new(AtomicUsize::new(0));
+    let ran_in = ran.clone();
+
+    let wf = create_workflow(CreateWorkflowConfig::new("redo3").input::<serde_json::Value>())
+        .middleware(reseed())
+        .handler(move |ctx: WorkflowCtx| {
+            let ran = ran_in.clone();
+            async move {
+                ctx.step("a", move |_sc: StepCtx| {
+                    let ran = ran.clone();
+                    async move {
+                        ran.fetch_add(1, Ordering::SeqCst);
+                        Ok(serde_json::json!(1))
+                    }
+                })
+                .await?;
+                Ok(serde_json::json!({ "ok": true }))
+            }
+        });
+
+    let out = run_workflow(
+        RunWorkflowOptions::new(Arc::new(wf), store)
+            .input(serde_json::json!({}))
+            .meta(reseed_meta(ReseedPlan {
+                source_run_id: "ghost".into(),
+                redo_set: vec![],
+            }))
+            .run_id("m2"),
+    )
+    .outcome()
+    .await
+    .unwrap();
+
+    assert_eq!(format!("{:?}", out.status), "Errored");
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "读源失败不该被吞掉、静默降级为真跑"
+    );
+    assert!(
+        out.error
+            .expect("应记录错误")
+            .message
+            .contains("source log unavailable"),
+        "错误应来自 store 读失败"
+    );
+}
+
+/// 源 run 里「已完成但事件没带结果」的 step 也要复用——**完成即成功**，
+/// 结果为空不等于「没跑过」。复用后本 run 的 checkpoint 结果记为 `Null`。
+#[tokio::test]
+async fn completed_step_without_result_is_reused_as_null() {
+    let store = Arc::new(InMemoryStore::new());
+    // 源 run n1：一条 STEP_FINISHED，但 result 是 None（外部/历史写入的形状）。
+    store
+        .append_event(
+            "n1",
+            0,
+            &WorkflowEvent::StepFinished {
+                ts: 1,
+                run_id: "n1".into(),
+                step_id: "a".into(),
+                result: None,
+                attempts: Vec::new(),
+                meta: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let ran = Arc::new(AtomicUsize::new(0));
+    let ran_in = ran.clone();
+    let wf = create_workflow(CreateWorkflowConfig::new("redo4").input::<serde_json::Value>())
+        .middleware(reseed())
+        .handler(move |ctx: WorkflowCtx| {
+            let ran = ran_in.clone();
+            async move {
+                ctx.step("a", move |_sc: StepCtx| {
+                    let ran = ran.clone();
+                    async move {
+                        ran.fetch_add(1, Ordering::SeqCst);
+                        Ok(serde_json::json!("真的跑了"))
+                    }
+                })
+                .await?;
+                Ok(serde_json::json!({ "ok": true }))
+            }
+        });
+
+    let out = run_workflow(
+        RunWorkflowOptions::new(Arc::new(wf), store.clone())
+            .input(serde_json::json!({}))
+            .meta(reseed_meta(ReseedPlan {
+                source_run_id: "n1".into(),
+                redo_set: vec![],
+            }))
+            .run_id("n2"),
+    )
+    .outcome()
+    .await
+    .unwrap();
+
+    assert_eq!(format!("{:?}", out.status), "Finished");
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "已完成（即使事件没带结果）的 step 不该重跑"
+    );
+
+    let results: Vec<Option<serde_json::Value>> = store
+        .get_events("n2")
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            WorkflowEvent::StepFinished {
+                step_id, result, ..
+            } if step_id == "a" => Some(result.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        results,
+        vec![Some(serde_json::Value::Null)],
+        "复用的空结果记为 Null"
+    );
 }
 
 fn void<T>(_: T) {}

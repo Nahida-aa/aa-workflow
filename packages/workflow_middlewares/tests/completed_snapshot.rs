@@ -189,22 +189,15 @@ async fn completed_snapshot_never_contains_self() {
 /// 泊车。这条锁定「策略无状态」改造后与改造前一致的行为。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn completed_accumulates_across_drives() {
-    use aa_workflow_core::RunStore;
     use aa_workflow_core::define::MetaBag;
-    use aa_workflow_middlewares::{interim_goals, InterimGoalsKey, INTERIM_GOAL_SIGNAL};
+    use aa_workflow_middlewares::{interim_goals, InterimGoalsKey};
 
     let store = Arc::new(InMemoryStore::new());
-    let store_for_hook = store.clone();
     let ran: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let ran_in = ran.clone();
 
     let wf = create_workflow(CreateWorkflowConfig::new("acc").input::<serde_json::Value>())
-        .middleware(interim_goals(move |run_id| {
-            use aa_workflow_core::RunStore;
-            let store = store_for_hook.clone();
-            Box::pin(async move { Ok(store.get_events(run_id).await?) })
-                as aa_workflow_core::define::BoxFuture<'_, _>
-        }))
+        .middleware(interim_goals())
         .handler(move |ctx: WorkflowCtx| {
             let ran = ran_in.clone();
             async move {

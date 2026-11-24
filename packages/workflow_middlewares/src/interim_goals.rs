@@ -26,15 +26,15 @@
 //!
 //! # 需要 store
 //!
-//! 判断「开局目标是否已达成」要读日志，构造时注入 `get_events`。
+//! 判断「开局目标是否已达成」要读日志——走 `args.get_events(&args.ctx.run_id)`，
+//! 引擎自带 store，中间件不必构造期注入。
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashSet;
-use std::sync::Arc;
 
-use aa_workflow_core::define::{BoxFuture, MetaKey};
+use aa_workflow_core::define::MetaKey;
 use aa_workflow_core::middleware::{
-    Middleware, MiddlewareServer, MiddlewareServerFnArgs, StepRequest, step_layer, Decision,
+    MiddlewareServer, MiddlewareServerFnArgs, StepRequest, step_layer, Decision,
 };
 
 /// 保留信号名（与 `__timer` 同族）。
@@ -57,42 +57,27 @@ aa_workflow_core::impl_meta_accessors!(
     try_interim_goals
 );
 
-/// 读某个 run 的日志（引擎事件数组）。async 对齐 TanStack hook + async RunStore。
-pub type GetEvents = dyn for<'a> Fn(&'a str) -> aa_workflow_core::define::BoxFuture<'a, anyhow::Result<Vec<aa_workflow_core::event::WorkflowEvent>>>
-    + Send
-    + Sync;
-
 /// 目标全部 checkpoint 后在下一个 step 入口泊车（后续 step 不执行）。
 ///
 /// 目标本身**不在这里给**——它属于 run 级参数，调用方每次 drive 通过
 /// `RunWorkflowOptions.meta` 传：
 ///
 /// ```ignore
-/// .middleware(interim_goals(get_events))          // 挂一次
+/// .middleware(interim_goals())          // 挂一次
 /// RunWorkflowOptions::new(wf, store)
 ///     .meta(MetaBag::new().with::<InterimGoalsKey>(vec!["b".into()]))   // 每次可不同
 /// ```
 ///
 /// 没传 `InterimGoalsKey` 时中间件不装层（等价于「本次 drive 不设临时目标」），
 /// 而不是泊在空目标上。
-pub fn interim_goals<F>(get_events: F) -> InterimGoalsMw
-where
-    F: for<'a> Fn(&'a str) -> aa_workflow_core::define::BoxFuture<'a, anyhow::Result<Vec<aa_workflow_core::event::WorkflowEvent>>>
-        + Send
-        + Sync
-        + 'static,
-{
-    InterimGoalsMw {
-        get_events: Arc::new(get_events),
-    }
+pub fn interim_goals() -> InterimGoalsMw {
+    InterimGoalsMw
 }
 
-/// struct 形态（tower `Service` 同款）：参数是**字段**，`serve<'a>(&'a self)`
+/// struct 形态（tower `Service` 同款）：无构造期状态，`call<'a>(&'a self)`
 /// 的 future 借 `&self`——零捕获仪式、零 per-call 克隆。
 #[derive(Clone)]
-pub struct InterimGoalsMw {
-    get_events: Arc<GetEvents>,
-}
+pub struct InterimGoalsMw;
 
 impl MiddlewareServer for InterimGoalsMw {
     async fn call(&self, mut args: MiddlewareServerFnArgs) -> Result<Value> {
@@ -103,9 +88,8 @@ impl MiddlewareServer for InterimGoalsMw {
         };
 
         // 开局已完成的目标（续驱 / reseed 导入）——不该为它们泊车。
-        // `&self.get_events` 直接借字段——server_state/闭包形态里这曾是
-        // 「async move 前 clone 一行」的仪式位。
-        let finished_at_start: HashSet<String> = (self.get_events)(&args.ctx.run_id)
+        let finished_at_start: HashSet<String> = args
+            .get_events(&args.ctx.run_id)
             .await?
             .iter()
             .filter_map(|e| match e {

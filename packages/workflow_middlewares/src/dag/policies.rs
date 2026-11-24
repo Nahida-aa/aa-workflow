@@ -35,7 +35,8 @@
 //!
 //! # 需要 store
 //!
-//! `reseed_plan` 要读源 run 日志——构造时注入 `get_events`。
+//! `reseed_plan` 要读源 run 日志——走 `args.get_events(source_run_id)`，
+//! 引擎自带 store，中间件不必构造期注入。
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -43,9 +44,10 @@ use std::sync::Arc;
 
 use aa_workflow_core::define::BoxFuture;
 use aa_workflow_core::middleware::{
-    Middleware, MiddlewareServer, MiddlewareServerFnArgs, StepRequest, step_layer, Decision,
+    MiddlewareServer, MiddlewareServerFnArgs, StepRequest, step_layer, Decision,
 };
 use crate::dag::core::DagShape;
+use crate::reseed::{SourceStep, step_results_from_events};
 
 /// 保留信号名（与 `__timer` 同族）。
 pub const INTERIM_GOAL_SIGNAL: &str = "__interim-goal";
@@ -86,7 +88,10 @@ aa_workflow_core::impl_meta_accessors!(DagPlanKey => DagPlanAccess, dag_plan, tr
 
 
 /// 读某个 run 的日志（引擎事件数组）。async 对齐 TanStack hook + async RunStore。
-pub type GetEvents = dyn for<'a> Fn(&'a str) -> aa_workflow_core::define::BoxFuture<'a, anyhow::Result<Vec<aa_workflow_core::event::WorkflowEvent>>>
+///
+/// 内置中间件已改走 [`MiddlewareServerFnArgs::get_events`](aa_workflow_core::middleware::MiddlewareServerFnArgs::get_events)；
+/// 这个别名留给**自写中间件**做构造期注入（仍是合法写法）。
+pub type GetEvents = dyn for<'a> Fn(&'a str) -> BoxFuture<'a, anyhow::Result<Vec<aa_workflow_core::event::WorkflowEvent>>>
     + Send
     + Sync;
 
@@ -100,24 +105,23 @@ struct PlanState {
     goals: Vec<String>,
     /// redo 复用表：step_id → (源结果, 源下标)。空 = 无 redo。
     /// 下标用于 `SkipImported` 的溯源（对齐引擎版 `reseedRun`）。
-    lookup: HashMap<String, (serde_json::Value, usize)>,
+    lookup: HashMap<String, SourceStep>,
     /// 源 run id（`SkipImported` 溯源用）；无 redo 时为 `None`。
     source_run_id: Option<String>,
 }
 
 /// DAG 策略中间件：redo 复用 + 临时目标泊车，读 `meta.__dagPlan`。
 ///
-/// `shape` 提供图（`from` 闭包展开、缺省种子计算）；`get_events` 提供日志读取。
-pub fn dag_policies(shape: Arc<DagShape>, get_events: Arc<GetEvents>) -> DagPoliciesMw {
-    DagPoliciesMw { shape, get_events }
+/// `shape` 提供图（`from` 闭包展开、缺省种子计算）。
+pub fn dag_policies(shape: Arc<DagShape>) -> DagPoliciesMw {
+    DagPoliciesMw { shape }
 }
 
-/// struct 形态（tower `Service` 同款）：两个构造期参数都是**字段**，
+/// struct 形态（tower `Service` 同款）：图是**字段**，
 /// `serve<'a>(&'a self)` 的 future 借 `&self`——零捕获仪式、零 per-call 克隆。
 #[derive(Clone)]
 pub struct DagPoliciesMw {
     shape: Arc<DagShape>,
-    get_events: Arc<GetEvents>,
 }
 
 impl MiddlewareServer for DagPoliciesMw {
@@ -139,7 +143,7 @@ impl MiddlewareServer for DagPoliciesMw {
             // redo：source_run_id 存在才启用；from 闭包展开交给
             // DagShape::reseed_plan（库有图，含缺省种子计算）。
             if let Some(source_run_id) = plan.source_run_id.as_deref() {
-                let source_log = (self.get_events)(source_run_id).await?;
+                let source_log = args.get_events(source_run_id).await?;
                 let from = plan.from.clone();
                 let reseed_run = self.shape.reseed_plan(&source_log, from)?;
                 let mut redo: HashSet<String> = reseed_run.redo_set.iter().cloned().collect();
@@ -150,24 +154,9 @@ impl MiddlewareServer for DagPoliciesMw {
                 }
 
                 // 源结果 → lookup（排除重跑名单），带源下标（溯源）。
-                // 不要求 result 非 null：有些工作流（如 LocalDub）刻意让节点返回
-                // Value::Null，数据走盘上文件；复用只表示「这步跑过了、不入边数据」。
-                // null 时导入的也是 Value::Null，消费方 body 不读 deps 即可。
-                for (index, e) in source_log.iter().enumerate() {
-                    if let aa_workflow_core::event::WorkflowEvent::StepFinished {
-                        step_id,
-                        result,
-                        ..
-                    } = e
-                    {
-                        if !redo.contains(step_id) {
-                            st.lookup.insert(
-                                step_id.clone(),
-                                (result.clone().unwrap_or(serde_json::Value::Null), index),
-                            );
-                        }
-                    }
-                }
+                // 解析与 `reseed` 共用 `step_results_from_events`，避免两处漂移。
+                st.lookup = step_results_from_events(&source_log);
+                st.lookup.retain(|id, _| !redo.contains(id));
             }
         }
 
@@ -194,12 +183,12 @@ impl MiddlewareServer for DagPoliciesMw {
             // ② redo：有源结果 → 复用（`skip_with_meta` 落 STEP_FINISHED
             //    **带 imported_from 溯源**——与引擎版 reseedRun 对齐；它同样
             //    进入下一次调用的 `completed`）。
-            if let Some((result, index)) = plan.lookup.get(&req.step_id).cloned() {
+            if let Some(src) = plan.lookup.get(&req.step_id) {
                 return Decision::SkipImported {
-                    result,
+                    result: src.result.clone(),
                     from: aa_workflow_core::event::ImportedFrom {
                         run_id: plan.source_run_id.clone().expect("有 lookup 必有源"),
-                        index,
+                        index: src.index,
                     },
                 };
             }

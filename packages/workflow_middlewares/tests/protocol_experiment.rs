@@ -25,7 +25,6 @@ use std::task::{Context, Poll};
 use anyhow::Result;
 use tower::{Layer, Service};
 
-use aa_workflow_middlewares::GetEvents;
 use aa_workflow_core::middleware::{Middleware, MiddlewareServer, MiddlewareServerFnArgs};
 
 type BoxFut = Pin<Box<dyn Future<Output = Result<serde_json::Value, anyhow::Error>> + Send>>;

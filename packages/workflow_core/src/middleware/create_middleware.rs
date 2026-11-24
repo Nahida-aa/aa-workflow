@@ -21,6 +21,7 @@
 //! | `({ ctx, next }) => …` | [`MiddlewareServerFnArgs`]（`ctx` 字段 + `next` 方法） |
 //! | `next({ context })` | [`MiddlewareServerFnArgs::next`]（一次调用：合并 + 推进） |
 //! | `ctx.step = wrapped` | [`MiddlewareServerFnArgs::wrap_step`]（tower `Layer`，可叠加） |
+//! | （无对应物：engine 藏在闭包） | [`MiddlewareServerFnArgs::get_events`]（直读指定 run 日志） |
 //! | `AnyMiddleware = Middleware<any, any>` | [`AnyMiddleware`]（别名，可混装） |
 //!
 //! # 为什么没有 `TCtxIn` / `TExtension` 两个泛型
@@ -273,6 +274,23 @@ impl MiddlewareServerFnArgs {
     /// 例如 DAG 中间件。
     pub fn take_over(&mut self) {
         self.pipeline = None;
+    }
+
+    /// 指定 run 的**完整事件日志**（只读快照）。
+    ///
+    /// 引擎手里就有 store，所以中间件不必自备 `Arc<GetEvents>` 句柄——本 run
+    /// 传 `&args.ctx.run_id`，reseed 类策略传**源 run** 的 id。那种构造期注入
+    /// 仍是合法写法，见 [`Middleware::from_impl`]。
+    ///
+    /// 读到的是**已落盘**的部分：本次 drive 尚未 append 的事件不在其中。
+    /// 与直接读 store 一样，这绕过了 replay 短路语义——消费方自己保证
+    /// 判定逻辑对「日志只增不减」是稳定的。
+    ///
+    /// # Errors
+    ///
+    /// 透传 [`crate::run_store::RunStore::get_events`] 的错误。
+    pub async fn get_events(&self, run_id: &str) -> Result<Vec<crate::event::WorkflowEvent>> {
+        Ok(self.ctx.engine.store.get_events(run_id).await?)
     }
 }
 

@@ -226,6 +226,29 @@ drive 期逐层箱（2N 次）——静态注册本可以零箱到终点擦一�
 
 **两侧状态**：Rust 已实现；上游 TS 无此分层（JS 闭包无此问题）。
 
+## F10. 中间件直读事件日志（`MiddlewareServerFnArgs::get_events`）
+
+**状态**：已实现。
+
+**场景**：中间件需要「本 run 已落盘的完整事件日志」——判断开局目标是否达成
+（`interim_goals`）、策略层按历史 step 决策、把日志尾部信息写进 ctx 扩展。
+
+**为什么现有手段不够**：`WorkflowCtx` 上没有 store（`engine` 是 `pub(crate)`，
+对齐上游「engine 藏在闭包」）。中间件原先只能在构造期注入 `Arc<GetEvents>`
+（F8 的形态），多一处「必须传同一个 store 实例」的仪式，且注入的句柄与引擎
+实际使用的 store 可能在装配时错配。因此内置的 `interim_goals` / `reseed` /
+`dag_policies` 已全部改为直接走该方法（前两者去参，后者只留 `shape`）；
+`reseed` 与 `dag_policies` 共用 `step_results_from_events` 解析源日志，读源失败
+统一传播错误（不再一处静默降级、一处 `Errored`）。
+
+**自然形态**：`MiddlewareServerFnArgs::get_events(&self, run_id)`——引擎自己持有的
+store，中间件直接 await；本 run 传 `ctx.run_id`，reseed 类策略传源 run 的 id。
+作用域刻意只在中间件：handler 侧仍无 store（读日志会引入隐藏的 replay 依赖，
+破坏确定性契约）。
+
+**两侧状态**：Rust 已实现；上游 TS 无对应方法（中间件从闭包拿 store，
+不经过 ctx）。
+
 ## 通用约束（本轮明确过的，新增功能都要过）
 
 1. **隐式新开 run 默认禁止**。引擎在 resume 时内部创建新 run 而调用方不直接

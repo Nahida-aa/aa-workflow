@@ -38,9 +38,9 @@
 //!
 //! ```rust,ignore
 //! // 中间件：挂一次，不含 run 级参数
-//! .middleware(interim_goals(get_events))
-//! .middleware(reseed(load_results))
-//! .middleware(dag_policies(shape, get_events))   // shape 是静态图，不是 run 级参数
+//! .middleware(interim_goals())
+//! .middleware(reseed())
+//! .middleware(dag_policies(shape))   // shape 是静态图，不是 run 级参数
 //!
 //! // run 级参数：每次 drive 各自给
 //! RunWorkflowOptions::new(wf, store)
@@ -53,7 +53,7 @@
 //!
 //! ```rust,ignore
 //! create_workflow(config)
-//!     .middleware(dag_policies(shape, get_events))  // 策略照旧挂
+//!     .middleware(dag_policies(shape))  // 策略照旧挂
 //!     .handler(dag_to_handler(spec));                  // handler 天然最内层
 //! ```
 //!
@@ -69,9 +69,10 @@
 //! 引擎上曾经有过 `interim_goals` / `reseed_run` 两个策略参数，已于 2026-11-06
 //! 删除（`docs/decisions/0001`、`0018`），本包就是它们的归宿。
 //!
-//! **中间件的构造参数只放静态配置**（`get_events` / `load_results` / `shape`），
+//! **中间件的构造参数只放静态配置**（`shape`），
 //! 不放「每次 run 可能不同」的东西——那些都走 `ctx.meta` 的类型化 key
-//! （`InterimGoalsKey` / `ReseedKey` / `DagPlan`）。
+//! （`InterimGoalsKey` / `ReseedKey` / `DagPlan`）。读日志走
+//! [`MiddlewareServerFnArgs::get_events`]，不需要构造期注入 store 句柄。
 mod dag;
 mod interim_goals;
 mod reseed;
@@ -86,7 +87,10 @@ pub use dag::policies::{
     dag_policies,
 };
 pub use interim_goals::{InterimGoalsAccess, InterimGoalsKey, InterimGoalsMw, interim_goals};
-pub use reseed::{LoadResults, ReseedAccess, ReseedKey, ReseedPlan, ReseedMw, SourceStep, reseed};
+pub use reseed::{
+    LoadResults, ReseedAccess, ReseedKey, ReseedMw, ReseedPlan, SourceStep, reseed,
+    step_results_from_events,
+};
 
 /// 供文档链接用：把常用名字提上来，避免调用方再导一遍 core。
 ///

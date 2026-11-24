@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 use aa_workflow_core::define::{DefExt, ExtNamespace};
 use aa_workflow_core::middleware::{Middleware, MiddlewareServerFnArgs};
 use aa_workflow_core::{
-    create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunStatus,
-    RunWorkflowOptions, WorkflowCtx,
+    create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunStatus, RunStore,
+    RunWorkflowOptions, StepCtx, WorkflowCtx, WorkflowEvent,
 };
 use serde_json::{json, Value};
 
@@ -214,5 +214,75 @@ async fn rejects_calling_next_more_than_once_in_a_middleware() {
         err.message.contains("at most once"),
         "错误信息应含 `at most once`，实际: {}",
         err.message
+    );
+}
+
+/// 中间件直读 event 日志（`sc.get_events(&sc.ctx.run_id)`）。
+///
+/// 引擎自己持有 store 与 `run_id`，中间件不必在构造期注入 `Arc<GetEvents>`
+/// （那种注入仍合法，但不是唯一路径）。
+/// 上游无对应方法：TS 的 engine 藏在闭包里，中间件只能自己捕获 store。
+///
+/// 验证点：读到的就是引擎用的那个 store，且只含**本次 drive 之前已落盘**的事件。
+#[tokio::test]
+async fn middleware_reads_the_run_event_log() {
+    let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
+    // 预置一条 checkpoint：先于本次 drive，中间件应能读到它。
+    store
+        .append_event(
+            "mw-events:1",
+            0,
+            &WorkflowEvent::StepFinished {
+                ts: 1,
+                run_id: "mw-events:1".into(),
+                step_id: "pre".into(),
+                result: Some(json!(1)),
+                attempts: Vec::new(),
+                meta: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let mw = Middleware::new().server(move |mut sc: MiddlewareServerFnArgs| {
+        let log = log.clone();
+        async move {
+            let ids: Vec<String> = sc
+                .get_events(&sc.ctx.run_id)
+                .await?
+                .iter()
+                .filter_map(|e| match e {
+                    WorkflowEvent::StepFinished { step_id, .. } => Some(step_id.clone()),
+                    _ => None,
+                })
+                .collect();
+            log.lock().unwrap().extend(ids);
+            sc.next(None).await
+        }
+    });
+
+    let wf = create_workflow(CreateWorkflowConfig::new("mw-events").input::<Value>())
+        .middleware(mw)
+        .handler(|ctx: WorkflowCtx| async move {
+            ctx.step("a", |_sc: StepCtx| async { Ok(json!(2)) })
+                .await
+        });
+
+    let out = run_workflow(
+        RunWorkflowOptions::new(Arc::new(wf), store)
+            .input(json!({}))
+            .run_id("mw-events:1"),
+    )
+    .outcome()
+    .await
+    .unwrap();
+
+    assert_eq!(out.status, RunStatus::Finished);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["pre".to_string()],
+        "中间件应读到引擎 store 里已落盘的 checkpoint"
     );
 }

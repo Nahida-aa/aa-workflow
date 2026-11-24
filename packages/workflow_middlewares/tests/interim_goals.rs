@@ -31,15 +31,9 @@ async fn parks_at_the_goal_step_and_does_not_run_later_steps() {
     let log2 = log_in.clone();
 
     let store = Arc::new(InMemoryStore::new());
-    let store_for_hook = store.clone();
 
     let wf = create_workflow(CreateWorkflowConfig::new("goal").input::<serde_json::Value>())
-        .middleware(interim_goals(move |run_id| {
-            use aa_workflow_core::RunStore;
-            let store = store_for_hook.clone();
-            Box::pin(async move { Ok(store.get_events(run_id).await?) })
-                as aa_workflow_core::define::BoxFuture<'_, _>
-        }))
+        .middleware(interim_goals())
         .handler(move |ctx: WorkflowCtx| {
             let log = log2.clone();
             async move {
@@ -112,19 +106,11 @@ async fn parks_at_the_goal_step_and_does_not_run_later_steps() {
 #[tokio::test]
 async fn no_goals_means_no_parking() {
     let store = Arc::new(InMemoryStore::new());
-    let store_for_hook = store.clone();
     let ran = Arc::new(AtomicUsize::new(0));
     let ran_in = ran.clone();
 
     let wf = create_workflow(CreateWorkflowConfig::new("noop").input::<serde_json::Value>())
-        .middleware(interim_goals(move |run_id| {
-            use aa_workflow_core::RunStore;
-            let store = store_for_hook.clone();
-            Box::pin(async move {
-                let _ = store.get_events(run_id).await?;
-                Ok(vec![])
-            }) as aa_workflow_core::define::BoxFuture<'_, _>
-        }))
+        .middleware(interim_goals())
         .handler(move |ctx: WorkflowCtx| {
             let ran = ran_in.clone();
             async move {

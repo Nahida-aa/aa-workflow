@@ -3,7 +3,6 @@
 //! 现有测试都是单中间件；这里验证「各自的 meta key 互不干扰」以及
 //! 「reseed 写入的 StepFinished 能被 interim_goals 的完成判定看到」。
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use aa_workflow_core::define::{MetaBag, StepCtx};
@@ -14,32 +13,8 @@ use aa_workflow_core::{
 };
 use aa_workflow_middlewares::{
     DagPlan, DagPlanKey, DagShape, INTERIM_GOAL_SIGNAL, InterimGoalsKey, ReseedKey, ReseedPlan,
-    SourceStep, dag_policies, interim_goals, reseed,
+    dag_policies, interim_goals, reseed,
 };
-
-/// 把源 run 的 STEP_FINISHED 收成 map（带日志下标）。
-fn loader(
-    store: Arc<InMemoryStore>,
-) -> impl for<'a> Fn(&'a str) -> aa_workflow_core::define::BoxFuture<'a, anyhow::Result<HashMap<String, SourceStep>>> + Send + Sync + 'static {
-    move |run_id: &str| {
-        let store = store.clone();
-        Box::pin(async move {
-            use aa_workflow_core::RunStore;
-            let mut m = HashMap::new();
-            for (index, e) in store.get_events(run_id).await?.into_iter().enumerate() {
-                if let WorkflowEvent::StepFinished {
-                    step_id,
-                    result: Some(r),
-                    ..
-                } = e
-                {
-                    m.insert(step_id, SourceStep { result: r, index });
-                }
-            }
-            Ok(m)
-        }) as aa_workflow_core::define::BoxFuture<'_, _>
-    }
-}
 
 /// 一个把 a/b/c 串起来的 workflow，挂上调用方给的两个中间件。
 fn make_wf(
@@ -87,11 +62,8 @@ async fn outer_reseed_short_circuits_before_interim_goals_can_park() {
 
     let wf = Arc::new(make_wf(
         ran.clone(),
-        reseed(loader(store.clone())),
-        interim_goals({
-            let store = store.clone();
-            move |run_id: &str| { let store = store.clone(); Box::pin(async move { use aa_workflow_core::RunStore; Ok(store.get_events(run_id).await?) }) as aa_workflow_core::define::BoxFuture<'_, _> }
-        }),
+        reseed(),
+        interim_goals(),
     ));
 
     // run1：不给任何 plan → 两个中间件都不装层 → 全跑。
@@ -182,11 +154,8 @@ async fn outer_interim_goals_parks_before_reseed_short_circuits() {
     // 注意顺序反了：interim_goals 在外层。
     let wf = Arc::new(make_wf(
         ran.clone(),
-        interim_goals({
-            let store = store.clone();
-            move |run_id: &str| { let store = store.clone(); Box::pin(async move { use aa_workflow_core::RunStore; Ok(store.get_events(run_id).await?) }) as aa_workflow_core::define::BoxFuture<'_, _> }
-        }),
-        reseed(loader(store.clone())),
+        interim_goals(),
+        reseed(),
     ));
 
     run_workflow(
@@ -256,17 +225,8 @@ async fn outer_interim_goals_wins_the_park_race() {
 
     let wf = Arc::new(make_wf(
         ran.clone(),
-        interim_goals({
-            let store = store.clone();
-            move |run_id: &str| { let store = store.clone(); Box::pin(async move { use aa_workflow_core::RunStore; Ok(store.get_events(run_id).await?) }) as aa_workflow_core::define::BoxFuture<'_, _> }
-        }),
-        dag_policies(
-            linear_shape(),
-            Arc::new({
-                let store = store.clone();
-                move |run_id: &str| { let store = store.clone(); Box::pin(async move { use aa_workflow_core::RunStore; Ok(store.get_events(run_id).await?) }) as aa_workflow_core::define::BoxFuture<'_, _> }
-            }),
-        ),
+        interim_goals(),
+        dag_policies(linear_shape()),
     ));
 
     let out = run_workflow(
@@ -303,17 +263,8 @@ async fn outer_dag_policies_wins_the_park_race() {
 
     let wf = Arc::new(make_wf(
         ran.clone(),
-        dag_policies(
-            linear_shape(),
-            Arc::new({
-                let store = store.clone();
-                move |run_id: &str| { let store = store.clone(); Box::pin(async move { use aa_workflow_core::RunStore; Ok(store.get_events(run_id).await?) }) as aa_workflow_core::define::BoxFuture<'_, _> }
-            }),
-        ),
-        interim_goals({
-            let store = store.clone();
-            move |run_id: &str| { let store = store.clone(); Box::pin(async move { use aa_workflow_core::RunStore; Ok(store.get_events(run_id).await?) }) as aa_workflow_core::define::BoxFuture<'_, _> }
-        }),
+        dag_policies(linear_shape()),
+        interim_goals(),
     ));
 
     let out = run_workflow(

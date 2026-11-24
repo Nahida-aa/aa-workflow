@@ -48,7 +48,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use aa_workflow_core::{CreateWorkflowConfig, WorkflowBuilder, WorkflowDefinition, create_workflow};
-use aa_workflow_middlewares::{DagSpec, DagShape, GetEvents, dag_policies, dag_to_handler, define_dag};
+use aa_workflow_middlewares::{DagSpec, DagShape, dag_policies, dag_to_handler, define_dag};
 
 // ========================================================================
 // dub_sf_ocr 的定义
@@ -637,12 +637,11 @@ pub fn dub_sf_ocr() -> WorkflowDefinition<DubSfOcrInput, serde_json::Value, DubS
 /// 环境由调用方注入（[`DubEnv`]）：runtime 的 `load` 闭包每次装配定义时
 /// 克隆同一个 handle，测试侧持同一柄——「服务故障 / 恢复」跨 run 生效。
 pub fn dub_sf_ocr_dag(
-    get_events: Arc<GetEvents>,
     env: DubEnv,
 ) -> WorkflowDefinition<DubSfOcrInput, serde_json::Value, DubSfOcrState> {
     let spec = define_dag(dub_spec(env)).expect("dub spec 合法（无重复 / 未知依赖 / 环）");
     let shape = Arc::new(spec.shape().expect("dub 形状无环"));
     dub_builder()
-        .middleware(dag_policies(shape, get_events))
+        .middleware(dag_policies(shape))
         .handler(dag_to_handler(spec))
 }
