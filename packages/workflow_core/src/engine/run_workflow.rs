@@ -2608,7 +2608,6 @@ mod tests {
         assert_eq!(scheduled, 1, "STEP_RETRY_SCHEDULED 应持久化");
         // 耐久重试逐 attempt 落 STEP_ATTEMPT_STARTED（对齐上游）：两次驱动
         // 共两次 attempt（第一次失败、第二次成功），应各有一条。
-        eprintln!("DEBUG events={:?}", store.get_events("durable:1").await.unwrap().iter().map(|e| (e.type_name().to_string(), e.step_id().map(str::to_string))).collect::<Vec<_>>());
 
         // 第二次驱动（deadline 已过）：attempt 2 成功 → Finished
         let second = run_workflow(

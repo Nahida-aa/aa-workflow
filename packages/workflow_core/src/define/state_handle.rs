@@ -101,10 +101,6 @@ impl<TState> StateHandle<TState> {
 
     /// drop 时只在**本 handle** 被变更过才同步（克隆的旧快照不得回写）。
     pub(crate) fn sync_if_dirty(&self) {
-        eprintln!(
-            "[trace] sync_if_dirty dirty={}",
-            self.dirty.load(Ordering::Relaxed)
-        );
         if self.dirty.load(Ordering::Relaxed) {
             self.sync();
         }
