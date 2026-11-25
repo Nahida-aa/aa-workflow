@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use aa_workflow_core::{BaseCtx, CreateWorkflowConfig, RunStatus, RunWorkflowOptions, StepCtx, WorkflowEvent, create_workflow, run_workflow};
+use aa_workflow_core::{BaseCtx, CreateWorkflowConfig, RunWorkflowOptions, StepCtx, WorkflowEvent, create_workflow, run_workflow};
 use aa_workflow_runtime::run_store_adapter::{WorkflowExecutionStore, create_run_store_adapter};
 use aa_workflow_runtime::types::ReadEventsArgs;
 use example_store_file::FileExecutionStore;
@@ -35,7 +35,7 @@ async fn panicking_publisher_does_not_break_the_run() {
                 .await
         });
 
-    let out = run_workflow(
+    let events = run_workflow(
         RunWorkflowOptions::new(wf, create_run_store_adapter(store.clone()))
             .input(serde_json::json!({}))
             .run_id("r")
@@ -43,11 +43,17 @@ async fn panicking_publisher_does_not_break_the_run() {
                 panic!("publisher 炸了");
             }))),
     )
-    .outcome().await
-    .expect("publisher panic 不得逃逸出 run_workflow");
+    .collect().await;
 
-    assert_eq!(out.status, RunStatus::Finished, "run 应照常跑完");
-    assert_eq!(out.output, Some(serde_json::Value::Null));
+    assert!(
+        events.iter().any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+        "run 应照常跑完"
+    );
+    let output = events.iter().find_map(|e| match e {
+        WorkflowEvent::RunFinished { output, .. } => Some(output.clone()),
+        _ => None,
+    });
+    assert_eq!(output, Some(Some(serde_json::Value::Null)));
 
     // 关键：日志必须**完整**——隔离 panic 不能反过来吞掉已 append 的 checkpoint。
     let logged = store
@@ -87,8 +93,7 @@ async fn publisher_keeps_working_after_one_panic() {
                 sink.lock().unwrap().push(t.to_string());
             }))),
     )
-    .outcome().await
-    .expect("单次 panic 不得逃逸");
+    .collect().await;
 
     let got = seen.lock().unwrap().clone();
     assert!(

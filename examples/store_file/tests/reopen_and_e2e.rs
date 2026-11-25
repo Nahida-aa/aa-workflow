@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use aa_workflow_core::{BaseCtx, CreateWorkflowConfig, RunStatus, RunWorkflowOptions, StepCtx, create_workflow, run_workflow};
+use aa_workflow_core::{BaseCtx, CreateWorkflowConfig, RunWorkflowOptions, StepCtx, WorkflowEvent, create_workflow, run_workflow};
 use aa_workflow_runtime::run_store_adapter::{WorkflowExecutionStore, WorkflowRunStoreAdapterStore, create_run_store_adapter};
 use aa_workflow_runtime::types::*;
 use example_store_file::FileExecutionStore;
@@ -133,24 +133,38 @@ async fn drives_a_parallel_workflow() {
     let store: Arc<dyn WorkflowExecutionStore> = Arc::new(FileExecutionStore::new(&base));
     let core_store = create_run_store_adapter(store.clone());
 
-    let out = run_workflow(
+    let events = run_workflow(
         RunWorkflowOptions::new(wf.clone(), core_store)
             .input(serde_json::json!({ "n": 1 })),
     )
-    .outcome().await
-    .expect("run_workflow");
+    .collect()
+    .await;
 
-    assert_eq!(out.status, RunStatus::Finished, "workflow 应跑完");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+        "workflow 应跑完"
+    );
+    let run_id = events
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::RunStarted { run_id, .. }
+            | WorkflowEvent::RunFinished { run_id, .. }
+            | WorkflowEvent::RunErrored { run_id, .. } => Some(run_id.clone()),
+            _ => None,
+        })
+        .expect("run_id");
 
     // 两个并行 step 的终态都落了盘。
-    let events = store
+    let stored_events = store
         .read_events(ReadEventsArgs {
-            run_id: out.run_id.clone(),
+            run_id: run_id.clone(),
             from_index: None,
         })
         .unwrap();
     for step in ["left", "right"] {
-        let n = events
+        let n = stored_events
             .iter()
             .filter(|e| {
                 e.event_type == "STEP_FINISHED" && e.step_id.as_deref() == Some(step)
@@ -161,7 +175,7 @@ async fn drives_a_parallel_workflow() {
 
     // 重开一个实例：run 应处于终态（落盘可信）。
     let reopened = FileExecutionStore::new(&base);
-    let run = reopened.load_run(&out.run_id).unwrap().expect("重开应读到");
+    let run = reopened.load_run(&run_id).unwrap().expect("重开应读到");
     assert_eq!(run.status, WorkflowExecutionStatus::Finished);
 
     let _ = std::fs::remove_dir_all(&base);

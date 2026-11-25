@@ -186,9 +186,9 @@ async fn two_wrappers_stack_in_registration_order() {
             .input(serde_json::json!({}))
             .run_id("onion:order"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
 
     // 先注册的在最外层：outer:before → inner:before → inner:after → outer:after
     let a: Vec<String> = log
@@ -227,9 +227,9 @@ async fn inner_skip_short_circuits_base_but_outer_still_wraps() {
             .input(serde_json::json!({}))
             .run_id("onion:skip"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
 
     // b 的闭包没跑
     assert_eq!(
@@ -285,9 +285,9 @@ async fn wrapper_order_decides_who_wins() {
             .input(serde_json::json!({}))
             .run_id("onion:win"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
 
     let events = store.get_events("onion:win").await.unwrap();
     let b_result = events.iter().find_map(|e| match e {

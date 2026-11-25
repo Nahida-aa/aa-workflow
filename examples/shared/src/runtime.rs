@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use aa_workflow_core::{RunId, RunOutcome, RunStore, RunWorkflowOptions, WorkflowDefinition, WorkflowEvent, run_workflow};
+use aa_workflow_core::{RunId, RunStore, RunWorkflowOptions, WorkflowDefinition, WorkflowEvent, run_workflow};
 
 /// 可选的事件订阅者（每个 `ctx.step` 落盘事件都会回调）。首参 `run_id` 由
 /// core 直接给出（同 [`aa_workflow_core::RunWorkflowOptions::publish`]）。
@@ -54,15 +54,14 @@ impl DriveOpts<'_> {
     }
 }
 
-/// 跑/续跑一条 workflow，返回引擎的 [`RunOutcome`]。
+/// 跑/续跑一条 workflow，返回本次 drive 的事件流（对齐 TanStack
+/// `runWorkflow` 只给 `AsyncIterable<WorkflowEvent>`；终局只从事件判断）。
 pub async fn drive<TInput, TOutput, TState>(
     workflow: &WorkflowDefinition<TInput, TOutput, TState>,
     store: Arc<dyn RunStore>,
     input: serde_json::Value,
     opts: DriveOpts<'_>,
-) -> anyhow::Result<RunOutcome> {
+) -> Vec<WorkflowEvent> {
     let options = opts.into_run_options(Arc::new(workflow.clone()), store, input);
-    run_workflow(options)
-        .outcome().await
-        .map_err(|e| anyhow::anyhow!("{e}"))
+    run_workflow(options).collect().await
 }

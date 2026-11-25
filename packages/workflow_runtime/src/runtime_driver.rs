@@ -1143,7 +1143,7 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
             opts = opts.approval(a);
         }
         opts = opts.publish(Some(publish));
-        let drive_result = run_workflow(opts).outcome().await;
+        let drive_result = run_workflow(opts).collect().await;
 
         // 心跳停止 + 释放 lease（无论 drive 成败）。
         let heartbeat_error = heartbeat.stop().await;
@@ -1168,7 +1168,12 @@ impl<TWorkflows: WorkflowRegistry> WorkflowRuntimeDefinition<TWorkflows> {
 
         // drive 出错（step 终局失败等）→ Errored 结果。run_workflow 的错误
         // 详情已经落在事件日志（StepFailed / RunErrored）里，快照里也有。
-        if drive_result.is_err() {
+        // core 的 `collect()` 现在直接返回事件流（不再是 Result）——终局错误
+        // 由 `RunErrored` 事件表示（对齐 TanStack core 测试直接断言事件）。
+        if drive_result
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::RunErrored { .. }))
+        {
             return Ok(WorkflowRuntimeRunResult {
                 kind: WorkflowRuntimeRunResultKind::Errored,
                 run_id: args.run_id.to_string(),

@@ -94,9 +94,9 @@ async fn completed_snapshot_sees_prior_steps_in_order() {
             .input(serde_json::json!({}))
             .run_id("snap:1"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
 
     let seen = seen.lock().unwrap().clone();
     // 串行情形：每个 step 入口看到此前全部完成
@@ -166,9 +166,9 @@ async fn completed_snapshot_never_contains_self() {
             .input(serde_json::json!({}))
             .run_id("snap:2"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
 
     let seen = seen.lock().unwrap().clone();
     // 核心不变量：任何 step 入口看到的「已完成集」都不包含它自己
@@ -225,9 +225,9 @@ async fn completed_accumulates_across_drives() {
             .meta(MetaBag::new().with::<InterimGoalsKey>(vec!["a".to_string()]))
             .run_id("acc:1"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
     assert_eq!(ran.lock().unwrap().clone(), vec!["a".to_string()]);
 
     // 续驱：a 已在日志里 → goals_done_at_start 成立 → 不重复泊车，b/c 跑完。
@@ -241,9 +241,9 @@ async fn completed_accumulates_across_drives() {
             .meta(MetaBag::new().with::<InterimGoalsKey>(vec!["a".to_string()]))
             .run_id("acc:1"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
 
     assert_eq!(
         ran.lock().unwrap().clone(),

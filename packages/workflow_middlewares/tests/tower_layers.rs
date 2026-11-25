@@ -17,7 +17,7 @@ use aa_workflow_core::middleware::{
 };
 use aa_workflow_core::{
     create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunWorkflowOptions,
-    WorkflowCtx,
+    WorkflowCtx, WorkflowEvent,
 };
 
 /// 把一个 tower 原生 `Layer` 装到 step 上。
@@ -85,9 +85,9 @@ async fn tower_timeout_layer_wraps_steps() {
             .input(serde_json::json!({}))
             .run_id("tl:1"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
 
     assert_eq!(
         ran.lock().unwrap().clone(),
@@ -119,13 +119,13 @@ async fn tower_timeout_layer_actually_times_out() {
             .input(serde_json::json!({}))
             .run_id("tl:2"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
 
-    assert_ne!(
-        format!("{:?}", out.status),
-        "Finished",
+    assert!(
+        !out.iter()
+            .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
         "慢 step 应被 tower 的超时层掐断"
     );
 }
@@ -144,9 +144,9 @@ async fn tower_concurrency_limit_layer_wraps_steps() {
             .input(serde_json::json!({}))
             .run_id("tl:3"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
 
     assert_eq!(ran.lock().unwrap().len(), 2);
 }

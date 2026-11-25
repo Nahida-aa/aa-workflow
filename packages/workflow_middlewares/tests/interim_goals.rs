@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use aa_workflow_core::define::StepCtx;
 use aa_workflow_core::event::WorkflowEvent;
 use aa_workflow_core::{
-    CreateWorkflowConfig, InMemoryStore, RunStatus, RunStore, RunWorkflowOptions, SignalDelivery,
-    WorkflowCtx, create_workflow, run_workflow,
+    CreateWorkflowConfig, InMemoryStore, RunStore, RunWorkflowOptions, WorkflowCtx, create_workflow,
+    run_workflow,
 };
 
 use aa_workflow_core::define::MetaBag;
@@ -61,9 +61,9 @@ async fn parks_at_the_goal_step_and_does_not_run_later_steps() {
             .meta(goals_meta(&["b"]))
             .run_id("g:1"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
 
     // 关键断言：停在 b 之后，c 没跑
     assert_eq!(
@@ -73,7 +73,13 @@ async fn parks_at_the_goal_step_and_does_not_run_later_steps() {
     );
     // 真断言 Paused（曾经写成 `assert_ne!(.., Finished)`，而 `Decision::Park`
     // 因错误类型被格式化而退化成 Errored——也满足 `!= Finished`，于是假通过）。
-    assert_eq!(out.status, RunStatus::Paused, "目标达成后应泊车");
+    assert!(
+        out.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::SignalAwaited { .. } | WorkflowEvent::ApprovalRequested { .. }
+        )),
+        "目标达成后应泊车"
+    );
 
     // 日志里有一条 __interim-goal 的 SignalAwaited，meta 带目标
     let has_await = store.get_events("g:1").await.unwrap().iter().any(|e| {
@@ -92,10 +98,14 @@ async fn parks_at_the_goal_step_and_does_not_run_later_steps() {
             .meta(goals_meta(&["b"]))
             .run_id("g:1"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
-    assert_eq!(format!("{:?}", out2.status), "Finished");
+    ;
+    assert!(
+        out2.iter()
+            .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+        "续驱应跑到结束"
+    );
     assert_eq!(
         log.lock().unwrap().clone(),
         vec!["a".to_string(), "b".to_string(), "c".to_string()],
@@ -131,9 +141,13 @@ async fn no_goals_means_no_parking() {
             .input(serde_json::json!({}))
             .run_id("n:1"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
-    assert_eq!(format!("{:?}", out.status), "Finished", "空目标 = 不泊车");
+    ;
+    assert!(
+        out.iter()
+            .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+        "空目标 = 不泊车"
+    );
     assert_eq!(ran.load(Ordering::SeqCst), 1);
 }

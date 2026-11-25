@@ -1088,7 +1088,7 @@ impl WorkflowDefinition {
 mod tests {
     use super::*;
     use crate::engine::{RunWorkflowOptions, run_workflow};
-    use crate::event::RunStatus;
+    use crate::event::WorkflowEvent;
     use crate::middleware::{
         Middleware, MiddlewareServerFn, MiddlewareServerFnArgs, StepRequest,
     };
@@ -1127,11 +1127,17 @@ mod tests {
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf), store).input(serde_json::json!({})),
         )
-        .outcome()
+        .collect()
         .await
-        .unwrap();
-        assert_eq!(out.status, RunStatus::Finished);
-        assert_eq!(out.output, Some(serde_json::json!({ "user": "bob" })));
+        ;
+        assert!(out.iter().any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
+        assert_eq!(
+            out.iter().find_map(|e| match e {
+                WorkflowEvent::RunFinished { output, .. } => output.clone(),
+                _ => None,
+            }),
+            Some(serde_json::json!({ "user": "bob" }))
+        );
     }
 
     /// `next(ext)` 写入的扩展被 handler 读到 —— 对齐 TS 的 `next({ context })`。
@@ -1156,11 +1162,17 @@ mod tests {
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf), store).input(serde_json::json!({})),
         )
-        .outcome()
+        .collect()
         .await
-        .unwrap();
-        assert_eq!(out.status, RunStatus::Finished);
-        assert_eq!(out.output, Some(serde_json::json!({ "user": "alice" })));
+        ;
+        assert!(out.iter().any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
+        assert_eq!(
+            out.iter().find_map(|e| match e {
+                WorkflowEvent::RunFinished { output, .. } => output.clone(),
+                _ => None,
+            }),
+            Some(serde_json::json!({ "user": "alice" }))
+        );
     }
 
     /// 多个 server 的 `next(ext)` 全部合并、后者覆盖同名键 —— 对齐上游
@@ -1215,12 +1227,15 @@ mod tests {
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf), store).input(serde_json::json!({})),
         )
-        .outcome()
+        .collect()
         .await
-        .unwrap();
-        assert_eq!(out.status, RunStatus::Finished);
+        ;
+        assert!(out.iter().any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
         assert_eq!(
-            out.output,
+            out.iter().find_map(|e| match e {
+                WorkflowEvent::RunFinished { output, .. } => output.clone(),
+                _ => None,
+            }),
             Some(serde_json::json!({ "shared": "from-trace" })),
             "后注册的 next(ext) 覆盖同名键"
         );
@@ -1258,10 +1273,10 @@ mod tests {
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf), store).input(serde_json::json!({})),
         )
-        .outcome()
+        .collect()
         .await
-        .unwrap();
-        assert_eq!(out.status, RunStatus::Finished);
+        ;
+        assert!(out.iter().any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
         assert_eq!(
             *order.lock().unwrap(),
             vec![
@@ -1316,16 +1331,16 @@ mod tests {
                 .input(serde_json::json!({}))
                 .run_id("mi:1"),
         )
-        .outcome()
+        .collect()
         .await
-        .unwrap();
+        ;
 
         assert_eq!(
             ran.lock().unwrap().clone(),
             vec!["a".to_string()],
             "b skip 不执行；c 在入口 Park，c/d 都不执行"
         );
-        assert_ne!(format!("{:?}", out.status), "Finished");
+        assert!(!out.iter().any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
 
         let events = store.get_events("mi:1").await.unwrap();
         assert!(
@@ -1408,10 +1423,10 @@ mod tests {
         let out = run_workflow(
             RunWorkflowOptions::new(Arc::new(wf), store).input(serde_json::json!({})),
         )
-        .outcome()
+        .collect()
         .await
-        .unwrap();
-        assert_eq!(out.status, RunStatus::Finished);
+        ;
+        assert!(out.iter().any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
     }
 
     /// 对齐上游 `ReadonlyArray<AnyMiddleware>`：不同来源的中间件放进同一个数组，
@@ -1457,12 +1472,15 @@ mod tests {
             RunWorkflowOptions::new(Arc::new(wf), Arc::new(InMemoryStore::new()))
                 .input(serde_json::json!({})),
         )
-        .outcome()
+        .collect()
         .await
-        .unwrap();
-        assert_eq!(out.status, RunStatus::Finished);
+        ;
+        assert!(out.iter().any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
         assert_eq!(
-            out.output,
+            out.iter().find_map(|e| match e {
+                WorkflowEvent::RunFinished { output, .. } => output.clone(),
+                _ => None,
+            }),
             Some(serde_json::json!({ "user": "alice", "trace": "t-1" }))
         );
     }

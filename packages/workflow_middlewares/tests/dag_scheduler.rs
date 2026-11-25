@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aa_workflow_core::{
-    create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunStatus,
-    RunWorkflowOptions,
+    create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunWorkflowOptions,
+    WorkflowEvent,
 };
 use aa_workflow_middlewares::{DagSpec, dag_to_handler, define_dag};
 use serde_json::{Value, json};
@@ -73,18 +73,22 @@ async fn dag_schedules_by_dependency_order_and_fans_out() {
             .input(json!({ "base": 7 }))
             .run_id("dag:1"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
 
-    assert_eq!(out.status, RunStatus::Finished);
+    assert!(out.iter().any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
     let got = exec.lock().unwrap().clone();
     assert_eq!(got.len(), 4);
     assert_eq!(got[0], "a");
     assert_eq!(got[3], "d");
     assert!(got[1..3].contains(&"b") && got[1..3].contains(&"c"));
+    let output = out.iter().find_map(|e| match e {
+        WorkflowEvent::RunFinished { output, .. } => Some(output.clone()),
+        _ => None,
+    });
     assert_eq!(
-        out.output.unwrap(),
+        output.unwrap().unwrap(),
         json!({ "results": { "a": { "v": 7 }, "b": 14, "c": 21, "d": 35 } })
     );
 }
@@ -121,9 +125,9 @@ async fn dag_replay_short_circuits_checkpointed_nodes() {
         run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone()).run_id(run_id),
         )
-        .outcome()
+        .collect()
         .await
-        .unwrap();
+        ;
     }
     // 第二次 drive 命中重放短路：节点闭包一次也没再跑。
     assert_eq!(runs.lock().unwrap().clone(), BTreeMap::from([("a".to_string(), 1), ("b".to_string(), 1)]));

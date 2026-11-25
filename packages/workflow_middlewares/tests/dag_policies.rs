@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use aa_workflow_core::StepCtx;
 use aa_workflow_core::event::WorkflowEvent;
 use aa_workflow_core::{
-    create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunStatus, RunStore,
+    create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunStore,
     RunWorkflowOptions, WorkflowCtx,
 };
 use aa_workflow_middlewares::{
@@ -109,9 +109,9 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
             .input(serde_json::json!({}))
             .run_id("r1"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
     // enrich / translate 是 fan-out，彼此先后不定；排序后比集合。
     let mut got = debug_exec_log.lock().unwrap().clone();
     got.sort();
@@ -124,7 +124,7 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
     // 期望：load/enrich 复用（不执行），translate/merge 真跑，merge 达成后泊车
     //（publish 不执行）。
     debug_exec_log.lock().unwrap().clear();
-    let out = run_workflow(
+    let events = run_workflow(
         RunWorkflowOptions::new(wf.clone(), store.clone())
             .input(serde_json::json!({}))
             .meta(
@@ -137,9 +137,8 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
             )
             .run_id("r2"),
     )
-    .outcome()
-    .await
-    .unwrap();
+    .collect()
+    .await;
 
     assert_eq!(
         debug_exec_log.lock().unwrap().clone(),
@@ -147,7 +146,20 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
         "load/enrich 复用、merge 达成即停、publish 不跑"
     );
     // 真断言 Paused（同 interim_goals 的测试：`!= Finished` 会放过 Errored）。
-    assert_eq!(out.status, RunStatus::Paused, "应泊车");
+    // Paused 没有终局事件，按事件流判断：有 SignalAwaited/ApprovalRequested 且没有 RunFinished。
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+        "不应有 RunFinished"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::SignalAwaited { .. } | WorkflowEvent::ApprovalRequested { .. }
+        )),
+        "应泊车（有 SignalAwaited / ApprovalRequested）"
+    );
     assert!(
         store
             .get_events("r2")
@@ -179,15 +191,19 @@ async fn redo_reuse_and_goal_park_via_dag_plan() {
 
     // 续驱：publish 补跑（load/enrich/translate/merge 短路）
     debug_exec_log.lock().unwrap().clear();
-    let out3 = run_workflow(
+    let events3 = run_workflow(
         RunWorkflowOptions::new(wf, store.clone())
             .input(serde_json::json!({}))
             .run_id("r2"),
     )
-    .outcome()
-    .await
-    .unwrap();
-    assert_eq!(format!("{:?}", out3.status), "Finished");
+    .collect()
+    .await;
+    assert!(
+        events3
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+        "续驱应 Finished（有 RunFinished）"
+    );
     assert_eq!(
         debug_exec_log.lock().unwrap().clone(),
         vec!["publish".to_string()],
@@ -217,14 +233,18 @@ async fn no_plan_means_no_behavior() {
             }
         });
 
-    let out = run_workflow(
+    let events = run_workflow(
         RunWorkflowOptions::new(Arc::new(wf), store.clone())
             .input(serde_json::json!({}))
             .run_id("np:1"),
     )
-    .outcome()
-    .await
-    .unwrap();
-    assert_eq!(format!("{:?}", out.status), "Finished", "无 plan = 无行为");
+    .collect()
+    .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+        "无 plan = 无行为（有 RunFinished）"
+    );
     assert_eq!(debug_exec_log.lock().unwrap().len(), 1);
 }

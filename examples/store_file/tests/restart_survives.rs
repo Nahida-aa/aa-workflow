@@ -46,7 +46,7 @@ fn base_dir(tag: &str) -> PathBuf {
 
         // 第一顿（= 进程 A）：落盘 FileExecutionStore
         let store = core_store(&base);
-        let out1 = drive(
+        let events_out1 = drive(
             &wf,
             store.clone(),
             input.clone(),
@@ -56,9 +56,10 @@ fn base_dir(tag: &str) -> PathBuf {
                 ..DriveOpts::default()
             },
         )
-        .await
-        .unwrap();
-        assert_eq!(out1.status, RunStatus::Finished);
+        .await;
+        assert!(events_out1
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
         let events_1 = store.get_events("digest:r").await.unwrap();
         let scan_ts_1 = events_1
             .iter()
@@ -72,7 +73,7 @@ fn base_dir(tag: &str) -> PathBuf {
 
         // "进程重启"：全新 store 实例打开同一 base 再续跑 → 全部短路
         let store2 = core_store(&base);
-        let out2 = drive(
+        let events_out2 = drive(
             &wf,
             store2.clone(),
             input,
@@ -81,9 +82,10 @@ fn base_dir(tag: &str) -> PathBuf {
                 ..DriveOpts::default()
             },
         )
-        .await
-        .unwrap();
-        assert_eq!(out2.status, RunStatus::Finished);
+        .await;
+        assert!(events_out2
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
         let events_2 = store2.get_events("digest:r").await.unwrap();
         assert_eq!(
             events_2
@@ -140,7 +142,7 @@ fn base_dir(tag: &str) -> PathBuf {
         // 进程 B：全新 FileExecutionStore 打开同一 base 续跑 → 不重复挂起等待点。
         // 顺序 drive 就够——进程 A 被 abort 时同样没写终态，Paused 也是。
         let store2 = core_store(&base);
-        let out = drive(
+        let events = drive(
             &wf,
             store2.clone(),
             serde_json::json!({}),
@@ -149,9 +151,11 @@ fn base_dir(tag: &str) -> PathBuf {
                 ..DriveOpts::default()
             },
         )
-        .await
-        .unwrap();
-        assert_eq!(out.status, RunStatus::Paused);
+        .await;
+        assert!(events.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::SignalAwaited { .. } | WorkflowEvent::ApprovalRequested { .. }
+        )));
         assert_eq!(
             store2
                 .get_events("approve:r")
@@ -167,7 +171,7 @@ fn base_dir(tag: &str) -> PathBuf {
 
         // 进程 B 的第二次 drive：审批载荷随它一起给。
         let store2b = store2.clone();
-        let out = drive(
+        let out_events = drive(
             &wf,
             store2,
             serde_json::json!({}),
@@ -181,11 +185,17 @@ fn base_dir(tag: &str) -> PathBuf {
                 ..DriveOpts::default()
             },
         )
-        .await
-        .unwrap();
-        assert_eq!(out.status, RunStatus::Finished);
+        .await;
+        assert!(out_events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
         assert_eq!(
-            out.output,
+            out_events
+                .iter()
+                .find_map(|e| match e {
+                    WorkflowEvent::RunFinished { output, .. } => output.clone(),
+                    _ => None,
+                }),
             Some(serde_json::json!({ "approved": true, "feedback": null }))
         );
         let events = store2b.get_events("approve:r").await.unwrap();
@@ -221,7 +231,7 @@ fn base_dir(tag: &str) -> PathBuf {
         // 进程 A：跑到第一个 sleep 挂起（挂起 = 结束，进程可以退）。
         let store = core_store(&base);
         let wf = workflows::invoice();
-        let first = drive(
+        let first_events = drive(
             &wf,
             store.clone(),
             input.clone(),
@@ -230,9 +240,11 @@ fn base_dir(tag: &str) -> PathBuf {
                 ..DriveOpts::default()
             },
         )
-        .await
-        .unwrap();
-        assert_eq!(first.status, RunStatus::Paused);
+        .await;
+        assert!(first_events.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::SignalAwaited { .. } | WorkflowEvent::ApprovalRequested { .. }
+        )));
         assert_eq!(
             store
                 .get_run_state("invoice:r")
@@ -276,13 +288,23 @@ fn base_dir(tag: &str) -> PathBuf {
                         ..DriveOpts::default()
                     },
                 )
-                .await
-                .unwrap(),
+                .await,
             );
         }
-        let out = out.expect("应至少驱动一次");
-        assert_eq!(out.status, RunStatus::Finished);
-        assert_eq!(out.output.unwrap()["settled"], true);
+        let out_events = out.expect("应至少驱动一次");
+        assert!(out_events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
+        assert_eq!(
+            out_events
+                .iter()
+                .find_map(|e| match e {
+                    WorkflowEvent::RunFinished { output, .. } => output.clone(),
+                    _ => None,
+                })
+                .expect("RunFinished 应带 output")["settled"],
+            true
+        );
 
         let events = store2.get_events("invoice:r").await.unwrap();
         assert_eq!(

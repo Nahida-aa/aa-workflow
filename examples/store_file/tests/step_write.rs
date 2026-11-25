@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use aa_workflow_core::{RunStatus, RunWorkflowOptions, WorkflowEvent, run_workflow};
+use aa_workflow_core::{RunWorkflowOptions, WorkflowEvent, run_workflow};
 use aa_workflow_runtime::run_store_adapter::{WorkflowExecutionStore, create_run_store_adapter};
 use aa_workflow_runtime::types::ReadEventsArgs;
 use example_store_file::{FileExecutionStore, step_write};
@@ -27,14 +27,25 @@ fn core_store(tag: &str) -> (Arc<dyn WorkflowExecutionStore>, std::path::PathBuf
 async fn run(tag: &str) -> serde_json::Value {
     let (store, dir) = core_store(tag);
     let core = create_run_store_adapter(store);
-    let out = run_workflow(
+    let events = run_workflow(
         RunWorkflowOptions::new(step_write(), core)
             .input(serde_json::json!({ "base": 7 })),
     )
-    .outcome().await
-    .unwrap();
-    assert_eq!(out.status, RunStatus::Finished);
-    let o = out.output.unwrap();
+    .collect().await
+    ;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+        "run 应 Finished"
+    );
+    let o = events
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::RunFinished { output, .. } => output.clone(),
+            _ => None,
+        })
+        .expect("RunFinished 应带 output");
     let _ = std::fs::remove_dir_all(dir);
     o
 }
@@ -140,18 +151,22 @@ async fn step_return_values_reach_the_log_for_all_three_steps() {
             .input(serde_json::json!({ "base": 7 }))
             .run_id("step-write-logged".to_string()),
     )
-    .outcome().await
-    .unwrap();
-    assert_eq!(out.status, RunStatus::Finished);
+    .collect().await
+    ;
+    assert!(
+        out.iter()
+            .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+        "run 应 Finished"
+    );
 
-    let events = store
+    let stored = store
         .read_events(ReadEventsArgs {
-            run_id: out.run_id,
+            run_id: "step-write-logged".to_string(),
             from_index: None,
         })
         .unwrap();
     let logged_of = |id: &str| {
-        events
+        stored
             .iter()
             .find(|e| e.event_type == "STEP_FINISHED" && e.step_id.as_deref() == Some(id))
             .map(|e| match &e.event {

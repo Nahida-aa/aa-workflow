@@ -420,7 +420,7 @@ struct RunStoreAdapter {
 ///
 /// ```ignore
 /// let store: Arc<dyn WorkflowExecutionStore> = Arc::new(MyStore::new());
-/// let outcome = run_workflow(wf, create_run_store_adapter(store), &opts, None).outcome().await?;
+/// let outcome = run_workflow(wf, create_run_store_adapter(store), &opts, None).collect().await?;
 /// ```
 ///
 /// # 为什么不让实现者自己 `impl RunStore`
@@ -798,7 +798,7 @@ mod e2e_tests {
     //! 端到端验证适配器：用 `WorkflowExecutionStore` 实现驱动 core 的引擎。
     use super::*;
     use crate::in_memory_store::InMemoryExecutionStore;
-    use aa_workflow_core::{BaseCtx, CreateWorkflowConfig, RunWorkflowOptions, RunStatus, StepCtx, WorkflowDefinition, create_workflow};
+    use aa_workflow_core::{BaseCtx, CreateWorkflowConfig, RunWorkflowOptions, RunStatus, StepCtx, WorkflowDefinition, WorkflowEvent, create_workflow};
 
     /// 用适配器把一个 `WorkflowExecutionStore` 实现接进 core，跑通一次真实
     /// workflow：**这是「不需要实现者手写两套方法」的实证。**
@@ -820,16 +820,28 @@ mod e2e_tests {
         let exec: Arc<dyn WorkflowExecutionStore> = mem.clone();
         let store = create_run_store_adapter(exec);
 
-        let out = aa_workflow_core::run_workflow(
+        let events = aa_workflow_core::run_workflow(
             RunWorkflowOptions::new(Arc::new(wf.clone()), store)
                 .input(serde_json::json!({}))
-            .run_id("e2e:1"),
+                .run_id("e2e:1"),
         )
-        .outcome().await
-        .unwrap();
+        .collect()
+        .await;
 
-        assert_eq!(out.status, RunStatus::Finished);
-        assert_eq!(out.output, Some(serde_json::json!({ "got": { "v": 1 } })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+            "run 必须以 Finished 收场"
+        );
+        let output = events
+            .iter()
+            .find_map(|e| match e {
+                WorkflowEvent::RunFinished { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .flatten();
+        assert_eq!(output, Some(serde_json::json!({ "got": { "v": 1 } })));
         // 状态与事件都落在内层 store 里。
         let st = mem.load_run_state(&"e2e:1".to_string()).unwrap().unwrap();
         assert_eq!(st.status, RunStatus::Finished);

@@ -28,7 +28,7 @@
 
 use std::time::Duration;
 use aa_workflow_core::{
-    Backoff, BaseCtx, CreateWorkflowConfig, RetryPolicy, StepCtx, StepOptions, WorkflowCtx,
+    Backoff, BaseCtx, CreateWorkflowConfig, RetryPolicy, StepOptions, WorkflowCtx,
     WorkflowDefinition, create_workflow,
 };
 
@@ -702,7 +702,43 @@ mod tests {
             .expect("应有 StepFinished")
     }
 
-    /// 驱动到**挂起**并返回：`run_workflow` 在挂起点立刻返回 `Paused`（不等外部
+    /// run 是否停在挂起点（paused 没有终态事件，靠挂起 checkpoint 判断）。
+    fn is_paused(events: &[WorkflowEvent]) -> bool {
+        events.iter().any(|e| {
+            matches!(
+                e,
+                WorkflowEvent::SignalAwaited { .. } | WorkflowEvent::ApprovalRequested { .. }
+            )
+        })
+    }
+
+    /// 从事件流里取终态 output（`RunFinished.output`）。
+    fn finished_output(events: &[WorkflowEvent]) -> Option<serde_json::Value> {
+        events.iter().find_map(|e| match e {
+            WorkflowEvent::RunFinished { output, .. } => output.clone(),
+            _ => None,
+        })
+    }
+
+    /// 从事件流里取 run_id（任意带 run_id 的事件）。
+    fn event_run_id(events: &[WorkflowEvent]) -> Option<String> {
+        events.iter().find_map(|e| match e {
+            WorkflowEvent::RunStarted { run_id, .. }
+            | WorkflowEvent::RunFinished { run_id, .. }
+            | WorkflowEvent::RunErrored { run_id, .. } => Some(run_id.clone()),
+            _ => None,
+        })
+    }
+
+    /// 从事件流里取终态错误（`RunErrored.error`）。
+    fn errored_message(events: &[WorkflowEvent]) -> Option<String> {
+        events.iter().find_map(|e| match e {
+            WorkflowEvent::RunErrored { error, .. } => Some(error.message.clone()),
+            _ => None,
+        })
+    }
+
+    /// 驱动到**挂起**并返回事件流：`run_workflow` 在挂起点立刻撒手（不等外部
     /// 投递）。这就是运行时（runtime）要替我们做的事——core 只负责「跑到挂起点
     /// 就撒手」。
     ///
@@ -713,11 +749,9 @@ mod tests {
         store: &Arc<dyn RunStore>,
         wf: &WorkflowDefinition<TInput, TOutput, TState>,
         opts: impl Fn(AnyWorkflowDefinition, Arc<dyn RunStore>) -> RunWorkflowOptions,
-    ) -> RunStatus {
+    ) -> Vec<WorkflowEvent> {
         run_workflow(opts(wf.clone().into(), store.clone()))
-            .outcome().await
-            .unwrap()
-            .status
+            .collect().await
     }
 
     /// 投递外部 signal 后再驱动一次，返回最终结果。
@@ -727,7 +761,7 @@ mod tests {
         opts: impl Fn(AnyWorkflowDefinition, Arc<dyn RunStore>) -> RunWorkflowOptions,
         step_id: &str,
         payload: serde_json::Value,
-    ) -> aa_workflow_core::RunOutcome {
+    ) -> Vec<WorkflowEvent> {
         let run_id = opts(wf.clone().into(), store.clone())
             .run_id
             .clone()
@@ -764,7 +798,7 @@ mod tests {
                 meta: None,
             })
         };
-        run_workflow(options).outcome().await.unwrap()
+        run_workflow(options).collect().await
     }
 
     /// 一次投递载荷：信号或审批。`drive_through_timers` 的首次 drive 用。
@@ -787,7 +821,7 @@ mod tests {
         wf: &WorkflowDefinition<TInput, TOutput, TState>,
         opts: impl Fn(AnyWorkflowDefinition, Arc<dyn RunStore>) -> RunWorkflowOptions,
         first: Option<FirstDelivery>,
-    ) -> aa_workflow_core::RunOutcome {
+    ) -> Vec<WorkflowEvent> {
         let mut pending = first;
         loop {
             let run_id = opts(wf.clone().into(), store.clone())
@@ -801,8 +835,8 @@ mod tests {
                 Some(FirstDelivery::Approval(a)) => options = options.approval(a),
                 None => {}
             }
-            let out = run_workflow(options).outcome().await.unwrap();
-            if out.status != RunStatus::Paused {
+            let out = run_workflow(options).collect().await;
+            if !is_paused(&out) {
                 return out;
             }
             // 挂起投影有两种：signal（含 sleep 的 `__timer`）走 `waiting_for`，
@@ -850,13 +884,18 @@ mod tests {
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({ "orderId": "o-1", "expedited": true })),
         )
-        .outcome().await
-        .unwrap();
-        assert_eq!(out.status, RunStatus::Finished);
+        .collect().await
+        ;
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+            "run 应正常结束"
+        );
 
         // charge 重试 3 次成功（前 2 次失败）
         assert_eq!(payment_gateway::attempts(), 3);
-        let events = store.get_events(&out.run_id).await.unwrap();
+        let run_id = event_run_id(&out).expect("应有 RunStarted/RunFinished");
+        let events = store.get_events(&run_id).await.unwrap();
         let charge_fin = events
             .iter()
             .find_map(|e| match e {
@@ -883,10 +922,9 @@ mod tests {
                 .run_id("approve:r")
         };
 
-        assert_eq!(
-            drive_to_pause(&store, &wf, opts).await,
-            RunStatus::Paused,
-            "挂起时 run 状态应为 Paused"
+        assert!(
+            is_paused(&drive_to_pause(&store, &wf, opts).await),
+            "挂起时 run 应停在 review 等待点"
         );
 
         let out = drive_after_signal(
@@ -897,9 +935,13 @@ mod tests {
             serde_json::json!({ "ok": true }),
         )
         .await;
-        assert_eq!(out.status, RunStatus::Finished);
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+            "投递后 run 应正常结束"
+        );
         assert_eq!(
-            out.output,
+            finished_output(&out),
             Some(serde_json::json!({ "approved": true, "feedback": null }))
         );
 
@@ -938,7 +980,7 @@ mod tests {
         };
 
         let out = drive_through_timers(&store, &wf, opts, None).await;
-        assert_eq!(out.status, RunStatus::Paused, "应停在 payment 等审批");
+        assert!(is_paused(&out), "应停在 payment 等审批");
         let out = drive_after_signal(
             &store,
             &wf,
@@ -947,7 +989,11 @@ mod tests {
             serde_json::json!({ "ok": true }),
         )
         .await;
-        assert_eq!(out.status, RunStatus::Finished);
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+            "投递后 run 应正常结束"
+        );
 
         let events = store.get_events("fulfill:p").await.unwrap();
         assert_eq!(finished_count(&events, "reserve-inventory"), 1);
@@ -973,20 +1019,25 @@ mod tests {
             )
             .input(serde_json::json!({ "orderId": "o-1", "amount": 500 })),
         )
-        .outcome().await
-        .unwrap();
-        assert_eq!(out.status, RunStatus::Finished);
+        .collect().await
+        ;
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+            "未超阈值应立即结束"
+        );
         assert_eq!(
-            out.output,
+            finished_output(&out),
             Some(serde_json::json!({
                 "orderId": "o-1", "status": "approved", "amount": 500, "currency": "USD"
             }))
         );
+        let run_id = event_run_id(&out).expect("应有 RunStarted/RunFinished");
         assert_eq!(
-            finished_count(&store.get_events(&out.run_id).await.unwrap(), "charge-payment"),
+            finished_count(&store.get_events(&run_id).await.unwrap(), "charge-payment"),
             1
         );
-        let events = store.get_events(&out.run_id).await.unwrap();
+        let events = store.get_events(&run_id).await.unwrap();
         assert!(
             !events
                 .iter()
@@ -1006,7 +1057,7 @@ mod tests {
                 .run_id("approve:o")
         };
 
-        assert_eq!(drive_to_pause(&store, &wf, opts).await, RunStatus::Paused);
+        assert!(is_paused(&drive_to_pause(&store, &wf, opts).await));
         let out = drive_after_signal(
             &store,
             &wf,
@@ -1015,9 +1066,14 @@ mod tests {
             serde_json::json!({ "ok": false, "feedback": "budget overrun" }),
         )
         .await;
-        assert_eq!(out.status, RunStatus::Finished);
-        assert_eq!(out.output.clone().unwrap()["status"], "rejected");
-        assert_eq!(out.output.clone().unwrap()["reason"], "budget overrun");
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+            "投递后 run 应正常结束"
+        );
+        let output = finished_output(&out).expect("RunFinished 应带 output");
+        assert_eq!(output["status"], "rejected");
+        assert_eq!(output["reason"], "budget overrun");
         let events = store.get_events("approve:o").await.unwrap();
         assert_eq!(finished_count(&events, "notify-rejected"), 1);
         assert_eq!(finished_count(&events, "charge-payment"), 0);
@@ -1040,10 +1096,15 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(out.status, RunStatus::Finished);
-        assert_eq!(out.output.unwrap()["settled"], true);
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+            "两次 timer 投递后 run 应正常结束"
+        );
+        assert_eq!(finished_output(&out).unwrap()["settled"], true);
 
-        let events = store.get_events(&out.run_id).await.unwrap();
+        let run_id = event_run_id(&out).expect("应有 RunStarted/RunFinished");
+        let events = store.get_events(&run_id).await.unwrap();
         assert_eq!(finished_count(&events, "settle-invoice"), 1);
         for step in ["settle-due-1", "settle-due-2"] {
             let paused = events
@@ -1073,7 +1134,7 @@ mod tests {
         };
 
         let out = drive_to_pause(&store, &wf, opts).await;
-        assert_eq!(out, RunStatus::Paused);
+        assert!(is_paused(&out));
         let out = drive_after_signal(
             &store,
             &wf,
@@ -1082,7 +1143,7 @@ mod tests {
             serde_json::json!({ "ok": true }),
         )
         .await;
-        assert_eq!(out.status, RunStatus::Paused, "应停在第二个事件上");
+        assert!(is_paused(&out), "应停在第二个事件上");
         let out = drive_after_signal(
             &store,
             &wf,
@@ -1091,8 +1152,12 @@ mod tests {
             serde_json::json!({ "ok": true }),
         )
         .await;
-        assert_eq!(out.status, RunStatus::Finished);
-        assert_eq!(out.output.unwrap()["archived"], true);
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+            "两次投递后 run 应正常结束"
+        );
+        assert_eq!(finished_output(&out).unwrap()["archived"], true);
 
         let events = store.get_events("comp:r").await.unwrap();
         assert_eq!(finished_count(&events, "archive-record"), 1);
@@ -1110,7 +1175,7 @@ mod tests {
         };
 
         let out = drive_to_pause(&store, &wf, opts).await;
-        assert_eq!(out, RunStatus::Paused);
+        assert!(is_paused(&out));
         let out = drive_after_signal(
             &store,
             &wf,
@@ -1119,7 +1184,7 @@ mod tests {
             serde_json::json!({ "ok": true }),
         )
         .await;
-        assert_eq!(out.status, RunStatus::Paused);
+        assert!(is_paused(&out));
         let out = drive_after_signal(
             &store,
             &wf,
@@ -1128,8 +1193,15 @@ mod tests {
             serde_json::json!({ "ok": false }),
         )
         .await;
-        assert_eq!(out.status, RunStatus::Finished);
-        assert_eq!(out.output.clone().unwrap()["status"], "declined");
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+            "拒绝后 run 应正常结束（走 declined 分支）"
+        );
+        assert_eq!(
+            finished_output(&out).expect("RunFinished 应带 output")["status"],
+            "declined"
+        );
         let events = store.get_events("refund:d").await.unwrap();
         assert_eq!(finished_count(&events, "disburse-refund"), 0);
     }
@@ -1152,7 +1224,7 @@ mod tests {
 
         // 两次 approve → 中间的 sleep 由 `drive_through_timers` 自动投递。
         let out = drive_to_pause(&store, &wf, opts).await;
-        assert_eq!(out, RunStatus::Paused);
+        assert!(is_paused(&out));
         let out = drive_after_signal(
             &store,
             &wf,
@@ -1161,12 +1233,12 @@ mod tests {
             serde_json::json!({ "ok": true }),
         )
         .await;
-        assert_eq!(out.status, RunStatus::Paused);
+        assert!(is_paused(&out));
         // 此刻泊在 `refund-wait`（sleep）上——审批还没轮到，**不能提前投**
         // （core 的 deliver_approval 过闸：没泊在该审批上就报错）。先把 timer
         // 驱动到泊上 `refund-policy`。
         let out = drive_through_timers(&store, &wf, opts, None).await;
-        assert_eq!(out.status, RunStatus::Paused, "timer 后应泊在 refund-policy");
+        assert!(is_paused(&out), "timer 后应泊在 refund-policy");
         // 审批载荷随这一次 drive 给。
         let out = drive_through_timers(
             &store,
@@ -1179,8 +1251,15 @@ mod tests {
             })),
         )
         .await;
-        assert_eq!(out.status, RunStatus::Finished);
-        assert_eq!(out.output.clone().unwrap()["status"], "refunded");
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+            "审批通过后 run 应正常结束"
+        );
+        assert_eq!(
+            finished_output(&out).expect("RunFinished 应带 output")["status"],
+            "refunded"
+        );
 
         let events = store.get_events("refund:q").await.unwrap();
         assert_eq!(finished_count(&events, "disburse-refund"), 1);
@@ -1212,10 +1291,14 @@ mod tests {
                 .input(serde_json::json!({ "orderId": "o-1" }))
                 .run_id("fulfill:bad"),
         )
-        .outcome().await
-        .unwrap();
-        assert_eq!(out.status, RunStatus::Errored, "缺 readyAt 应 schema 报错");
-        let msg = out.error.unwrap().message;
+        .collect().await
+        ;
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, WorkflowEvent::RunErrored { .. })),
+            "缺 readyAt 应 schema 报错"
+        );
+        let msg = errored_message(&out).expect("RunErrored 应带 error");
         assert!(
             msg.contains("ready_at") || msg.contains("missing field"),
             "错误应指向字段路径: {msg}"
@@ -1238,19 +1321,20 @@ mod tests {
             RunWorkflowOptions::new(Arc::new(wf.clone()), store.clone())
                 .input(serde_json::json!({})),
         )
-        .outcome().await
-        .unwrap();
-        assert_eq!(
-            out.status,
-            RunStatus::Errored,
+        .collect().await
+        ;
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, WorkflowEvent::RunErrored { .. })),
             "initialize 产物不符 state_schema 应报错"
         );
-        let err = out.error.unwrap().message;
+        let err = errored_message(&out).expect("RunErrored 应带 error");
         assert!(
             err.contains("missing field") || err.contains("total") || err.contains("settle_events"),
             "错误应指向 state 形状: {err}"
         );
-        let st = store.get_run_state(&out.run_id).await.unwrap().unwrap();
+        let run_id = event_run_id(&out).expect("应有 RunStarted/RunErrored");
+        let st = store.get_run_state(&run_id).await.unwrap().unwrap();
         assert_eq!(
             st.status,
             RunStatus::Errored,
@@ -1296,10 +1380,14 @@ mod tests {
             RunWorkflowOptions::new(wf.clone(), store.clone())
                 .input(serde_json::json!({})),
         )
-        .outcome().await
-        .unwrap();
-        assert_eq!(out.status, RunStatus::Finished);
-        assert_eq!(out.output, Some(serde_json::json!(99)));
+        .collect().await
+        ;
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+            "run 应正常结束"
+        );
+        assert_eq!(finished_output(&out), Some(serde_json::json!(99)));
     }
 
     /// state 每次调用（start/resume）都从 initialize(input) 重建、step 闭包之外的
@@ -1313,10 +1401,7 @@ mod tests {
         let store_a: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
         let wf_a = state_demo();
         let opts_a = |wf: AnyWorkflowDefinition, store: Arc<dyn RunStore>| RunWorkflowOptions::new(wf, store).input(inp()).run_id("state:burst");
-        assert_eq!(
-            drive_to_pause(&store_a, &wf_a, opts_a).await,
-            RunStatus::Paused
-        );
+        assert!(is_paused(&drive_to_pause(&store_a, &wf_a, opts_a).await));
         let out_burst = drive_after_signal(
             &store_a,
             &wf_a,
@@ -1325,17 +1410,19 @@ mod tests {
             serde_json::json!({ "ok": true }),
         )
         .await;
-        assert_eq!(out_burst.status, RunStatus::Finished);
+        assert!(
+            out_burst
+                .iter()
+                .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+            "run A 应正常结束"
+        );
 
         // run B：挂起在 gate（模拟进程退出——挂起时确实没人在跑），投递后重跑
         // 同 run_id → 引擎从头重建 state + 重放 handler，最终输出应与 A 一致。
         let store_b: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
         let wf = state_demo();
         let opts_b = |wf: AnyWorkflowDefinition, store: Arc<dyn RunStore>| RunWorkflowOptions::new(wf, store).input(inp()).run_id("state:gated");
-        assert_eq!(
-            drive_to_pause(&store_b, &wf, opts_b).await,
-            RunStatus::Paused
-        );
+        assert!(is_paused(&drive_to_pause(&store_b, &wf, opts_b).await));
         let paused_b = store_b.get_run_state("state:gated").await.unwrap().unwrap();
         assert_eq!(paused_b.status, RunStatus::Paused, "gate 应把 run 挂起");
         let out_b = drive_after_signal(
@@ -1346,7 +1433,12 @@ mod tests {
             serde_json::json!({ "ok": true }),
         )
         .await;
-        assert_eq!(out_b.status, RunStatus::Finished);
+        assert!(
+            out_b
+                .iter()
+                .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+            "run B 应正常结束"
+        );
 
         // 跳过 preparedAt（每次取 now_ms）比较其余全部字段。
         let project = |o: &serde_json::Value| {
@@ -1364,12 +1456,12 @@ mod tests {
             "settled": true,
         });
         assert_eq!(
-            project(&out_burst.output.unwrap()),
+            project(&finished_output(&out_burst).expect("RunFinished 应带 output")),
             expected,
             "一次跑完的输出"
         );
         assert_eq!(
-            project(&out_b.output.unwrap()),
+            project(&finished_output(&out_b).expect("RunFinished 应带 output")),
             expected,
             "崩溃重启后输出应一致（state 重建+重放）"
         );
@@ -1425,7 +1517,7 @@ mod tests {
                 Ok(serde_json::json!({ "total": ctx.state["total"] }))
             });
         let opts = |wf: AnyWorkflowDefinition, store: Arc<dyn RunStore>| RunWorkflowOptions::new(wf, store).input(serde_json::json!({})).run_id("state:flush");
-        assert_eq!(drive_to_pause(&store, &wf, opts).await, RunStatus::Paused);
+        assert!(is_paused(&drive_to_pause(&store, &wf, opts).await));
         let out = drive_after_signal(
             &store,
             &wf,
@@ -1434,8 +1526,12 @@ mod tests {
             serde_json::json!({ "ok": true }),
         )
         .await;
-        assert_eq!(out.status, RunStatus::Finished);
-        assert_eq!(out.output, Some(serde_json::json!({ "total": 1 })));
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+            "投递后 run 应正常结束"
+        );
+        assert_eq!(finished_output(&out), Some(serde_json::json!({ "total": 1 })));
     }
 
     /// TanStack 0.0.4 同款 sharp edge：重启重放（crash → re-run handler）时，
@@ -1486,13 +1582,12 @@ mod tests {
             });
 
         // 进程 A：跑到 gate 挂起（挂起即没人执行——等价于进程退出，不写终态）。
-        assert_eq!(
-            drive_to_pause(&store, &wf, |wf: AnyWorkflowDefinition, store: Arc<dyn RunStore>| {
+        assert!(is_paused(
+            &drive_to_pause(&store, &wf, |wf: AnyWorkflowDefinition, store: Arc<dyn RunStore>| {
                 RunWorkflowOptions::new(wf, store).input(serde_json::json!({ "amount": 5 })).run_id("state:edge")
             })
-            .await,
-            RunStatus::Paused
-        );
+            .await
+        ));
 
         // 进程 B：同 run_id 重跑 → state 从 initialize 重建为 5，`bump-inside`
         // 已被 checkpoint 记录 → 闭包跳过（+1 丢失），只剩闭包之外的 mutation。
@@ -1506,10 +1601,14 @@ mod tests {
                 })
                 .run_id("state:edge"),
         )
-        .outcome().await
-        .unwrap();
-        assert_eq!(out.status, RunStatus::Finished);
-        let o = out.output.unwrap();
+        .collect().await
+        ;
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+            "重跑后 run 应正常结束"
+        );
+        let o = finished_output(&out).expect("RunFinished 应带 output");
         assert_eq!(
             o["total"].as_u64().unwrap(),
             5,
@@ -1543,9 +1642,9 @@ mod tests {
                 move |_run_id: &aa_workflow_core::RunId, e: WorkflowEvent| sink.lock().unwrap().push(e.clone()),
             ))),
         )
-        .outcome().await
-        .unwrap();
-        assert_eq!(first.status, RunStatus::Paused);
+        .collect().await
+        ;
+        assert!(is_paused(&first));
 
         // 挂起投影：waiting_for.signal_name = 事件通道（≠ pause key）。
         let st = store.get_run_state("event:gate").await.unwrap().unwrap();
@@ -1570,15 +1669,14 @@ mod tests {
             })),
         )
         .await;
-        assert_eq!(out.status, RunStatus::Finished);
-        assert_eq!(
-            out.output.clone().unwrap()["settlement"],
-            serde_json::json!({ "px": 62000 })
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+            "timer 投递后 run 应正常结束"
         );
-        assert_eq!(
-            out.output.clone().unwrap()["finalized"],
-            serde_json::json!(true)
-        );
+        let output = finished_output(&out).expect("RunFinished 应带 output");
+        assert_eq!(output["settlement"], serde_json::json!({ "px": 62000 }));
+        assert_eq!(output["finalized"], serde_json::json!(true));
 
         // emit 进 publisher 但不进日志。
         assert!(seen.lock().unwrap().iter().any(|e| matches!(
@@ -1604,7 +1702,7 @@ mod tests {
             RunWorkflowOptions::new(wf, store).input(serde_json::json!({ "market": "eth", "predictedAt": 0 }))
                 .run_id("event:crash")
         };
-        assert_eq!(drive_to_pause(&store, &wf, opts).await, RunStatus::Paused);
+        assert!(is_paused(&drive_to_pause(&store, &wf, opts).await));
 
         // 信号载荷随首次 drive 给；`sleep_until(0)` 也会挂起，之后由 timer 推进。
         let out = drive_through_timers(
@@ -1620,9 +1718,13 @@ mod tests {
             })),
         )
         .await;
-        assert_eq!(out.status, RunStatus::Finished);
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+            "重跑后 run 应正常结束"
+        );
         assert_eq!(
-            out.output.clone().unwrap()["settlement"],
+            finished_output(&out).expect("RunFinished 应带 output")["settlement"],
             serde_json::json!({ "px": 3000 })
         );
         assert_eq!(

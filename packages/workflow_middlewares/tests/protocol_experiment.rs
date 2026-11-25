@@ -357,7 +357,7 @@ fn authoring_cost_static_counts() {
 use aa_workflow_core::define::{
     CreateWorkflowConfig, MetaBag, StepCtx, WorkflowCtx, create_workflow,
 };
-use aa_workflow_core::{InMemoryStore, RunStatus, RunStore, RunWorkflowOptions, run_workflow};
+use aa_workflow_core::{InMemoryStore, RunStore, RunWorkflowOptions, WorkflowEvent, run_workflow};
 
 #[derive(Clone)]
 struct StepsMw {
@@ -392,13 +392,20 @@ async fn cps_side_flat_serve_runs_in_the_real_engine() {
             .meta(MetaBag::new().with::<SkipFlag>(true))
             .run_id("exp:skip"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
-    assert_eq!(out.status, RunStatus::Finished);
+    ;
+    assert!(
+        out.iter().any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+        "run 正常结束"
+    );
+    let output = out.iter().find_map(|e| match e {
+        WorkflowEvent::RunFinished { output, .. } => Some(output.clone()),
+        _ => None,
+    });
     assert_eq!(
-        out.output,
-        Some(serde_json::json!({ "skipped": true })),
+        output,
+        Some(Some(serde_json::json!({ "skipped": true }))),
         "CPS 平铺短路直接产出结果"
     );
 
@@ -409,9 +416,9 @@ async fn cps_side_flat_serve_runs_in_the_real_engine() {
             .meta(MetaBag::new().with::<SkipFlag>(false))
             .run_id("exp:run"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
     assert!(
         !log.lock().unwrap().is_empty(),
         "TimedCps 的 after 逻辑（await 之后）已执行"

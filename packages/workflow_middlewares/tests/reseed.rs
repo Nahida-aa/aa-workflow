@@ -61,9 +61,9 @@ async fn redo_reuses_steps_outside_redo_set() {
             .input(serde_json::json!({}))
             .run_id("rev1"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
     assert_eq!(
         exec.lock().unwrap().clone(),
         vec!["a".to_string(), "b".to_string(), "c".to_string()]
@@ -71,7 +71,7 @@ async fn redo_reuses_steps_outside_redo_set() {
 
     // rev2：给 plan → 只重跑 c，a/b 复用
     exec.lock().unwrap().clear();
-    let out = run_workflow(
+    let events = run_workflow(
         RunWorkflowOptions::new(wf, store.clone())
             .input(serde_json::json!({}))
             .meta(reseed_meta(ReseedPlan {
@@ -80,11 +80,12 @@ async fn redo_reuses_steps_outside_redo_set() {
             }))
             .run_id("rev2"),
     )
-    .outcome()
-    .await
-    .unwrap();
+    .collect()
+    .await;
 
-    assert_eq!(format!("{:?}", out.status), "Finished");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
     // 关键：只有 c 真正执行过
     assert_eq!(
         exec.lock().unwrap().clone(),
@@ -151,13 +152,13 @@ async fn redo_with_empty_redo_set_reuses_everything() {
             .input(serde_json::json!({}))
             .run_id("s1"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
 
     // s2：空 redoSet → 全部复用
     exec.lock().unwrap().clear();
-    let out = run_workflow(
+    let events = run_workflow(
         RunWorkflowOptions::new(wf, store.clone())
             .input(serde_json::json!({}))
             .meta(reseed_meta(ReseedPlan {
@@ -166,11 +167,12 @@ async fn redo_with_empty_redo_set_reuses_everything() {
             }))
             .run_id("s2"),
     )
-    .outcome()
-    .await
-    .unwrap();
+    .collect()
+    .await;
 
-    assert_eq!(format!("{:?}", out.status), "Finished");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
     assert!(
         exec.lock().unwrap().is_empty(),
         "空 redoSet = 全部复用，零业务执行"
@@ -202,7 +204,7 @@ async fn redo_with_missing_source_runs_everything() {
             }
         });
 
-    let out = run_workflow(
+    let events = run_workflow(
         RunWorkflowOptions::new(Arc::new(wf), store.clone())
             .input(serde_json::json!({}))
             .meta(reseed_meta(ReseedPlan {
@@ -211,10 +213,11 @@ async fn redo_with_missing_source_runs_everything() {
             }))
             .run_id("m1"),
     )
-    .outcome()
-    .await
-    .unwrap();
-    assert_eq!(format!("{:?}", out.status), "Finished");
+    .collect()
+    .await;
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
     assert_eq!(ran.load(Ordering::SeqCst), 1, "源不存在 → 业务函数真跑");
     void(exec);
 }
@@ -304,7 +307,7 @@ async fn source_read_failure_is_propagated() {
             }
         });
 
-    let out = run_workflow(
+    let events = run_workflow(
         RunWorkflowOptions::new(Arc::new(wf), store)
             .input(serde_json::json!({}))
             .meta(reseed_meta(ReseedPlan {
@@ -313,21 +316,26 @@ async fn source_read_failure_is_propagated() {
             }))
             .run_id("m2"),
     )
-    .outcome()
-    .await
-    .unwrap();
+    .collect()
+    .await;
 
-    assert_eq!(format!("{:?}", out.status), "Errored");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, WorkflowEvent::RunErrored { .. })));
     assert_eq!(
         ran.load(Ordering::SeqCst),
         0,
         "读源失败不该被吞掉、静默降级为真跑"
     );
+    let error = events
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::RunErrored { error, .. } => Some(error.clone()),
+            _ => None,
+        })
+        .expect("应记录错误");
     assert!(
-        out.error
-            .expect("应记录错误")
-            .message
-            .contains("source log unavailable"),
+        error.message.contains("source log unavailable"),
         "错误应来自 store 读失败"
     );
 }
@@ -373,7 +381,7 @@ async fn completed_step_without_result_is_reused_as_null() {
             }
         });
 
-    let out = run_workflow(
+    let events = run_workflow(
         RunWorkflowOptions::new(Arc::new(wf), store.clone())
             .input(serde_json::json!({}))
             .meta(reseed_meta(ReseedPlan {
@@ -382,11 +390,12 @@ async fn completed_step_without_result_is_reused_as_null() {
             }))
             .run_id("n2"),
     )
-    .outcome()
-    .await
-    .unwrap();
+    .collect()
+    .await;
 
-    assert_eq!(format!("{:?}", out.status), "Finished");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
     assert_eq!(
         ran.load(Ordering::SeqCst),
         0,

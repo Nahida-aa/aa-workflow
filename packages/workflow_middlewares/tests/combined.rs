@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use aa_workflow_core::define::{MetaBag, StepCtx};
 use aa_workflow_core::event::WorkflowEvent;
 use aa_workflow_core::{
-    CreateWorkflowConfig, InMemoryStore, RunStatus, RunStore, RunWorkflowOptions, WorkflowCtx,
+    CreateWorkflowConfig, InMemoryStore, RunStore, RunWorkflowOptions, WorkflowCtx,
     create_workflow, run_workflow,
 };
 use aa_workflow_middlewares::{
@@ -72,9 +72,9 @@ async fn outer_reseed_short_circuits_before_interim_goals_can_park() {
             .input(serde_json::json!({}))
             .run_id("c1"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
     assert_eq!(
         ran.lock().unwrap().clone(),
         vec!["a".to_string(), "b".to_string(), "c".to_string()],
@@ -99,9 +99,9 @@ async fn outer_reseed_short_circuits_before_interim_goals_can_park() {
             )
             .run_id("c2"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
 
     // **层序的后果**：`reseed` 在外层，c 入口被它 `SkipImported` 短路，
     // 内层 `interim_goals` 根本没被调用 → goals 看不到 c 的入口 → 不泊车。
@@ -111,9 +111,8 @@ async fn outer_reseed_short_circuits_before_interim_goals_can_park() {
         vec!["b".to_string()],
         "只有 b 真跑（在 redo_set）；a/c 被复用"
     );
-    assert_eq!(
-        out.status,
-        RunStatus::Finished,
+    assert!(
+        out.iter().any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
         "reseed 在外层时 c 被短路，interim_goals 看不到入口 → 不泊车"
     );
 
@@ -163,9 +162,9 @@ async fn outer_interim_goals_parks_before_reseed_short_circuits() {
             .input(serde_json::json!({}))
             .run_id("d1"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
 
     ran.lock().unwrap().clear();
     let out = run_workflow(
@@ -181,18 +180,20 @@ async fn outer_interim_goals_parks_before_reseed_short_circuits() {
             )
             .run_id("d2"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
 
     assert_eq!(
         ran.lock().unwrap().clone(),
         vec!["b".to_string()],
         "注册顺序不影响两个 meta key 的读取"
     );
-    assert_eq!(
-        out.status,
-        RunStatus::Paused,
+    assert!(
+        out.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::SignalAwaited { .. } | WorkflowEvent::ApprovalRequested { .. }
+        )),
         "反序（interim_goals 在外层）应能泊车；实际 err={:?}",
         store.get_run_state("d2").await.unwrap().unwrap().error
     );
@@ -242,12 +243,15 @@ async fn outer_interim_goals_wins_the_park_race() {
             )
             .run_id("p1"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
 
     assert_eq!(ran.lock().unwrap().clone(), vec!["a".to_string()]);
-    assert_eq!(out.status, RunStatus::Paused);
+    assert!(out.iter().any(|e| matches!(
+        e,
+        WorkflowEvent::SignalAwaited { .. } | WorkflowEvent::ApprovalRequested { .. }
+    )));
     let m = park_meta(&store, "p1").await.expect("应泊车");
     assert!(
         m.get("__interimGoals").is_some(),
@@ -280,12 +284,15 @@ async fn outer_dag_policies_wins_the_park_race() {
             )
             .run_id("q1"),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
 
     assert_eq!(ran.lock().unwrap().clone(), vec!["a".to_string()]);
-    assert_eq!(out.status, RunStatus::Paused);
+    assert!(out.iter().any(|e| matches!(
+        e,
+        WorkflowEvent::SignalAwaited { .. } | WorkflowEvent::ApprovalRequested { .. }
+    )));
     let m = park_meta(&store, "q1").await.expect("应泊车");
     assert!(
         m.get("goals").is_some() && m.get("__interimGoals").is_none(),

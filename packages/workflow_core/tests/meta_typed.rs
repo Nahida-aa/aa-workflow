@@ -14,7 +14,7 @@ use aa_workflow_core::define::{Cons, MetaBag, MetaKey, Nil};
 use aa_workflow_core::middleware::{Middleware, MiddlewareServerFnArgs};
 use aa_workflow_core::{
     create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunStore,
-    RunWorkflowOptions, StepCtx, WorkflowCtx,
+    RunWorkflowOptions, StepCtx, WorkflowCtx, WorkflowEvent,
 };
 
 /// 一个「消费 meta」的中间件包会定义的 key。
@@ -64,9 +64,13 @@ async fn declared_meta_is_required_and_typed() {
         .meta(MetaBag::<Nil>::new().set::<LoopLimitKey>(7))
         .run_id("meta-typed:1");
 
-    let out = run_workflow(opts).outcome().await.unwrap();
+    let events = run_workflow(opts).collect().await;
+    let output = events.iter().find_map(|e| match e {
+        WorkflowEvent::RunFinished { output, .. } => output.clone(),
+        _ => None,
+    });
     assert_eq!(
-        out.output,
+        output,
         Some(serde_json::json!({ "limit": 7 })),
         "handler 读到的应当是调用方提供的值"
     );
@@ -88,8 +92,12 @@ async fn erased_workflow_does_not_constrain_meta() {
         .input(serde_json::json!({}))
         .run_id("meta-erased:1");
 
-    let out = run_workflow(opts).outcome().await.unwrap();
-    assert_eq!(out.output, Some(serde_json::json!({ "limit": null })));
+    let events = run_workflow(opts).collect().await;
+    let output = events.iter().find_map(|e| match e {
+        WorkflowEvent::RunFinished { output, .. } => output.clone(),
+        _ => None,
+    });
+    assert_eq!(output, Some(serde_json::json!({ "limit": null })));
 }
 
 /// **编译期保证**：声明了 meta 的 workflow，`meta` 少提供字段就不通过。

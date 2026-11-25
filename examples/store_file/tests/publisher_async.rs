@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aa_workflow_core::{BaseCtx, CreateWorkflowConfig, RunStatus, RunWorkflowOptions, StepCtx, WorkflowEvent, create_workflow, run_workflow};
+use aa_workflow_core::{BaseCtx, CreateWorkflowConfig, RunWorkflowOptions, StepCtx, WorkflowEvent, create_workflow, run_workflow};
 use aa_workflow_runtime::run_store_adapter::{WorkflowExecutionStore, create_run_store_adapter};
 use example_store_file::FileExecutionStore;
 
@@ -94,9 +94,9 @@ async fn slow_publisher_does_not_stall_the_engine() {
                 }
             }),
     )
-    .outcome().await
-    .unwrap();
-    assert_eq!(out.status, RunStatus::Finished);
+    .collect().await
+    ;
+    assert!(out.iter().any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
 
     let handler = *handler_elapsed.lock().unwrap();
     assert!(
@@ -140,9 +140,9 @@ async fn async_publisher_can_await_without_blocking_the_runtime() {
                 }
             }),
     )
-    .outcome().await
-    .unwrap();
-    assert_eq!(out.status, RunStatus::Finished);
+    .collect().await
+    ;
+    assert!(out.iter().any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
     assert!(!seen.lock().unwrap().is_empty(), "async publisher 应被调用");
 }
 
@@ -171,8 +171,8 @@ async fn delivery_order_matches_production_order() {
                 }
             }),
     )
-    .outcome().await
-    .unwrap();
+    .collect().await
+    ;
 
     let got = seen.lock().unwrap().clone();
     assert_eq!(got, vec!["a", "b", "c"], "step 的投递顺序必须等于执行顺序");
@@ -203,9 +203,9 @@ async fn terminal_event_is_delivered_before_run_workflow_returns() {
                 }
             }),
     )
-    .outcome().await
-    .unwrap();
-    assert_eq!(out.status, RunStatus::Finished);
+    .collect().await
+    ;
+    assert!(out.iter().any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
 
     let got = seen.lock().unwrap().clone();
     assert_eq!(
@@ -248,9 +248,12 @@ async fn paused_path_also_drains_the_queue() {
                 }
             }),
     )
-    .outcome().await
-    .unwrap();
-    assert_eq!(out.status, RunStatus::Paused);
+    .collect().await
+    ;
+    assert!(out.iter().any(|e| matches!(
+        e,
+        WorkflowEvent::SignalAwaited { .. } | WorkflowEvent::ApprovalRequested { .. }
+    )));
 
     let got = seen.lock().unwrap().clone();
     assert_eq!(
@@ -287,8 +290,8 @@ async fn event_moves_into_the_future_with_no_extra_clone() {
                 }
             }),
     )
-    .outcome().await
-    .unwrap();
+    .collect().await
+    ;
 
     let got = done.lock().unwrap().clone();
     assert_eq!(got.last().map(String::as_str), Some("RUN_FINISHED"), "{got:?}");

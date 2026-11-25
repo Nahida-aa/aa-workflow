@@ -544,7 +544,7 @@ pub type AnyMiddleware = Middleware;
 mod tests {
     use super::*;
     use crate::define::{CreateWorkflowConfig, StepCtx, WorkflowCtx, create_workflow};
-    use crate::{InMemoryStore, RunStatus, RunStore, RunWorkflowOptions, run_workflow};
+    use crate::{InMemoryStore, RunStore, RunWorkflowOptions, WorkflowEvent, run_workflow};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// 参数化中间件的**状态就是字段**：同一实例跨 drive 复用（不重新构造、
@@ -582,11 +582,11 @@ mod tests {
                     .input(serde_json::json!({}))
                     .run_id("count:1"),
             )
-            .outcome()
+            .collect()
         };
         let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
-        run(Arc::clone(&store)).await.unwrap();
-        run(store).await.unwrap();
+        run(Arc::clone(&store)).await;
+        run(store).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2, "同一实例服务两次 drive");
 
     }
@@ -613,9 +613,8 @@ mod tests {
         let out = run_workflow(
             RunWorkflowOptions::new(wf, store).input(serde_json::json!({})),
         )
-        .outcome()
-        .await
-        .unwrap();
-        assert_eq!(out.status, RunStatus::Finished);
+        .collect()
+        .await;
+        assert!(out.iter().any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
     }
 }

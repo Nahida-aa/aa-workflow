@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use aa_workflow_store_sqlx_postgres::SqlxPostgresStore;
 use sqlx::postgres::PgPoolOptions;
-use aa_workflow_core::{RunStatus, RunWorkflowOptions, create_workflow, run_workflow};
+use aa_workflow_core::{RunWorkflowOptions, WorkflowEvent, create_workflow, run_workflow};
 use aa_workflow_runtime::run_store_adapter::create_run_store_adapter;
 
 fn database_url() -> String {
@@ -109,17 +109,21 @@ fn run_workflow_against_postgres_store() {
     // 跑 workflow：同一个 runtime 驱动。
     let wf = parallel_workflow();
     let core_store = create_run_store_adapter(Arc::new(store));
-    let outcome = rt
-        .block_on(async {
-            run_workflow(
-                RunWorkflowOptions::new(wf.clone(), core_store)
-                    .input(serde_json::json!({ "n": 1 })),
-            )
-            .outcome().await
-        })
-        .expect("run_workflow");
+    let events: Vec<WorkflowEvent> = rt.block_on(async {
+        run_workflow(
+            RunWorkflowOptions::new(wf.clone(), core_store)
+                .input(serde_json::json!({ "n": 1 })),
+        )
+        .collect()
+        .await
+    });
 
-    assert_eq!(outcome.status, RunStatus::Finished, "workflow 应跑完");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+        "workflow 应跑完"
+    );
 
     // 事件确实落到了 Postgres。
     let events: i64 = rt

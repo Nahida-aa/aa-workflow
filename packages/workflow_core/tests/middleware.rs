@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use aa_workflow_core::define::{DefExt, ExtNamespace};
 use aa_workflow_core::middleware::{Middleware, MiddlewareServerFnArgs};
 use aa_workflow_core::{
-    create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunStatus, RunStore,
+    create_workflow, run_workflow, CreateWorkflowConfig, InMemoryStore, RunStore,
     RunWorkflowOptions, StepCtx, WorkflowCtx, WorkflowEvent,
 };
 use serde_json::{json, Value};
@@ -88,16 +88,21 @@ async fn extends_ctx_with_middleware_added_fields() {
             Ok(json!({ "userId": user.id, "userName": user.name }))
         });
 
-    let out = run_workflow(
+    let events = run_workflow(
         RunWorkflowOptions::new(Arc::new(wf), Arc::new(InMemoryStore::new())).input(json!({})),
     )
-    .outcome()
-    .await
-    .unwrap();
+    .collect()
+    .await;
 
-    assert_eq!(out.status, RunStatus::Finished);
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
+    let output = events.iter().find_map(|e| match e {
+        WorkflowEvent::RunFinished { output, .. } => Some(output.clone()),
+        _ => None,
+    });
     assert_eq!(
-        out.output,
+        output.flatten(),
         Some(json!({ "userId": "u-1", "userName": "Alice" }))
     );
 }
@@ -136,14 +141,19 @@ async fn composes_multiple_middlewares_in_order_accumulating_ctx_fields() {
             Ok(json!({ "sum": sum }))
         });
 
-    let out = run_workflow(
+    let events = run_workflow(
         RunWorkflowOptions::new(Arc::new(wf), Arc::new(InMemoryStore::new())).input(json!({})),
     )
-    .outcome()
-    .await
-    .unwrap();
-    assert_eq!(out.status, RunStatus::Finished);
-    assert_eq!(out.output, Some(json!({ "sum": 11 })));
+    .collect()
+    .await;
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
+    let output = events.iter().find_map(|e| match e {
+        WorkflowEvent::RunFinished { output, .. } => Some(output.clone()),
+        _ => None,
+    });
+    assert_eq!(output.flatten(), Some(json!({ "sum": 11 })));
 }
 
 /// 对齐上游用例 3：`wraps the handler so middleware can run code before AND after`
@@ -176,9 +186,9 @@ async fn wraps_the_handler_so_middleware_can_run_code_before_and_after() {
     run_workflow(
         RunWorkflowOptions::new(Arc::new(wf), Arc::new(InMemoryStore::new())).input(json!({})),
     )
-    .outcome()
+    .collect()
     .await
-    .unwrap();
+    ;
 
     assert_eq!(
         *events.lock().unwrap(),
@@ -201,15 +211,22 @@ async fn rejects_calling_next_more_than_once_in_a_middleware() {
         .middleware(broken)
         .handler(|_ctx: WorkflowCtx| async move { Ok(json!({})) });
 
-    let out = run_workflow(
+    let events = run_workflow(
         RunWorkflowOptions::new(Arc::new(wf), Arc::new(InMemoryStore::new())).input(json!({})),
     )
-    .outcome()
-    .await
-    .unwrap();
+    .collect()
+    .await;
 
-    assert_eq!(out.status, RunStatus::Errored);
-    let err = out.error.expect("应记录错误");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, WorkflowEvent::RunErrored { .. })));
+    let err = events
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::RunErrored { error, .. } => Some(error.clone()),
+            _ => None,
+        })
+        .expect("应记录错误");
     assert!(
         err.message.contains("at most once"),
         "错误信息应含 `at most once`，实际: {}",
@@ -270,16 +287,17 @@ async fn middleware_reads_the_run_event_log() {
                 .await
         });
 
-    let out = run_workflow(
+    let events = run_workflow(
         RunWorkflowOptions::new(Arc::new(wf), store)
             .input(json!({}))
             .run_id("mw-events:1"),
     )
-    .outcome()
-    .await
-    .unwrap();
+    .collect()
+    .await;
 
-    assert_eq!(out.status, RunStatus::Finished);
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })));
     assert_eq!(
         *seen.lock().unwrap(),
         vec!["pre".to_string()],

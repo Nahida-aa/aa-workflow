@@ -16,7 +16,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use aa_workflow_core::{RunStatus, RunWorkflowOptions, WorkflowEvent, run_workflow};
+use aa_workflow_core::{RunWorkflowOptions, WorkflowEvent, run_workflow};
 use aa_workflow_runtime::run_store_adapter::{WorkflowExecutionStore, create_run_store_adapter};
 use aa_workflow_runtime::types::ReadEventsArgs;
 use example_store_file::{FileExecutionStore, progress_report};
@@ -48,10 +48,21 @@ async fn drive(
                 sink.lock().unwrap().push(e.clone())
             }))),
     )
-    .outcome().await
-    .unwrap();
-    assert_eq!(out.status, RunStatus::Finished);
-    assert_eq!(out.output.unwrap()["slow"]["rounds"], ROUNDS);
+    .collect()
+    .await;
+    assert!(
+        out.iter().any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+        "run 必须以 Finished 收场"
+    );
+    let output = out
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::RunFinished { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .flatten()
+        .expect("RunFinished 应带 output");
+    assert_eq!(output["slow"]["rounds"], ROUNDS);
 
     let logged = store
         .read_events(ReadEventsArgs {
@@ -177,9 +188,17 @@ async fn resume_does_not_continue_the_progress_counter() {
             .input(input.clone())
             .run_id("r"),
     )
-    .outcome().await
-    .unwrap();
-    assert_eq!(first.output.unwrap()["slow"]["reported"], ROUNDS);
+    .collect()
+    .await;
+    let first_output = first
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::RunFinished { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .flatten()
+        .expect("RunFinished 应带 output");
+    assert_eq!(first_output["slow"]["reported"], ROUNDS);
 
     // 同 run_id 再跑一次：闭包被短路，reported 仍是日志里那个值，
     // 而不是「再报 5 次 = 10」。
@@ -193,11 +212,22 @@ async fn resume_does_not_continue_the_progress_counter() {
                 sink.lock().unwrap().push(e.clone())
             }))),
     )
-    .outcome().await
-    .unwrap();
-    assert_eq!(second.status, RunStatus::Finished);
+    .collect()
+    .await;
+    assert!(
+        second.iter().any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+        "run 必须以 Finished 收场"
+    );
+    let second_output = second
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::RunFinished { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .flatten()
+        .expect("RunFinished 应带 output");
     assert_eq!(
-        second.output.unwrap()["slow"]["reported"],
+        second_output["slow"]["reported"],
         ROUNDS,
         "resume 应原样恢复日志里的值，不接着累加"
     );
