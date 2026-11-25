@@ -16,6 +16,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::OnceCell;
 use tokio::task::JoinSet;
+use tracing::Instrument;
 
 use super::declare::DagSpec;
 
@@ -46,13 +47,18 @@ where
     let ctx = ctx.clone();
 
     let mut set = JoinSet::new();
+    // tokio task 不继承调用方的 tracing span：宿主用 span 携带 video_dir 等
+    // 上下文落盘时会在 JoinSet::spawn 这里断链。spawn 前捕获当前 span 并在
+    // 节点 future 上 instrument，让节点内的日志继续带宿主上下文。
+    let span = tracing::Span::current();
     for id in spec.nodes.keys() {
         let id = id.clone();
         let spec = spec.clone();
         let cells = cells.clone();
         let ctx = ctx.clone();
+        let span = span.clone();
         set.spawn(async move {
-            let value = ensure(&id, &spec, &cells, &ctx).await?;
+            let value = ensure(&id, &spec, &cells, &ctx).instrument(span).await?;
             Ok::<_, anyhow::Error>((id, value))
         });
     }

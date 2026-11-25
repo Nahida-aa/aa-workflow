@@ -12,6 +12,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt", "sync"] }
 tower = { version = "0.5.3", features = ["util"] }
+# DAG 每个节点跑在 JoinSet::spawn 的新 task 里；tokio task 不继承调用方的
+# tracing span，宿主（如 LocalDub）用 span 携带 video_dir 落盘时会在这里断链。
+# spawn 前捕获 Span::current() 并在节点 future 上 instrument，恢复继承。
+tracing = "0.1"
 
 [dev-dependencies]
 # 测试里手写 RunStore（注入读失败）要用：该 trait 是 async_trait 形。
