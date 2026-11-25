@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use aa_workflow_core::{CreateWorkflowConfig, InMemoryStore, RunStatus, RunStore, RunWorkflowOptions, StepCtx, WorkflowDefinition, create_workflow, run_workflow};
+use aa_workflow_core::{CreateWorkflowConfig, InMemoryStore, RunStore, RunWorkflowOptions, WorkflowDefinition, WorkflowEvent, create_workflow, run_workflow};
 
 #[derive(serde::Deserialize, Clone, serde::Serialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -38,16 +38,28 @@ fn charge_workflow() -> WorkflowDefinition<ChargeInput, serde_json::Value> {
 #[tokio::test]
 async fn typed_input_is_deserialized_and_reaches_the_handler() {
     let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
-    let outcome = run_workflow(
+    let events = run_workflow(
         RunWorkflowOptions::new(charge_workflow(), store)
             .input(serde_json::json!({ "amount": 4200, "userId": "cus_123" })),
     )
-    .outcome().await
-    .unwrap();
+    .collect()
+    .await;
 
-    assert_eq!(outcome.status, RunStatus::Finished);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+        "run 必须以 Finished 收场"
+    );
+    let output = events
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::RunFinished { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .flatten();
     assert_eq!(
-        outcome.output,
+        output,
         Some(serde_json::json!({
             // sc.id = 确定性 step id → 可作幂等键
             "chargeId": "ch_stripe-charge",
@@ -64,26 +76,37 @@ async fn typed_input_is_deserialized_and_reaches_the_handler() {
 #[tokio::test]
 async fn typed_input_rejects_missing_field() {
     let store: Arc<dyn RunStore> = Arc::new(InMemoryStore::new());
-    let outcome = run_workflow(
+    let events = run_workflow(
         RunWorkflowOptions::new(charge_workflow(), store.clone())
             .input(serde_json::json!({ "amount": 4200 })), // 缺 userId
     )
-    .outcome().await
-    .unwrap();
+    .collect()
+    .await;
 
-    assert_eq!(outcome.status, RunStatus::Errored);
-    let msg = outcome.error.unwrap().message;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::RunErrored { .. })),
+        "run 必须以 Errored 收场"
+    );
+    let err = events
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::RunErrored { error, .. } => Some(error.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let msg = err.message;
     assert!(
         msg.contains("user_id") || msg.contains("missing field"),
         "错误应指向字段路径，实际：{msg}"
     );
 
     // 校验失败不该留下半个 run：没有 STEP_* 事件。
-    let events = store.get_events(&outcome.run_id).await.unwrap();
     assert!(
         !events
             .iter()
-            .any(|e| matches!(e, aa_workflow_core::WorkflowEvent::StepFinished { .. })),
+            .any(|e| matches!(e, WorkflowEvent::StepFinished { .. })),
         "schema 校验失败不应产生 StepFinished"
     );
 }
@@ -146,9 +169,14 @@ async fn step_ctx_id_is_stable_across_resume() {
             .input(input.clone())
             .run_id("charge-1"),
     )
-    .outcome().await
-    .unwrap();
-    assert_eq!(first.status, RunStatus::Finished);
+    .collect()
+    .await;
+    assert!(
+        first
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+        "first run 必须以 Finished 收场"
+    );
 
     // 同 run_id 再 drive：已成功 step 短路，输出（含 chargeId）应逐字相同。
     let second = run_workflow(
@@ -156,23 +184,45 @@ async fn step_ctx_id_is_stable_across_resume() {
             .input(input)
             .run_id("charge-1"),
     )
-    .outcome().await
-    .unwrap();
+    .collect()
+    .await;
 
-    assert_eq!(second.status, RunStatus::Finished);
+    assert!(
+        second
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::RunFinished { .. })),
+        "second run 必须以 Finished 收场"
+    );
+    let first_output = first
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::RunFinished { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .flatten();
+    let second_output = second
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::RunFinished { output, .. } => Some(output.clone()),
+            _ => None,
+        })
+        .flatten();
     assert_eq!(
-        second.output, first.output,
+        second_output, first_output,
         "resume 应短路到缓存结果，sc.id 不能漂移"
     );
 
     // 幂等键确实来自 sc.id，而不是每次新生成。
-    let charge_id = |o: &aa_workflow_core::RunOutcome| {
-        o.output
-            .as_ref()
-            .and_then(|v| v.get("chargeId"))
-            .and_then(|v| v.as_str())
+    let charge_id = |events: &[WorkflowEvent]| {
+        events
+            .iter()
+            .find_map(|e| match e {
+                WorkflowEvent::RunFinished { output, .. } => output.clone(),
+                _ => None,
+            })
+            .and_then(|v| v.get("chargeId").cloned())
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
             .unwrap_or_default()
-            .to_string()
     };
     assert_eq!(charge_id(&first), "ch_stripe-charge");
     assert_eq!(charge_id(&second), charge_id(&first));
