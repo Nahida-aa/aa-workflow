@@ -730,7 +730,6 @@ async fn append_seed(
             run_id,
             WorkflowEvent::SignalResolved {
                 ts: now_ms(),
-                run_id: run_id.to_string(),
                 step_id,
                 name,
                 signal_id: d.signal_id.clone(),
@@ -751,7 +750,6 @@ async fn append_seed(
             run_id,
             WorkflowEvent::ApprovalResolved {
                 ts: now_ms(),
-                run_id: run_id.to_string(),
                 step_id: a.approval_id.clone(),
                 approval_id: a.approval_id.clone(),
                 approved: a.approved,
@@ -804,8 +802,8 @@ async fn drive(
         // 引擎路径），所以这条事实只能 emit 到流里。日志保持原样——重复 append
         // 一条终局事件会把「被取消」记成两次。
         return Err(WorkflowEvent::RunErrored {
+            run_id: run_id.to_string(),
             ts: now_ms(),
-            run_id: run_id.clone(),
             error: st
                 .error
                 .clone()
@@ -834,7 +832,7 @@ async fn drive(
             st
         }
         None => RunState {
-            run_id: run_id.clone(),
+            run_id: run_id.to_string(),
             workflow_id: workflow.id.clone(),
             workflow_version: workflow.version.clone(),
             status: RunStatus::Running,
@@ -989,7 +987,7 @@ async fn drive(
     // 同一个位置。慢 publish 因此只拖慢**消费端吞吐**，不拖慢引擎进度：引擎只做
     // 一次非阻塞 `send`。
     let inner = Arc::new(EngineRuntime {
-        run_id: run_id.clone(),
+        run_id: run_id.to_string(),
         // 选中的那一版（可能是 previous_versions 里的旧版本）。
         workflow: active.clone(),
         input: opts.input.clone(),
@@ -1020,7 +1018,7 @@ async fn drive(
     });
     inner.publish(&WorkflowEvent::RunStarted {
         ts,
-        run_id: run_id.clone(),
+        run_id: run_id.to_string(),
         thread_id: opts.thread_id.clone(),
     });
 
@@ -1081,14 +1079,14 @@ async fn drive(
 
     let terminal = match &failure {
         Some((err, code)) => WorkflowEvent::RunErrored {
+            run_id: run_id.to_string(),
             ts: now_ms(),
-            run_id: run_id.clone(),
             error: err.clone(),
             code: *code,
         },
         None => WorkflowEvent::RunFinished {
+            run_id: run_id.to_string(),
             ts: now_ms(),
-            run_id: run_id.clone(),
             output: output.clone(),
         },
     };
@@ -1151,8 +1149,8 @@ async fn attach_decision(
     // 状态刚读出来过，不可能不存在。
     let Some(state) = persisted else {
         return Some(vec![WorkflowEvent::RunErrored {
-            ts: now_ms(),
             run_id: run_id.to_string(),
+            ts: now_ms(),
             error: RunError {
                 name: "RunLost".to_string(),
                 message: format!("Run {run_id} not found."),
@@ -1181,13 +1179,13 @@ async fn attach_decision(
     if !has_terminal {
         match state.status {
             RunStatus::Finished => out.push(WorkflowEvent::RunFinished {
-                ts: now_ms(),
                 run_id: run_id.to_string(),
+                ts: now_ms(),
                 output: state.output.clone(),
             }),
             RunStatus::Errored | RunStatus::Aborted => out.push(WorkflowEvent::RunErrored {
-                ts: now_ms(),
                 run_id: run_id.to_string(),
+                ts: now_ms(),
                 error: state.error.clone().unwrap_or(RunError {
                     name: "Unknown".to_string(),
                     message: "Run ended in non-terminal state".to_string(),
@@ -1208,8 +1206,8 @@ async fn attach_decision(
 
 fn err_event(run_id: &str, e: impl std::fmt::Display, code: RunErrorCode) -> WorkflowEvent {
     WorkflowEvent::RunErrored {
-        ts: now_ms(),
         run_id: run_id.to_string(),
+        ts: now_ms(),
         error: RunError {
             name: "StoreError".to_string(),
             message: e.to_string(),
@@ -1250,8 +1248,8 @@ async fn error_persisted(
     // 落盘失败不改变这条事件：流是内存队列，与日志是两件事（上游同形）。
     let _ = store.set_run_state(run_id, &run_state).await;
     WorkflowEvent::RunErrored {
-        ts: now_ms(),
         run_id: run_id.to_string(),
+        ts: now_ms(),
         error: run_err,
         code,
     }
@@ -1467,8 +1465,7 @@ mod tests {
         .collect()
         .await;
         match events.last() {
-            Some(WorkflowEvent::RunErrored { run_id, code, .. }) => {
-                assert_eq!(run_id, "ab");
+            Some(WorkflowEvent::RunErrored { code, .. }) => {
                 assert_eq!(
                     *code,
                     RunErrorCode::Aborted,
@@ -1557,9 +1554,7 @@ mod tests {
     /// 从事件里取 run 身份。
     fn run_id_of(events: &[WorkflowEvent]) -> Option<String> {
         events.iter().find_map(|e| match e {
-            WorkflowEvent::RunStarted { run_id, .. }
-            | WorkflowEvent::RunFinished { run_id, .. }
-            | WorkflowEvent::RunErrored { run_id, .. } => Some(run_id.clone()),
+            WorkflowEvent::RunStarted { run_id, .. } => Some(run_id.clone()),
             _ => None,
         })
     }
@@ -1581,9 +1576,7 @@ mod tests {
         let run_id = out
             .iter()
             .find_map(|e| match e {
-                WorkflowEvent::RunStarted { run_id, .. }
-                | WorkflowEvent::RunFinished { run_id, .. }
-                | WorkflowEvent::RunErrored { run_id, .. } => Some(run_id.clone()),
+                WorkflowEvent::RunStarted { run_id, .. } => Some(run_id.clone()),
                 _ => None,
             })
             .expect("应有 RUN_STARTED 带 run_id");

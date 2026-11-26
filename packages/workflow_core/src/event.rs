@@ -36,8 +36,6 @@ pub enum StepStatus {
 /// A single execution attempt of one step (used for retry bookkeeping).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepAttempt {
-    /// 1-based attempt number.
-    pub attempt: usize,
     pub started_at: u64,
     pub finished_at: u64,
     pub result: Option<serde_json::Value>,
@@ -104,6 +102,8 @@ pub enum WorkflowEvent {
     /// Observability only (not persisted): marks the start of a run.
     RunStarted {
         ts: u64,
+        /// 对齐 TanStack `RUN_STARTED.runId`——只有 RUN_STARTED 带 run_id
+        /// （别的事件 run_id 在 store/流外层，不在 payload 里）。
         run_id: String,
         /// 客户端关联用的线程标识（上游 `threadId`，`types.ts:76`）。**只挂在
         /// `RUN_STARTED` 上**，别的事件不带——它不参与 resume，也不落进
@@ -114,12 +114,14 @@ pub enum WorkflowEvent {
     /// Checkpoint (persisted): final state of a completed run.
     RunFinished {
         ts: u64,
+        /// 对齐 TanStack `RUN_FINISHED.runId`（run 级三个事件都带）。
         run_id: String,
         output: Option<serde_json::Value>,
     },
     /// Checkpoint (persisted): the run errored (a step failed terminally).
     RunErrored {
         ts: u64,
+        /// 对齐 TanStack `RUN_ERRORED.runId`（run 级三个事件都带）。
         run_id: String,
         error: RunError,
         /// 机器可读的终局原因（TanStack `RUN_ERRORED.code`）。用它分支，别去
@@ -129,14 +131,12 @@ pub enum WorkflowEvent {
     /// Observability only (not persisted): a step began executing.
     StepStarted {
         ts: u64,
-        run_id: String,
         step_id: String,
     },
     /// Checkpoint (persisted): a step finished successfully; the run may be
     /// resumed from here without re-execution.
     StepFinished {
         ts: u64,
-        run_id: String,
         step_id: String,
         result: Option<serde_json::Value>,
         attempts: Vec<StepAttempt>,
@@ -148,7 +148,6 @@ pub enum WorkflowEvent {
     /// Checkpoint (persisted): a step failed terminally.
     StepFailed {
         ts: u64,
-        run_id: String,
         step_id: String,
         error: RunError,
         attempts: Vec<StepAttempt>,
@@ -162,7 +161,6 @@ pub enum WorkflowEvent {
     /// ms) for sleep-like waits so a timer host could auto-deliver.
     SignalAwaited {
         ts: u64,
-        run_id: String,
         step_id: String,
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,7 +175,6 @@ pub enum WorkflowEvent {
     /// host delivers a decision for); `title` is what approvers see.
     ApprovalRequested {
         ts: u64,
-        run_id: String,
         step_id: String,
         approval_id: String,
         title: String,
@@ -196,7 +193,6 @@ pub enum WorkflowEvent {
     /// `wait_for_event` call returns.
     SignalResolved {
         ts: u64,
-        run_id: String,
         step_id: String,
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -214,7 +210,6 @@ pub enum WorkflowEvent {
     /// `docs/tanstack-alignment.md` 的事件分类对照。
     ApprovalResolved {
         ts: u64,
-        run_id: String,
         step_id: String,
         approval_id: String,
         approved: bool,
@@ -236,7 +231,6 @@ pub enum WorkflowEvent {
     /// across resumes (TanStack `NOW_RECORDED`).
     NowRecorded {
         ts: u64,
-        run_id: String,
         step_id: String,
         value: u64,
     },
@@ -244,7 +238,6 @@ pub enum WorkflowEvent {
     /// replay the same id is served (TanStack `UUID_RECORDED`).
     UuidRecorded {
         ts: u64,
-        run_id: String,
         step_id: String,
         value: String,
     },
@@ -257,7 +250,6 @@ pub enum WorkflowEvent {
     /// delta 语义见 [`crate::engine::state_diff`]。
     StateDelta {
         ts: u64,
-        run_id: String,
         delta: Vec<crate::engine::state_diff::Operation>,
     },
     /// Checkpoint (persisted): 一个撤销 handler 被登记——**登记本身是耐久的**，
@@ -269,7 +261,6 @@ pub enum WorkflowEvent {
     /// 返回 `None`。
     CompensationRegistered {
         ts: u64,
-        run_id: String,
         compensation_id: String,
     },
     /// Checkpoint (persisted): 未捕获失败触发了补偿——原始失败随 `error`
@@ -277,21 +268,18 @@ pub enum WorkflowEvent {
     /// "补偿进行中"。
     CompensationStarted {
         ts: u64,
-        run_id: String,
         error: RunError,
     },
     /// Checkpoint (persisted): 一个已登记的撤销 handler 成功完成——重启后
     /// 该补偿不再重复执行（幂等键 = 补偿 id）。
     CompensationCompleted {
         ts: u64,
-        run_id: String,
         compensation_id: String,
     },
     /// Checkpoint (persisted): 一个撤销 handler 耗尽重试——补偿链就地停止
     /// （后续登记的补偿保持未执行，留给人工处置）。
     CompensationFailed {
         ts: u64,
-        run_id: String,
         compensation_id: String,
         error: RunError,
     },
@@ -301,7 +289,6 @@ pub enum WorkflowEvent {
     /// 事件携带，耗尽前的 STEP_FAILED 不落日志）。
     StepRetryScheduled {
         ts: u64,
-        run_id: String,
         step_id: String,
         /// 本次失败是第几次 attempt（重放时据此续算）。
         attempt: usize,
@@ -315,7 +302,6 @@ pub enum WorkflowEvent {
     /// step's retry policy is `durable` (non-durable attempts stay in-memory).
     StepAttemptStarted {
         ts: u64,
-        run_id: String,
         step_id: String,
         /// 1-based attempt number about to run.
         attempt: usize,

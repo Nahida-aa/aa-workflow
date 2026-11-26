@@ -152,7 +152,6 @@ mod tests {
     fn step_finished(step_id: &str) -> WorkflowEvent {
         WorkflowEvent::StepFinished {
             ts: 0,
-            run_id: "src".into(),
             step_id: step_id.into(),
             result: None,
             attempts: vec![],

@@ -723,9 +723,7 @@ mod tests {
     /// 从事件流里取 run_id（任意带 run_id 的事件）。
     fn event_run_id(events: &[WorkflowEvent]) -> Option<String> {
         events.iter().find_map(|e| match e {
-            WorkflowEvent::RunStarted { run_id, .. }
-            | WorkflowEvent::RunFinished { run_id, .. }
-            | WorkflowEvent::RunErrored { run_id, .. } => Some(run_id.clone()),
+            WorkflowEvent::RunStarted { run_id, .. } => Some(run_id.clone()),
             _ => None,
         })
     }

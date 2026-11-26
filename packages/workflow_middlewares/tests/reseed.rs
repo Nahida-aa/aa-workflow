@@ -352,7 +352,6 @@ async fn completed_step_without_result_is_reused_as_null() {
             0,
             &WorkflowEvent::StepFinished {
                 ts: 1,
-                run_id: "n1".into(),
                 step_id: "a".into(),
                 result: None,
                 attempts: Vec::new(),

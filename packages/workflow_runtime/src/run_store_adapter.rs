@@ -623,8 +623,8 @@ mod adapter_tests {
 
     fn event(run_id: &str) -> WorkflowEvent {
         WorkflowEvent::RunStarted {
+            run_id: run_id.to_string(),
             ts: 0,
-            run_id: run_id.into(),
             thread_id: None,
         }
     }
@@ -705,7 +705,6 @@ mod adapter_tests {
                     i as usize,
                     &WorkflowEvent::StepFinished {
                         ts: i as u64,
-                        run_id: "r1".into(),
                         step_id: format!("old{i}"),
                         result: None,
                         attempts: vec![],
@@ -729,7 +728,6 @@ mod adapter_tests {
                 2,
                 &WorkflowEvent::StepFinished {
                     ts: 99,
-                    run_id: "r1".into(),
                     step_id: "new".into(),
                     result: None,
                     attempts: vec![],
@@ -767,7 +765,6 @@ mod adapter_tests {
                 0,
                 &WorkflowEvent::StepFinished {
                     ts: 1,
-                    run_id: "r1".into(),
                     step_id: "a".into(),
                     result: None,
                     attempts: vec![],

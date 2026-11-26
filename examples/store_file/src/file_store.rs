@@ -452,7 +452,6 @@ impl WorkflowRunStoreAdapterStore for FileExecutionStore {
         write_json(&self.signal_inbox_path(), &inbox)?;
         Ok(Some(WorkflowEvent::SignalResolved {
             ts: args.now,
-            run_id: args.run_id,
             step_id: args.step_id,
             name: args.name,
             signal_id: Some(delivery.signal_id),

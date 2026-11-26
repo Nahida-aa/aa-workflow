@@ -417,7 +417,6 @@ impl WorkflowRunStoreAdapterStore for InMemoryExecutionStore {
 
         Ok(Some(WorkflowEvent::SignalResolved {
             ts: args.now,
-            run_id: args.run_id,
             step_id: args.step_id,
             name: args.name,
             signal_id: Some(delivery.signal_id),
@@ -1252,13 +1251,13 @@ mod in_memory_tests {
             expected_next_index: 0,
             events: vec![
                 WorkflowEvent::RunStarted {
-                    ts: 0,
                     run_id: "r".into(),
+                    ts: 0,
                     thread_id: None,
                 },
                 WorkflowEvent::RunStarted {
-                    ts: 1,
                     run_id: "r".into(),
+                    ts: 1,
                     thread_id: None,
                 },
             ],
@@ -1289,8 +1288,8 @@ mod in_memory_tests {
             run_id: "r".into(),
             expected_next_index: 2,
             events: vec![WorkflowEvent::RunStarted {
-                ts: 2,
                 run_id: "r".into(),
+                ts: 2,
                 thread_id: None,
             }],
         })
@@ -1307,8 +1306,8 @@ mod in_memory_tests {
             run_id: "r".into(),
             expected_next_index: 3,
             events: vec![WorkflowEvent::RunStarted {
-                ts: 3,
                 run_id: "r".into(),
+                ts: 3,
                 thread_id: None,
             }],
         })

@@ -291,7 +291,6 @@ async fn demo_dub_sf_ocr_shape_closure_redo() {
     .into_iter()
     .map(|id| WorkflowEvent::StepFinished {
         ts: 0,
-        run_id: "dub:src".into(),
         step_id: id.into(),
         result: None,
         attempts: vec![],

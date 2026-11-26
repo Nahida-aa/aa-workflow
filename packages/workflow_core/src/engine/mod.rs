@@ -161,7 +161,6 @@ pub(crate) async fn run_compensations(
     }
     let started = WorkflowEvent::CompensationStarted {
         ts: now_ms(),
-        run_id: run_id.to_string(),
         error: RunError::from_anyhow(original),
     };
     if let Err(e) = engine.append(&started).await {
@@ -201,7 +200,6 @@ pub(crate) async fn run_compensations(
                 Ok(()) => {
                     let ev = WorkflowEvent::CompensationCompleted {
                         ts: now_ms(),
-                        run_id: run_id.to_string(),
                         compensation_id: comp.id.clone(),
                     };
                     if let Err(e) = engine.append(&ev).await {
@@ -217,7 +215,6 @@ pub(crate) async fn run_compensations(
                     if attempts >= comp.retry.max_attempts {
                         let ev = WorkflowEvent::CompensationFailed {
                             ts: now_ms(),
-                            run_id: run_id.to_string(),
                             compensation_id: comp.id.clone(),
                             error: err.clone(),
                         };
@@ -625,7 +622,6 @@ impl EngineRuntime {
         }
         let ev = WorkflowEvent::CompensationRegistered {
             ts: now_ms(),
-            run_id: self.run_id.clone(),
             compensation_id: compensation_id.to_string(),
         };
         self.append(&ev).await
@@ -661,7 +657,6 @@ impl EngineRuntime {
         if !delta.is_empty() {
             self.publish(&WorkflowEvent::StateDelta {
                 ts: now_ms(),
-                run_id: self.run_id.clone(),
                 delta,
             });
         }
@@ -753,11 +748,9 @@ meta: Option<crate::event::StepMeta>,
 let ts = now_ms();
 let ev = WorkflowEvent::StepFinished {
     ts,
-    run_id: engine.run_id.clone(),
     step_id: step_id.to_string(),
     result: Some(result.clone()),
     attempts: vec![StepAttempt {
-        attempt: 1,
         started_at: ts,
         finished_at: ts,
         result: Some(result.clone()),
@@ -993,7 +986,6 @@ where
     }
     engine.publish(&WorkflowEvent::StepStarted {
         ts: now_ms(),
-        run_id: engine.run_id.clone(),
         step_id: step_id.to_string(),
     });
 
@@ -1038,7 +1030,6 @@ where
         if retry.as_ref().map(|p| p.durable).unwrap_or(false) {
             let ev = WorkflowEvent::StepAttemptStarted {
                 ts: started_at,
-                run_id: engine.run_id.clone(),
                 step_id: step_id.to_string(),
                 attempt,
             };
@@ -1077,7 +1068,6 @@ where
         match outcome {
             Ok((result, recorded)) => {
                 attempts.push(StepAttempt {
-                    attempt,
                     started_at,
                     finished_at,
                     result: Some(recorded.clone()),
@@ -1085,7 +1075,6 @@ where
                 });
                 let step_finished_event = WorkflowEvent::StepFinished {
                     ts: now_ms(),
-                    run_id: engine.run_id.clone(),
                     step_id: step_id.to_string(),
                     result: Some(recorded.clone()),
                     attempts: attempts.clone(),
@@ -1104,7 +1093,6 @@ where
                 }
                 let run_err = RunError::from_anyhow(&err);
                 attempts.push(StepAttempt {
-                    attempt,
                     started_at,
                     finished_at,
                     result: None,
@@ -1123,7 +1111,6 @@ where
                     let next_attempt_at = now_ms() + (delay as u64).max(1);
                     let ev = WorkflowEvent::StepRetryScheduled {
                         ts: now_ms(),
-                        run_id: engine.run_id.clone(),
                         step_id: step_id.to_string(),
                         attempt,
                         next_attempt_at,
@@ -1159,7 +1146,6 @@ where
                 }
                 let ev = WorkflowEvent::StepFailed {
                     ts: now_ms(),
-                    run_id: engine.run_id.clone(),
                     step_id: step_id.to_string(),
                     error: run_err.clone(),
                     attempts,
@@ -1203,7 +1189,6 @@ pub async fn exec_now(engine: &Arc<EngineRuntime>, id: Option<&str>) -> anyhow::
     let value = now_ms();
     let ev = WorkflowEvent::NowRecorded {
         ts: value,
-        run_id: engine.run_id.clone(),
         step_id,
         value,
     };
@@ -1231,7 +1216,6 @@ pub async fn exec_uuid(engine: &Arc<EngineRuntime>, id: Option<&str>) -> anyhow:
     let value = uuid::Uuid::new_v4().to_string();
     let ev = WorkflowEvent::UuidRecorded {
         ts: now_ms(),
-        run_id: engine.run_id.clone(),
         step_id,
         value: value.clone(),
     };
@@ -1369,7 +1353,6 @@ pub async fn exec_pause_with(
         let ev = if signal_name == "__approval" {
             WorkflowEvent::ApprovalRequested {
                 ts: now_ms(),
-                run_id: engine.run_id.clone(),
                 step_id: step_id.to_string(),
                 approval_id: step_id.to_string(),
                 title: reason.to_string(),
@@ -1379,7 +1362,6 @@ pub async fn exec_pause_with(
         } else {
             WorkflowEvent::SignalAwaited {
                 ts: now_ms(),
-                run_id: engine.run_id.clone(),
                 step_id: step_id.to_string(),
                 name: signal_name.to_string(),
                 deadline,
@@ -1654,9 +1636,7 @@ mod tests {
         events
             .iter()
             .find_map(|e| match e {
-                WorkflowEvent::RunStarted { run_id, .. }
-                | WorkflowEvent::RunFinished { run_id, .. }
-                | WorkflowEvent::RunErrored { run_id, .. } => Some(run_id.clone()),
+                WorkflowEvent::RunStarted { run_id, .. } => Some(run_id.clone()),
                 _ => None,
             })
             .expect("event stream must carry a run_id")
@@ -1670,7 +1650,6 @@ mod tests {
     fn find_checkpoint_matches_terminal_events_of_that_step() {
         let finished = |kind: &str, step: &str| WorkflowEvent::StepFinished {
             ts: 0,
-            run_id: "r".into(),
             step_id: step.into(),
             result: Some(serde_json::json!(kind)),
             attempts: vec![],
@@ -1689,7 +1668,6 @@ mod tests {
         // StepStarted 不是检查点（emit-only、不落盘）。
         let with_started = vec![WorkflowEvent::StepStarted {
             ts: 0,
-            run_id: "r".into(),
             step_id: "a".into(),
         }];
         assert!(find_checkpoint(&with_started, is_terminal_of("a")).is_none());
@@ -2215,12 +2193,11 @@ mod tests {
         assert_eq!(attempts.len(), 2, "retry=2 → 两个 attempt");
 
         for (i, a) in attempts.iter().enumerate() {
-            assert_eq!(a.attempt, i + 1);
             assert_eq!(a.result, None);
             let err = a
                 .error
                 .as_ref()
-                .unwrap_or_else(|| panic!("attempt {} 应记下结构化错误", a.attempt));
+                .unwrap_or_else(|| panic!("attempt {} 应记下结构化错误", i + 1));
             assert_eq!(err.message, "transient");
             assert_eq!(err.name, "Error", "anyhow 类型擦除，拿不到类名");
         }
@@ -2361,7 +2338,6 @@ mod tests {
         let store = Arc::new(InMemoryStore::new());
         let ev = WorkflowEvent::StepFinished {
             ts: 1,
-            run_id: "r1".into(),
             step_id: "a".into(),
             result: None,
             attempts: vec![],
@@ -2534,7 +2510,6 @@ mod tests {
                 0,
                 &WorkflowEvent::SignalResolved {
                     ts: now_ms(),
-                    run_id: "r1".into(),
                     step_id: "release".into(),
                     name: "release".into(),
                     signal_id: None,

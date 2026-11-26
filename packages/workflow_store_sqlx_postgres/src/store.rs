@@ -675,7 +675,6 @@ impl WorkflowRunStoreAdapterStore for SqlxPostgresStore {
             let meta = delivery.get("meta").cloned();
             Ok(Some(WorkflowEvent::SignalResolved {
                 ts: args.now,
-                run_id: args.run_id,
                 step_id: args.step_id,
                 name: args.name,
                 signal_id,

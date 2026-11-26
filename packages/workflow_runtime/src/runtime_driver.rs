@@ -1439,8 +1439,8 @@ mod driver_tests {
         let combined = combine_publishers(Some(shared.clone()), Some(shared.clone()))
             .expect("同一 publisher 仍应产出回调");
         combined(&RunId::from("r"), &WorkflowEvent::RunFinished {
-            ts: 0,
             run_id: "r".into(),
+            ts: 0,
             output: None,
         });
         assert_eq!(*calls.lock().unwrap(), 1, "同一 publisher 只该调一次");
@@ -1457,8 +1457,8 @@ mod driver_tests {
         });
         let combined = combine_publishers(Some(cfg), Some(req)).unwrap();
         combined(&RunId::from("r"), &WorkflowEvent::RunFinished {
-            ts: 0,
             run_id: "r".into(),
+            ts: 0,
             output: None,
         });
         assert_eq!(*order.lock().unwrap(), vec!["cfg", "req"], "配置级应在前");
@@ -2371,13 +2371,12 @@ mod driver_tests {
                 expected_next_index: 0,
                 events: vec![
                     WorkflowEvent::RunStarted {
-                        ts: now,
                         run_id: "sleep:1".into(),
+                        ts: now,
                         thread_id: None,
                     },
                     WorkflowEvent::StepFinished {
                         ts: now,
-                        run_id: "sleep:1".into(),
                         step_id: "before-sleep".into(),
                         result: None,
                         attempts: vec![],
@@ -2385,7 +2384,6 @@ mod driver_tests {
                     },
                     WorkflowEvent::SignalAwaited {
                         ts: now,
-                        run_id: "sleep:1".into(),
                         step_id: "hold".into(),
                         name: "__timer".into(),
                         deadline: Some(now + 30),

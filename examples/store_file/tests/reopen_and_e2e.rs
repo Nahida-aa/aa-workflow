@@ -149,9 +149,7 @@ async fn drives_a_parallel_workflow() {
     let run_id = events
         .iter()
         .find_map(|e| match e {
-            WorkflowEvent::RunStarted { run_id, .. }
-            | WorkflowEvent::RunFinished { run_id, .. }
-            | WorkflowEvent::RunErrored { run_id, .. } => Some(run_id.clone()),
+            WorkflowEvent::RunStarted { run_id, .. } => Some(run_id.clone()),
             _ => None,
         })
         .expect("run_id");

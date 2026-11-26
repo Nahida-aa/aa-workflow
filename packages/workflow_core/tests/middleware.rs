@@ -251,7 +251,6 @@ async fn middleware_reads_the_run_event_log() {
             0,
             &WorkflowEvent::StepFinished {
                 ts: 1,
-                run_id: "mw-events:1".into(),
                 step_id: "pre".into(),
                 result: Some(json!(1)),
                 attempts: Vec::new(),
